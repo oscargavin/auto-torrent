@@ -1,24 +1,77 @@
+import random
 import re
+import time
 from dataclasses import replace
 from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
-from .config import ABB_BASE_URL, DEFAULT_TRACKERS, HEADERS
+from .config import ABB_BASE_URL, CACHE_DIR, DEFAULT_TRACKERS, HEADERS
 from .types import SearchResult
+
+_REQUEST_DELAY = (1.5, 3.0)
 
 
 class ABBError(Exception):
     pass
 
 
+def _build_session() -> requests.Session:
+    try:
+        import requests_cache
+
+        session = requests_cache.CachedSession(
+            str(CACHE_DIR / "abb"),
+            backend="sqlite",
+            expire_after=3600,
+        )
+    except ImportError:
+        session = requests.Session()
+
+    retry = Retry(
+        total=3,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=10,
+        pool_maxsize=10,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update(HEADERS)
+    return session
+
+
+_session: requests.Session | None = None
+
+
+def _get_session() -> requests.Session:
+    global _session
+    if _session is None:
+        _session = _build_session()
+    return _session
+
+
+def _delay() -> None:
+    time.sleep(random.uniform(*_REQUEST_DELAY))
+
+
 def search(query: str, max_pages: int = 2) -> list[SearchResult]:
+    session = _get_session()
     results: list[SearchResult] = []
     for page in range(1, max_pages + 1):
+        if page > 1 or results:
+            _delay()
+
         url = f"{ABB_BASE_URL}/page/{page}/?s={query.lower().replace(' ', '+')}"
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp = session.get(url, timeout=15)
             resp.raise_for_status()
         except requests.ConnectTimeout:
             raise ABBError("AudiobookBay is not responding (connection timed out)")
@@ -76,7 +129,9 @@ def search(query: str, max_pages: int = 2) -> list[SearchResult]:
 
 
 def get_details(result: SearchResult) -> SearchResult:
-    resp = requests.get(result.link, headers=HEADERS, timeout=15)
+    session = _get_session()
+    _delay()
+    resp = session.get(result.link, timeout=15)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -130,7 +185,6 @@ def get_details(result: SearchResult) -> SearchResult:
         tracker_params = "&".join(f"tr={quote(t)}" for t in trackers)
         updates["magnet"] = f"magnet:?xt=urn:btih:{info_hash}&{tracker_params}"
 
-    # Only pass fields that exist on SearchResult
     valid_fields = {f.name for f in SearchResult.__dataclass_fields__.values()}
     filtered = {k: v for k, v in updates.items() if k in valid_fields}
     return replace(result, **filtered)

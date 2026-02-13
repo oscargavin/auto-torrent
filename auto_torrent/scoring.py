@@ -59,6 +59,23 @@ def score_result(
     return round(base)
 
 
+def quick_score(result: SearchResult, book: BookMetadata) -> int:
+    """Fast title+author score using search-page data only (no detail fetch needed)."""
+    title = result.title.lower()
+    title_score = max(
+        fuzz.token_set_ratio(book.title.lower(), title),
+        fuzz.partial_ratio(book.title.lower(), title),
+    )
+    author_score = 0
+    if book.author:
+        author_lower = book.author.lower()
+        author_score = max(
+            fuzz.token_set_ratio(author_lower, title),
+            fuzz.partial_ratio(author_lower, title),
+        )
+    return round(title_score * 0.6 + author_score * 0.4)
+
+
 def score_and_sort(
     results: list[SearchResult],
     book: BookMetadata,

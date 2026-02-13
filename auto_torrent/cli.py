@@ -15,7 +15,7 @@ from . import abb
 from .abb import ABBError
 from .config import DEFAULT_LIMIT, DOWNLOAD_DIR, MIN_SCORE, SCRAPE_WORKERS, STATE_DIR
 from .openlibrary import download_cover, lookup_book
-from .scoring import score_and_sort
+from .scoring import quick_score, score_and_sort
 from .types import BookMetadata, ScoredResult, SearchResult
 
 _quiet = False
@@ -314,6 +314,12 @@ def cmd_search(args: argparse.Namespace) -> None:
         else:
             print("  No results on AudiobookBay.")
         return
+
+    # Pre-filter: quick score on title+author to reduce detail fetches
+    max_enrich = limit * 2
+    if len(results) > max_enrich:
+        results.sort(key=lambda r: quick_score(r, book), reverse=True)
+        results = results[:max_enrich]
 
     _log(f"\n  Found {len(results)} candidates, loading details...")
     results = _enrich_results(results)

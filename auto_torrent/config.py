@@ -20,6 +20,7 @@ DEFAULT_TRACKERS = [
 
 DOWNLOAD_DIR = Path.home() / "Downloads" / "audiobooks"
 STATE_DIR = Path.home() / ".auto-torrent" / "downloads"
+CACHE_DIR = Path.home() / ".auto-torrent" / "cache"
 DEFAULT_LIMIT = 10
 
 # Scoring weights
