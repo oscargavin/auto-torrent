@@ -7,17 +7,35 @@ from .config import GENERIC_SUBJECTS
 from .types import BookMetadata
 
 _ARTICLES = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
+_NOISE = re.compile(
+    r"\b(graphic\s*audio|unabridged|abridged|audiobook|audio\s*book|narrated\s+by\b.*"
+    r"|read\s+by\b.*|full\s*cast)\b",
+    re.IGNORECASE,
+)
+_TRAILING_DIGITS = re.compile(r"\s+\d+\s*$")
+
+
+def _clean_query(query: str) -> str:
+    """Strip audiobook noise words and trailing volume numbers."""
+    cleaned = _NOISE.sub("", query).strip()
+    cleaned = _TRAILING_DIGITS.sub("", cleaned).strip()
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned or query
 
 
 def _query_variations(query: str) -> list[str]:
-    """Generate query variations: original, without articles, without subtitle."""
-    variations = [query]
-    without_article = _ARTICLES.sub("", query).strip()
-    if without_article != query:
+    """Generate query variations: cleaned, original, without articles, without subtitle."""
+    cleaned = _clean_query(query)
+    variations: list[str] = []
+    if cleaned != query:
+        variations.append(cleaned)
+    variations.append(query)
+    without_article = _ARTICLES.sub("", cleaned).strip()
+    if without_article not in variations:
         variations.append(without_article)
     for sep in (":", " - ", " — "):
-        if sep in query:
-            base = query.split(sep)[0].strip()
+        if sep in cleaned:
+            base = cleaned.split(sep)[0].strip()
             if base and base not in variations:
                 variations.append(base)
             without_art = _ARTICLES.sub("", base).strip()
@@ -42,19 +60,25 @@ def _try_query(q: str) -> list[dict]:
 
 
 def lookup_book(query: str) -> BookMetadata | None:
-    for variation in _query_variations(query):
+    docs: list[dict] = []
+    variations = _query_variations(query)
+    for variation in variations:
         docs = _try_query(variation)
         if docs:
             break
-    else:
+    if not docs:
         return None
 
     doc = docs[0]
 
     series = None
     for subj in doc.get("subject") or []:
-        if subj.lower() not in GENERIC_SUBJECTS and not subj.startswith("nyt:"):
+        low = subj.lower()
+        if low not in GENERIC_SUBJECTS and not subj.startswith("nyt:") and not subj.startswith("franchise:"):
             series = subj
+            break
+        if subj.startswith("franchise:"):
+            series = subj.split(":", 1)[1].strip()
             break
 
     return BookMetadata(
