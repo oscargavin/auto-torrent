@@ -9,6 +9,10 @@ from .config import ABB_BASE_URL, DEFAULT_TRACKERS, HEADERS
 from .types import SearchResult
 
 
+class ABBError(Exception):
+    pass
+
+
 def search(query: str, max_pages: int = 2) -> list[SearchResult]:
     results: list[SearchResult] = []
     for page in range(1, max_pages + 1):
@@ -16,6 +20,12 @@ def search(query: str, max_pages: int = 2) -> list[SearchResult]:
         try:
             resp = requests.get(url, headers=HEADERS, timeout=15)
             resp.raise_for_status()
+        except requests.ConnectTimeout:
+            raise ABBError("AudiobookBay is not responding (connection timed out)")
+        except requests.ConnectionError:
+            raise ABBError("AudiobookBay is unreachable (connection failed)")
+        except requests.HTTPError as e:
+            raise ABBError(f"AudiobookBay returned an error (HTTP {e.response.status_code})")
         except requests.RequestException:
             break
 

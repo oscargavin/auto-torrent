@@ -12,6 +12,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 
 from . import abb
+from .abb import ABBError
 from .config import DEFAULT_LIMIT, DOWNLOAD_DIR, MIN_SCORE, SCRAPE_WORKERS, STATE_DIR
 from .openlibrary import download_cover, lookup_book
 from .scoring import score_and_sort
@@ -298,7 +299,15 @@ def cmd_search(args: argparse.Namespace) -> None:
 
     # Step 2: Fan-out search on ABB
     _log("")
-    results = _fan_out_search(book)
+    try:
+        results = _fan_out_search(book)
+    except ABBError as e:
+        if json_mode:
+            _json_error(str(e))
+        else:
+            print(f"\n  {e}")
+        return
+
     if not results:
         if json_mode:
             _json_error("No results on AudiobookBay")
