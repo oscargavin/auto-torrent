@@ -19,8 +19,14 @@ uv sync             # install Python dependencies
 # Interactive — shows picker, prompts for download
 auto-torrent search "project hail mary"
 
+# Auto-select best match and download immediately
+auto-torrent search "the name of the wind" --auto
+
 # JSON output for scripts/agents
 auto-torrent search "the name of the wind" --json --limit 5
+
+# Auto + JSON — search, download best match, return everything
+auto-torrent search "the wise mans fear" --auto --json
 
 # Prefer a specific narrator
 auto-torrent search "the wise mans fear" --narrator Rupert Degas --json

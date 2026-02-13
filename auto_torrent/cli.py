@@ -320,16 +320,36 @@ def cmd_search(args: argparse.Namespace) -> None:
 
     scored = scored[:limit]
 
-    # JSON mode: output structured data (no download)
+    auto = args.auto
+
+    # JSON mode
     if json_mode:
         output: dict = {
             "book": asdict(book),
             "results": [_scored_to_dict(s) for s in scored],
+            "download": None,
         }
+        if auto:
+            best = scored[0]
+            download_info = _execute_download_fg(book.title, best.result.magnet, book.cover_id)
+            output["download"] = download_info
         _json_out(output)
         return
 
-    # Interactive mode
+    # Interactive auto mode
+    if auto:
+        best = scored[0]
+        print(f"\n  Auto-selected: {best.result.title} ({best.score}% match)")
+        if best.result.narrator:
+            print(f"  Narrator: {best.result.narrator}")
+        fmt = best.result.format or "?"
+        size = best.result.file_size or "?"
+        print(f"  {fmt} | {size}")
+        print()
+        _execute_download_fg(book.title, best.result.magnet, book.cover_id)
+        return
+
+    # Interactive picker
     print()
     for i, s in enumerate(scored, 1):
         print(_format_result(i, s))
@@ -445,6 +465,7 @@ def _build_parser() -> argparse.ArgumentParser:
     search_p = subs.add_parser("search", help="Search for an audiobook")
     search_p.add_argument("query", nargs="*", help="Book title to search for")
     search_p.add_argument("--json", action="store_true", help="Output structured JSON")
+    search_p.add_argument("--auto", action="store_true", help="Auto-select best match and download")
     search_p.add_argument("--narrator", nargs="+", help="Preferred narrator name")
     search_p.add_argument(
         "--limit", type=int, default=DEFAULT_LIMIT,
