@@ -1,4 +1,9 @@
+import json
+import os
 from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".auto-torrent"
+CONFIG_FILE = CONFIG_DIR / "config.json"
 
 ABB_BASE_URL = "https://audiobookbay.lu"
 
@@ -22,7 +27,12 @@ DEFAULT_TRACKERS = [
 DOWNLOAD_DIR = Path.home() / "Downloads" / "audiobooks"
 STATE_DIR = Path.home() / ".auto-torrent" / "downloads"
 CACHE_DIR = Path.home() / ".auto-torrent" / "cache"
+STREAM_DIR = Path.home() / ".auto-torrent" / "stream"
 DEFAULT_LIMIT = 10
+
+# Streaming
+STREAM_BUFFER_MB = 5
+STREAM_PORT = 8888
 
 # Scoring weights
 TITLE_WEIGHT = 0.5
@@ -36,6 +46,29 @@ MIN_SCORE = 60
 
 # Concurrency
 SCRAPE_WORKERS = 4
+
+# TPB scoring
+TPB_SOURCE_SCORES = {"bluray": 25, "web-dl": 20, "webrip": 15, "hdrip": 10, "hdtv": 8, "cam": 0}
+TPB_STATUS_SCORES = {"vip": 15, "trusted": 10, "helper": 5, "member": 3}
+TPB_RESOLUTION_LADDER = ["480p", "720p", "1080p", "2160p"]
+TPB_RESOLUTION_DISTANCE_SCORES = {0: 20, 1: 12, 2: 5, 3: 2}
+TPB_CODEC_SCORES = {"x265": 5, "av1": 5, "x264": 3}
+TPB_MAX_SEED_SCORE = 30
+TPB_SEED_LOG_SCALE = 5
+
+def load_user_config() -> dict:
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def get_proxy() -> str | None:
+    """Resolve proxy: env var > config file. CLI --proxy overrides both (handled in cli.py)."""
+    return os.environ.get("AUTO_TORRENT_PROXY") or load_user_config().get("proxy")
+
 
 # Open Library subjects to ignore when detecting series
 GENERIC_SUBJECTS = frozenset({

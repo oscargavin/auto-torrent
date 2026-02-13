@@ -49,12 +49,21 @@ def _build_session() -> requests.Session:
 
 
 _session: requests.Session | None = None
+_proxy: str | None = None
+
+
+def configure(proxy: str | None = None) -> None:
+    global _proxy, _session
+    _proxy = proxy
+    _session = None
 
 
 def _get_session() -> requests.Session:
     global _session
     if _session is None:
         _session = _build_session()
+        if _proxy:
+            _session.proxies = {"http": _proxy, "https": _proxy}
     return _session
 
 
