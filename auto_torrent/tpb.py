@@ -3,11 +3,21 @@
 import math
 import re
 from dataclasses import dataclass, replace
+from typing import NamedTuple
 from urllib.parse import quote
 
 import requests
 
-from .config import DEFAULT_TRACKERS
+from .config import (
+    DEFAULT_TRACKERS,
+    TPB_CODEC_SCORES,
+    TPB_MAX_SEED_SCORE,
+    TPB_RESOLUTION_DISTANCE_SCORES,
+    TPB_RESOLUTION_LADDER,
+    TPB_SEED_LOG_SCALE,
+    TPB_SOURCE_SCORES,
+    TPB_STATUS_SCORES,
+)
 
 APIBAY_URL = "https://apibay.org"
 
@@ -108,24 +118,24 @@ _SOURCE_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("cam", re.compile(r"\b(cam|ts|hdts|telesync|tc|hdtc|screener|scr)\b", re.IGNORECASE)),
 ]
 
-_SOURCE_SCORES = {"bluray": 25, "web-dl": 20, "webrip": 15, "hdrip": 10, "hdtv": 8, "cam": 0}
-_STATUS_SCORES = {"vip": 15, "trusted": 10, "member": 3, "helper": 5}
-
-_RES_LADDER = ["480p", "720p", "1080p", "2160p"]
+class TitleInfo(NamedTuple):
+    resolution: str | None
+    source: str | None
+    codec: str | None
+    hdr: bool
 
 
 def _resolution_scores(prefer: str = "1080p") -> dict[str, int]:
     """Score resolutions by distance from preferred. Preferred=20, ±1 step=12, ±2=5, ±3=2."""
-    scores_by_distance = {0: 20, 1: 12, 2: 5, 3: 2}
-    prefer_idx = _RES_LADDER.index(prefer) if prefer in _RES_LADDER else 2
+    prefer_idx = TPB_RESOLUTION_LADDER.index(prefer) if prefer in TPB_RESOLUTION_LADDER else 2
     scores: dict[str, int] = {}
-    for i, res in enumerate(_RES_LADDER):
+    for i, res in enumerate(TPB_RESOLUTION_LADDER):
         dist = abs(i - prefer_idx)
-        scores[res] = scores_by_distance.get(dist, 2)
+        scores[res] = TPB_RESOLUTION_DISTANCE_SCORES.get(dist, 2)
     return scores
 
 
-def parse_title(title: str) -> dict:
+def parse_title(title: str) -> TitleInfo:
     res_match = _RESOLUTION_RE.search(title)
     resolution = res_match.group(1).lower() if res_match else None
 
@@ -148,27 +158,19 @@ def parse_title(title: str) -> dict:
 
     hdr = bool(_HDR_RE.search(title))
 
-    return {"resolution": resolution, "source": source, "codec": codec, "hdr": hdr}
+    return TitleInfo(resolution=resolution, source=source, codec=codec, hdr=hdr)
 
 
 def score_result(r: TPBResult, prefer_resolution: str = "1080p") -> int:
     info = parse_title(r.title)
     res_scores = _resolution_scores(prefer_resolution)
 
-    seed_score = min(30, int(math.log2(r.seeders + 1) * 5)) if r.seeders > 0 else 0
-    source_score = _SOURCE_SCORES.get(info["source"] or "", 10)
-    res_score = res_scores.get(info["resolution"] or "", 8)
-    trust_score = _STATUS_SCORES.get(r.status, 3)
-
-    codec = info["codec"]
-    if codec in ("x265", "av1"):
-        codec_score = 5
-    elif codec == "x264":
-        codec_score = 3
-    else:
-        codec_score = 0
-
-    hdr_score = 5 if info["hdr"] else 0
+    seed_score = min(TPB_MAX_SEED_SCORE, int(math.log2(r.seeders + 1) * TPB_SEED_LOG_SCALE)) if r.seeders > 0 else 0
+    source_score = TPB_SOURCE_SCORES.get(info.source or "", 10)
+    res_score = res_scores.get(info.resolution or "", 8)
+    trust_score = TPB_STATUS_SCORES.get(r.status, 3)
+    codec_score = TPB_CODEC_SCORES.get(info.codec or "", 0)
+    hdr_score = 5 if info.hdr else 0
 
     total = seed_score + source_score + res_score + trust_score + codec_score + hdr_score
     return min(100, total)
@@ -179,14 +181,18 @@ def search(
     category: str = "video",
     min_seeds: int = 5,
     quality: str = "1080p",
+    proxy: str | None = None,
 ) -> list[TPBResult]:
     allowed_cats: set[str] | None = None
     if category != "all":
         allowed_cats = CATEGORY_GROUPS.get(category)
 
     url = f"{APIBAY_URL}/q.php?q={quote(query)}"
+    kwargs: dict = {"timeout": 15}
+    if proxy:
+        kwargs["proxies"] = {"http": proxy, "https": proxy}
     try:
-        resp = requests.get(url, timeout=15)
+        resp = requests.get(url, **kwargs)
         resp.raise_for_status()
     except requests.ConnectTimeout:
         raise TPBError("The Pirate Bay is not responding (connection timed out)")
@@ -202,8 +208,12 @@ def search(
 
     results: list[TPBResult] = []
     for item in data:
-        cat_id = str(item.get("category", ""))
-        seeders = int(item.get("seeders", "0"))
+        try:
+            cat_id = str(item.get("category", ""))
+            seeders = int(item.get("seeders", "0"))
+            size_bytes = int(item.get("size", 0))
+        except (ValueError, TypeError):
+            continue
 
         if allowed_cats and cat_id not in allowed_cats:
             continue
@@ -211,7 +221,6 @@ def search(
             continue
 
         name = item.get("name", "")
-        size_bytes = int(item.get("size", 0))
 
         result = TPBResult(
             title=name,

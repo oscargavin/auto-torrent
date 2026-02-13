@@ -14,7 +14,7 @@ from pathlib import Path
 
 from . import abb, tpb
 from .abb import ABBError
-from .config import DEFAULT_LIMIT, DOWNLOAD_DIR, MIN_SCORE, SCRAPE_WORKERS, STATE_DIR
+from .config import DEFAULT_LIMIT, DOWNLOAD_DIR, MIN_SCORE, SCRAPE_WORKERS, STATE_DIR, STREAM_DIR, STREAM_PORT, get_proxy
 from .openlibrary import download_cover, lookup_book
 from .scoring import quick_score, score_and_sort
 from .tpb import TPBError, TPBResult
@@ -187,11 +187,15 @@ def _check_pid(pid: int) -> bool:
 
 
 def _resolve_status(state: dict) -> str:
-    if state.get("status") == "downloading":
-        pid = state.get("pid")
-        if pid and not _check_pid(pid):
+    if state.get("status") != "downloading":
+        return state.get("status", "unknown")
+    pid = state.get("pid")
+    if pid and not _check_pid(pid):
+        path = Path(state.get("path", ""))
+        if path.exists() and any(path.iterdir()):
             return "completed"
-    return state.get("status", "unknown")
+        return "failed"
+    return "downloading"
 
 
 # -- Safety checks --
@@ -294,6 +298,10 @@ def _execute_download_bg(
 
 # -- Subcommand handlers --
 
+def _resolve_proxy(args: argparse.Namespace) -> str | None:
+    return getattr(args, "proxy", None) or get_proxy()
+
+
 def cmd_search(args: argparse.Namespace) -> None:
     global _quiet
 
@@ -301,6 +309,10 @@ def cmd_search(args: argparse.Namespace) -> None:
     _quiet = json_mode
     limit = args.limit
     source = args.source
+
+    proxy = _resolve_proxy(args)
+    if proxy:
+        abb.configure(proxy=proxy)
 
     query = " ".join(args.query) if args.query else ""
     narrator_pref = " ".join(args.narrator) if args.narrator else None
@@ -313,10 +325,15 @@ def cmd_search(args: argparse.Namespace) -> None:
     if not query:
         return
 
+    stream_mode = args.stream
+    player = args.player
+    port = args.port
+    keep = args.keep
+
     if source == "tpb":
-        _cmd_search_tpb(query, limit, json_mode, args.auto, args.category, args.min_seeds, args.quality)
+        _cmd_search_tpb(query, limit, json_mode, args.auto, args.category, args.min_seeds, args.quality, stream_mode, player, port, keep, proxy)
     else:
-        _cmd_search_abb(query, limit, json_mode, args.auto, narrator_pref)
+        _cmd_search_abb(query, limit, json_mode, args.auto, narrator_pref, stream_mode, player, port, keep)
 
 
 def _cmd_search_tpb(
@@ -327,13 +344,18 @@ def _cmd_search_tpb(
     category: str,
     min_seeds: int,
     quality: str,
+    stream_mode: bool = False,
+    player: str = "auto",
+    port: int = STREAM_PORT,
+    keep: bool = False,
+    proxy: str | None = None,
 ) -> None:
     _log(f"\n  Searching The Pirate Bay: {query}")
     if category != "all":
         _log(f"  Category: {category} | Min seeds: {min_seeds} | Quality: {quality}")
 
     try:
-        results = tpb.search(query, category=category, min_seeds=min_seeds, quality=quality)
+        results = tpb.search(query, category=category, min_seeds=min_seeds, quality=quality, proxy=proxy)
     except TPBError as e:
         if json_mode:
             _json_error(str(e))
@@ -350,6 +372,13 @@ def _cmd_search_tpb(
 
     results = results[:limit]
 
+    def _action(title: str, magnet: str) -> dict | None:
+        if stream_mode:
+            return _execute_stream(magnet, json_mode, player, port, keep)
+        return _execute_download_fg(title, magnet, None)
+
+    action_word = "Stream" if stream_mode else "Download"
+
     if json_mode:
         output: dict = {
             "results": [asdict(r) for r in results],
@@ -357,7 +386,7 @@ def _cmd_search_tpb(
         }
         if auto:
             best = results[0]
-            output["download"] = _execute_download_fg(best.title, best.magnet, None)
+            output["download"] = _action(best.title, best.magnet)
         _json_out(output)
         return
 
@@ -368,7 +397,7 @@ def _cmd_search_tpb(
         if best.warning:
             print(f"  ⚠ {best.warning}")
         print()
-        _execute_download_fg(best.title, best.magnet, None)
+        _action(best.title, best.magnet)
         return
 
     print()
@@ -382,12 +411,12 @@ def _cmd_search_tpb(
 
     selected = results[pick - 1]
     print()
-    confirm = input("Download? (y/n): ").strip().lower()
+    confirm = input(f"{action_word}? (y/n): ").strip().lower()
     if confirm not in ("y", "yes"):
         print("Cancelled.")
         return
 
-    _execute_download_fg(selected.title, selected.magnet, None)
+    _action(selected.title, selected.magnet)
 
 
 def _cmd_search_abb(
@@ -396,6 +425,10 @@ def _cmd_search_abb(
     json_mode: bool,
     auto: bool,
     narrator_pref: str | None,
+    stream_mode: bool = False,
+    player: str = "auto",
+    port: int = STREAM_PORT,
+    keep: bool = False,
 ) -> None:
     _log(f"\n  Looking up: {query}")
     book = lookup_book(query)
@@ -450,6 +483,13 @@ def _cmd_search_abb(
 
     scored = scored[:limit]
 
+    def _action(title: str, magnet: str, cover_id: int | None) -> dict | None:
+        if stream_mode:
+            return _execute_stream(magnet, json_mode, player, port, keep)
+        return _execute_download_fg(title, magnet, cover_id)
+
+    action_word = "Stream" if stream_mode else "Download"
+
     if json_mode:
         output: dict = {
             "book": asdict(book),
@@ -458,8 +498,7 @@ def _cmd_search_abb(
         }
         if auto:
             best = scored[0]
-            download_info = _execute_download_fg(book.title, best.result.magnet, book.cover_id)
-            output["download"] = download_info
+            output["download"] = _action(book.title, best.result.magnet, book.cover_id)
         _json_out(output)
         return
 
@@ -472,7 +511,7 @@ def _cmd_search_abb(
         size = best.result.file_size or "?"
         print(f"  {fmt} | {size}")
         print()
-        _execute_download_fg(book.title, best.result.magnet, book.cover_id)
+        _action(book.title, best.result.magnet, book.cover_id)
         return
 
     print()
@@ -490,12 +529,12 @@ def _cmd_search_abb(
         print(f"\n  {desc[:300]}{'...' if len(desc) > 300 else ''}")
 
     print()
-    confirm = input("Download? (y/n): ").strip().lower()
+    confirm = input(f"{action_word}? (y/n): ").strip().lower()
     if confirm not in ("y", "yes"):
         print("Cancelled.")
         return
 
-    _execute_download_fg(book.title, selected.result.magnet, book.cover_id)
+    _action(book.title, selected.result.magnet, book.cover_id)
 
 
 def cmd_download(args: argparse.Namespace) -> None:
@@ -576,6 +615,47 @@ def cmd_status(args: argparse.Namespace) -> None:
             print(f"  {status_icon} [{s['id']}] {s['title']} — {s['status']}")
 
 
+def _execute_stream(
+    magnet: str,
+    json_mode: bool,
+    player: str = "auto",
+    port: int = STREAM_PORT,
+    keep: bool = False,
+) -> dict | None:
+    from .stream import StreamError, stream
+
+    try:
+        return stream(
+            magnet=magnet, player=player, port=port,
+            keep=keep, json_mode=json_mode, log=_log,
+        )
+    except StreamError as e:
+        if json_mode:
+            _json_error(str(e))
+        else:
+            print(f"\n  Error: {e}")
+        return None
+
+
+def cmd_stream(args: argparse.Namespace) -> None:
+    global _quiet
+
+    json_mode = args.json
+    _quiet = json_mode
+
+    result = _execute_stream(
+        magnet=args.magnet,
+        json_mode=json_mode,
+        player=args.player,
+        port=args.port,
+        keep=args.keep,
+    )
+    if result is None:
+        sys.exit(1)
+    if json_mode:
+        _json_out(result)
+
+
 # -- Parser --
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -612,6 +692,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=DEFAULT_LIMIT,
         help=f"Max results to return (default: {DEFAULT_LIMIT})",
     )
+    search_p.add_argument("--stream", action="store_true", help="Stream instead of download")
+    search_p.add_argument(
+        "--player", default="auto",
+        help="Media player for streaming: mpv, vlc, iina, or auto (default: auto)",
+    )
+    search_p.add_argument(
+        "--port", type=int, default=STREAM_PORT,
+        help=f"HTTP server port for streaming (default: {STREAM_PORT})",
+    )
+    search_p.add_argument("--keep", action="store_true", help="Keep files after streaming")
+    search_p.add_argument("--proxy", help="Proxy URL (socks5h://user:pass@host:port or http://host:port)")
 
     # download
     dl_p = subs.add_parser("download", help="Download a specific audiobook by magnet")
@@ -626,6 +717,25 @@ def _build_parser() -> argparse.ArgumentParser:
     status_p.add_argument("download_id", nargs="?", default=None, help="Specific download ID")
     status_p.add_argument("--json", action="store_true", help="Output structured JSON")
 
+    # stream
+    stream_p = subs.add_parser("stream", help="Stream a torrent to a media player")
+    stream_p.add_argument("magnet", help="Magnet URI to stream")
+    stream_p.add_argument(
+        "--player", default="auto",
+        help="Media player: mpv, vlc, iina, or auto (default: auto)",
+    )
+    stream_p.add_argument(
+        "--port", type=int, default=STREAM_PORT,
+        help=f"HTTP server port (default: {STREAM_PORT})",
+    )
+    stream_p.add_argument(
+        "--save-path", default=None,
+        help=f"Save directory (default: {STREAM_DIR})",
+    )
+    stream_p.add_argument("--keep", action="store_true", help="Keep files after streaming")
+    stream_p.add_argument("--json", action="store_true", help="Output structured JSON")
+    stream_p.add_argument("--proxy", help="Proxy URL (socks5h://user:pass@host:port or http://host:port)")
+
     return parser
 
 
@@ -639,6 +749,8 @@ def main() -> None:
         cmd_download(args)
     elif args.command == "status":
         cmd_status(args)
+    elif args.command == "stream":
+        cmd_stream(args)
     else:
         parser.print_help()
 

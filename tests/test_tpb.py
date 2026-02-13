@@ -2,7 +2,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from auto_torrent.tpb import TPBError, TPBResult, _check_size_warning, parse_title, score_result, search
+from auto_torrent.tpb import TPBError, TPBResult, TitleInfo, _check_size_warning, parse_title, score_result, search
 
 # Minimal fields needed by apibay API — tests only include what search() reads
 SAMPLE_RESULTS = [
@@ -195,63 +195,63 @@ class TestSizeWarning:
 class TestParseTitle:
     def test_parses_resolution(self) -> None:
         info = parse_title("Movie.2014.1080p.BluRay.x265")
-        assert info["resolution"] == "1080p"
+        assert info.resolution == "1080p"
 
     def test_parses_4k(self) -> None:
         info = parse_title("Movie.2160p.UHD.BluRay")
-        assert info["resolution"] == "2160p"
+        assert info.resolution == "2160p"
 
     def test_parses_720p(self) -> None:
         info = parse_title("Movie.720p.WEB-DL")
-        assert info["resolution"] == "720p"
+        assert info.resolution == "720p"
 
     def test_parses_source_bluray(self) -> None:
         info = parse_title("Movie.1080p.BluRay.x264")
-        assert info["source"] == "bluray"
+        assert info.source == "bluray"
 
     def test_parses_source_webdl(self) -> None:
         info = parse_title("Movie.1080p.WEB-DL.DD5.1")
-        assert info["source"] == "web-dl"
+        assert info.source == "web-dl"
 
     def test_parses_source_webrip(self) -> None:
         info = parse_title("Movie.1080p.WEBRip.x264")
-        assert info["source"] == "webrip"
+        assert info.source == "webrip"
 
     def test_parses_source_cam(self) -> None:
         info = parse_title("Movie.2024.CAM.x264")
-        assert info["source"] == "cam"
+        assert info.source == "cam"
 
     def test_parses_codec_x265(self) -> None:
         info = parse_title("Movie.1080p.BluRay.x265.10bit")
-        assert info["codec"] == "x265"
+        assert info.codec == "x265"
 
     def test_parses_codec_x264(self) -> None:
         info = parse_title("Movie.1080p.BluRay.x264-YIFY")
-        assert info["codec"] == "x264"
+        assert info.codec == "x264"
 
     def test_parses_hevc_as_x265(self) -> None:
         info = parse_title("Movie.1080p.HEVC.BluRay")
-        assert info["codec"] == "x265"
+        assert info.codec == "x265"
 
     def test_parses_hdr(self) -> None:
         info = parse_title("Movie.2160p.BluRay.x265.HDR")
-        assert info["hdr"] is True
+        assert info.hdr is True
 
     def test_parses_dolby_vision(self) -> None:
         info = parse_title("Movie.2160p.BluRay.DV.x265")
-        assert info["hdr"] is True
+        assert info.hdr is True
 
     def test_no_hdr_when_absent(self) -> None:
         info = parse_title("Movie.1080p.BluRay.x264")
-        assert info["hdr"] is False
+        assert info.hdr is False
 
     def test_unknown_resolution(self) -> None:
         info = parse_title("Some.Random.Torrent")
-        assert info["resolution"] is None
+        assert info.resolution is None
 
     def test_unknown_source(self) -> None:
         info = parse_title("Movie.1080p.x264")
-        assert info["source"] is None
+        assert info.source is None
 
 
 class TestScoreResult:
@@ -391,3 +391,59 @@ class TestFileScan:
         (tmp_path / "run.vbs").touch()
         (tmp_path / "movie.mp4").touch()
         assert len(_scan_for_suspicious_files(str(tmp_path))) == 3
+
+
+class TestMalformedAPIResponse:
+    @patch("auto_torrent.tpb.requests.get")
+    def test_malformed_item_skipped(self, mock_get: MagicMock) -> None:
+        data = [
+            {"id": "1", "name": "Good.Movie.1080p", "info_hash": "A" * 40, "seeders": "100", "size": "2000000000", "category": "207"},
+            {"id": "2", "name": "Bad.Movie", "info_hash": "B" * 40, "seeders": "not_a_number", "size": "2000000000", "category": "207"},
+        ]
+        mock_get.return_value = _mock_response(data)
+        results = search("test", category="all")
+        assert len(results) == 1
+        assert results[0].title == "Good.Movie.1080p"
+
+    @patch("auto_torrent.tpb.requests.get")
+    def test_empty_list_returns_empty(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _mock_response([])
+        assert search("test") == []
+
+
+class TestTitleInfoNamedTuple:
+    def test_parse_title_returns_named_tuple(self) -> None:
+        info = parse_title("Movie.1080p.BluRay.x265.HDR")
+        assert isinstance(info, TitleInfo)
+        assert info.resolution == "1080p"
+        assert info.source == "bluray"
+        assert info.codec == "x265"
+        assert info.hdr is True
+
+    def test_tpb_result_serializable(self) -> None:
+        from dataclasses import asdict
+        r = TPBResult(
+            title="Test", link="", magnet="",
+            file_size="1 GB", size_bytes=1024**3, seeders=10,
+            category="Movies",
+        )
+        d = asdict(r)
+        assert d["title"] == "Test"
+        assert d["seeders"] == 10
+
+
+class TestResolveStatus:
+    def test_failed_on_empty_dir(self, tmp_path) -> None:
+        from auto_torrent.cli import _resolve_status
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+        state = {"status": "downloading", "pid": 99999999, "path": str(empty_dir)}
+        assert _resolve_status(state) == "failed"
+
+    def test_completed_on_dir_with_files(self, tmp_path) -> None:
+        from auto_torrent.cli import _resolve_status
+        dl_dir = tmp_path / "download"
+        dl_dir.mkdir()
+        (dl_dir / "movie.mkv").touch()
+        state = {"status": "downloading", "pid": 99999999, "path": str(dl_dir)}
+        assert _resolve_status(state) == "completed"
