@@ -213,6 +213,9 @@ def _aria2c_args(dest: Path, magnet: str) -> list[str]:
         "--seed-time=0",
         "--summary-interval=5",
         "--bt-stop-timeout=300",
+        "--enable-dht=true",
+        "--enable-peer-exchange=true",
+        "--bt-enable-lpd=true",
         magnet,
     ]
 
