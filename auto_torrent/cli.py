@@ -10,13 +10,14 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import abb, tpb
 from .abb import ABBError
 from .config import DEFAULT_LIMIT, DOWNLOAD_DIR, MIN_SCORE, SCRAPE_WORKERS, STATE_DIR
 from .openlibrary import download_cover, lookup_book
 from .scoring import quick_score, score_and_sort
-from .tpb import TPBError
+from .tpb import SUSPICIOUS_EXTENSIONS, TPBError, check_size_warning
 from .types import BookMetadata, ScoredResult, SearchResult
 
 _quiet = False
@@ -102,7 +103,7 @@ def _format_result(i: int, scored: ScoredResult) -> str:
     return f"  [{i:>2}] {r.title}\n       {info_line}"
 
 
-def _format_plain_result(i: int, r: SearchResult) -> str:
+def _format_plain_result(i: int, r: SearchResult, warning: str | None = None) -> str:
     parts: list[str] = []
     if r.file_size:
         parts.append(r.file_size)
@@ -111,7 +112,10 @@ def _format_plain_result(i: int, r: SearchResult) -> str:
     if r.category:
         parts.append(r.category)
     info_line = " | ".join(parts) if parts else "No details"
-    return f"  [{i:>2}] {r.title}\n       {info_line}"
+    line = f"  [{i:>2}] {r.title}\n       {info_line}"
+    if warning:
+        line += f"\n       ⚠ {warning}"
+    return line
 
 
 def _sanitize(name: str) -> str:
@@ -191,6 +195,33 @@ def _resolve_status(state: dict) -> str:
     return state.get("status", "unknown")
 
 
+def _parse_size(size_str: str) -> int:
+    """Convert human-readable size back to bytes (approximate)."""
+    size_str = size_str.strip().upper()
+    try:
+        if size_str.endswith("GB"):
+            return int(float(size_str[:-2].strip()) * 1024**3)
+        if size_str.endswith("MB"):
+            return int(float(size_str[:-2].strip()) * 1024**2)
+        if size_str.endswith("KB"):
+            return int(float(size_str[:-2].strip()) * 1024)
+        if size_str.endswith("B"):
+            return int(float(size_str[:-1].strip()))
+    except ValueError:
+        pass
+    return 0
+
+
+# -- Safety checks --
+
+def _scan_for_suspicious_files(directory: str) -> list[str]:
+    suspect: list[str] = []
+    for path in Path(directory).rglob("*"):
+        if path.is_file() and path.suffix.lower() in SUSPICIOUS_EXTENSIONS:
+            suspect.append(str(path.relative_to(directory)))
+    return suspect
+
+
 # -- Download execution --
 
 def _execute_download_fg(
@@ -224,6 +255,16 @@ def _execute_download_fg(
         ],
     )
     download_info["exit_code"] = proc.returncode
+
+    if proc.returncode == 0:
+        suspect = _scan_for_suspicious_files(str(dest))
+        if suspect:
+            download_info["warnings"] = [f"Suspicious file: {f}" for f in suspect]
+            _log("\n  ⚠ WARNING: Suspicious files detected in download:")
+            for f in suspect:
+                _log(f"    - {f}")
+            _log("  These may contain malware. Inspect before opening.\n")
+
     return download_info
 
 
@@ -293,7 +334,7 @@ def cmd_search(args: argparse.Namespace) -> None:
         return
 
     if source == "tpb":
-        _cmd_search_tpb(query, limit, json_mode, args.auto)
+        _cmd_search_tpb(query, limit, json_mode, args.auto, args.category, args.min_seeds)
     else:
         _cmd_search_abb(query, limit, json_mode, args.auto, narrator_pref)
 
@@ -303,11 +344,15 @@ def _cmd_search_tpb(
     limit: int,
     json_mode: bool,
     auto: bool,
+    category: str,
+    min_seeds: int,
 ) -> None:
     _log(f"\n  Searching The Pirate Bay: {query}")
+    if category != "all":
+        _log(f"  Category: {category} | Min seeds: {min_seeds}")
 
     try:
-        results = tpb.search(query)
+        results = tpb.search(query, category=category, min_seeds=min_seeds)
     except TPBError as e:
         if json_mode:
             _json_error(str(e))
@@ -324,9 +369,24 @@ def _cmd_search_tpb(
 
     results = results[:limit]
 
+    # Size sanity warnings
+    warnings: dict[int, str] = {}
+    for idx, r in enumerate(results):
+        size_str = r.file_size
+        size_bytes = _parse_size(size_str)
+        w = check_size_warning(r.title, size_bytes)
+        if w:
+            warnings[idx] = w
+
     if json_mode:
+        result_dicts = []
+        for idx, r in enumerate(results):
+            d = asdict(r)
+            if idx in warnings:
+                d["warning"] = warnings[idx]
+            result_dicts.append(d)
         output: dict = {
-            "results": [asdict(r) for r in results],
+            "results": result_dicts,
             "download": None,
         }
         if auto:
@@ -341,13 +401,15 @@ def _cmd_search_tpb(
         print(f"\n  Auto-selected: {best.title}")
         parts = [p for p in [best.file_size, best.posted, best.category] if p]
         print(f"  {' | '.join(parts)}")
+        if 0 in warnings:
+            print(f"  ⚠ {warnings[0]}")
         print()
         _execute_download_fg(best.title, best.magnet, None)
         return
 
     print()
     for i, r in enumerate(results, 1):
-        print(_format_plain_result(i, r))
+        print(_format_plain_result(i, r, warnings.get(i - 1)))
 
     print()
     pick = _prompt_choice(f"Select (1-{len(results)}), or q: ", len(results))
@@ -569,6 +631,14 @@ def _build_parser() -> argparse.ArgumentParser:
     search_p.add_argument(
         "--source", choices=["abb", "tpb"], default="abb",
         help="Search source: abb (AudiobookBay) or tpb (The Pirate Bay)",
+    )
+    search_p.add_argument(
+        "--category", default="video",
+        help="TPB category filter: video (default), audio, apps, games, all",
+    )
+    search_p.add_argument(
+        "--min-seeds", type=int, default=5,
+        help="Minimum seeders to include (default: 5, TPB only)",
     )
     search_p.add_argument(
         "--limit", type=int, default=DEFAULT_LIMIT,

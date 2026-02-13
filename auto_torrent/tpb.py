@@ -36,6 +36,26 @@ CATEGORIES = {
     "600": "Other",
 }
 
+CATEGORY_GROUPS: dict[str, set[str]] = {
+    "video": {"200", "201", "202", "203", "204", "205", "206", "207", "208", "209", "210", "211", "212", "299"},
+    "audio": {"100", "101", "102", "103", "104", "199"},
+    "apps": {"300"},
+    "games": {"400"},
+}
+
+SUSPICIOUS_EXTENSIONS = {
+    ".exe", ".bat", ".scr", ".msi", ".cmd", ".ps1",
+    ".vbs", ".js", ".wsf", ".com", ".pif", ".reg",
+}
+
+SIZE_WARNINGS: list[tuple[str, int]] = [
+    ("2160p", 2 * 1024**3),
+    ("4k", 2 * 1024**3),
+    ("uhd", 2 * 1024**3),
+    ("1080p", 500 * 1024**2),
+    ("720p", 200 * 1024**2),
+]
+
 
 class TPBError(Exception):
     pass
@@ -57,7 +77,23 @@ def _build_magnet(info_hash: str, name: str) -> str:
     return f"magnet:?xt=urn:btih:{info_hash}&dn={dn}&{tracker_params}"
 
 
-def search(query: str) -> list[SearchResult]:
+def check_size_warning(title: str, size_bytes: int) -> str | None:
+    title_lower = title.lower()
+    for keyword, min_size in SIZE_WARNINGS:
+        if keyword in title_lower and size_bytes < min_size:
+            return f"Claims {keyword} but only {_format_size(size_bytes)} — may be fake"
+    return None
+
+
+def search(
+    query: str,
+    category: str | None = "video",
+    min_seeds: int = 5,
+) -> list[SearchResult]:
+    allowed_cats: set[str] | None = None
+    if category and category != "all":
+        allowed_cats = CATEGORY_GROUPS.get(category)
+
     url = f"{APIBAY_URL}/q.php?q={quote(query)}"
     try:
         resp = requests.get(url, timeout=15)
@@ -76,11 +112,17 @@ def search(query: str) -> list[SearchResult]:
 
     results: list[SearchResult] = []
     for item in data:
+        cat_id = str(item.get("category", ""))
+        seeders = int(item.get("seeders", "0"))
+
+        if allowed_cats and cat_id not in allowed_cats:
+            continue
+        if seeders < min_seeds:
+            continue
+
         info_hash = item.get("info_hash", "")
         name = item.get("name", "")
         size_bytes = int(item.get("size", 0))
-        seeders = item.get("seeders", "0")
-        cat_id = str(item.get("category", ""))
         torrent_id = item.get("id", "")
 
         results.append(SearchResult(

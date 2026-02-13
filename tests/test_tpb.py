@@ -135,3 +135,172 @@ class TestTPBSearch:
 
         results = search("interstellar")
         assert results[0].category != ""
+
+
+MIXED_CATEGORY_RESULTS = [
+    {
+        "id": "1", "name": "Movie.1080p", "info_hash": "A" * 40,
+        "seeders": "100", "size": "2000000000", "category": "207",
+        "leechers": "10", "num_files": "1", "username": "", "added": "0",
+        "status": "member", "imdb": "",
+    },
+    {
+        "id": "2", "name": "Game.v1.0", "info_hash": "B" * 40,
+        "seeders": "50", "size": "5000000000", "category": "400",
+        "leechers": "5", "num_files": "1", "username": "", "added": "0",
+        "status": "member", "imdb": "",
+    },
+    {
+        "id": "3", "name": "Song.mp3", "info_hash": "C" * 40,
+        "seeders": "200", "size": "5000000", "category": "101",
+        "leechers": "2", "num_files": "1", "username": "", "added": "0",
+        "status": "member", "imdb": "",
+    },
+]
+
+LOW_SEED_RESULTS = [
+    {
+        "id": "4", "name": "Rare.Movie.720p", "info_hash": "D" * 40,
+        "seeders": "2", "size": "1000000000", "category": "207",
+        "leechers": "1", "num_files": "1", "username": "", "added": "0",
+        "status": "member", "imdb": "",
+    },
+    {
+        "id": "5", "name": "Popular.Movie.1080p", "info_hash": "E" * 40,
+        "seeders": "500", "size": "3000000000", "category": "207",
+        "leechers": "20", "num_files": "1", "username": "", "added": "0",
+        "status": "member", "imdb": "",
+    },
+]
+
+
+class TestTPBCategoryFilter:
+    @patch("auto_torrent.tpb.requests.get")
+    def test_video_filter_excludes_non_video(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _mock_response(MIXED_CATEGORY_RESULTS)
+        from auto_torrent.tpb import search
+
+        results = search("test", category="video")
+        assert len(results) == 1
+        assert results[0].title == "Movie.1080p"
+
+    @patch("auto_torrent.tpb.requests.get")
+    def test_audio_filter_returns_audio_only(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _mock_response(MIXED_CATEGORY_RESULTS)
+        from auto_torrent.tpb import search
+
+        results = search("test", category="audio")
+        assert len(results) == 1
+        assert results[0].title == "Song.mp3"
+
+    @patch("auto_torrent.tpb.requests.get")
+    def test_all_category_returns_everything(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _mock_response(MIXED_CATEGORY_RESULTS)
+        from auto_torrent.tpb import search
+
+        results = search("test", category="all")
+        assert len(results) == 3
+
+    @patch("auto_torrent.tpb.requests.get")
+    def test_games_filter(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _mock_response(MIXED_CATEGORY_RESULTS)
+        from auto_torrent.tpb import search
+
+        results = search("test", category="games")
+        assert len(results) == 1
+        assert results[0].title == "Game.v1.0"
+
+
+class TestTPBMinSeeds:
+    @patch("auto_torrent.tpb.requests.get")
+    def test_default_min_seeds_filters_low(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _mock_response(LOW_SEED_RESULTS)
+        from auto_torrent.tpb import search
+
+        results = search("test", category="all")
+        assert len(results) == 1
+        assert results[0].title == "Popular.Movie.1080p"
+
+    @patch("auto_torrent.tpb.requests.get")
+    def test_min_seeds_zero_returns_all(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _mock_response(LOW_SEED_RESULTS)
+        from auto_torrent.tpb import search
+
+        results = search("test", category="all", min_seeds=0)
+        assert len(results) == 2
+
+    @patch("auto_torrent.tpb.requests.get")
+    def test_min_seeds_custom_threshold(self, mock_get: MagicMock) -> None:
+        mock_get.return_value = _mock_response(LOW_SEED_RESULTS)
+        from auto_torrent.tpb import search
+
+        results = search("test", category="all", min_seeds=100)
+        assert len(results) == 1
+        assert "500" in results[0].posted
+
+
+class TestSizeWarning:
+    def test_1080p_too_small_warns(self) -> None:
+        from auto_torrent.tpb import check_size_warning
+
+        warning = check_size_warning("Movie.1080p.BluRay", 100 * 1024**2)
+        assert warning is not None
+        assert "1080p" in warning
+
+    def test_1080p_normal_size_no_warning(self) -> None:
+        from auto_torrent.tpb import check_size_warning
+
+        warning = check_size_warning("Movie.1080p.BluRay", 2 * 1024**3)
+        assert warning is None
+
+    def test_4k_too_small_warns(self) -> None:
+        from auto_torrent.tpb import check_size_warning
+
+        warning = check_size_warning("Movie.4K.HDR", 500 * 1024**2)
+        assert warning is not None
+        assert "4k" in warning.lower() or "4K" in warning
+
+    def test_no_quality_tag_no_warning(self) -> None:
+        from auto_torrent.tpb import check_size_warning
+
+        warning = check_size_warning("Some Random Torrent", 10 * 1024**2)
+        assert warning is None
+
+
+class TestFileScan:
+    def test_detects_exe_files(self, tmp_path) -> None:
+        from auto_torrent.cli import _scan_for_suspicious_files
+
+        (tmp_path / "movie.mkv").touch()
+        (tmp_path / "setup.exe").touch()
+        suspect = _scan_for_suspicious_files(str(tmp_path))
+        assert len(suspect) == 1
+        assert "setup.exe" in suspect[0]
+
+    def test_clean_directory_returns_empty(self, tmp_path) -> None:
+        from auto_torrent.cli import _scan_for_suspicious_files
+
+        (tmp_path / "movie.mkv").touch()
+        (tmp_path / "subtitles.srt").touch()
+        suspect = _scan_for_suspicious_files(str(tmp_path))
+        assert suspect == []
+
+    def test_detects_nested_suspicious_files(self, tmp_path) -> None:
+        from auto_torrent.cli import _scan_for_suspicious_files
+
+        sub = tmp_path / "subfolder"
+        sub.mkdir()
+        (sub / "crack.bat").touch()
+        suspect = _scan_for_suspicious_files(str(tmp_path))
+        assert len(suspect) == 1
+        assert "crack.bat" in suspect[0]
+
+    def test_multiple_suspicious_types(self, tmp_path) -> None:
+        from auto_torrent.cli import _scan_for_suspicious_files
+
+        (tmp_path / "keygen.exe").touch()
+        (tmp_path / "install.msi").touch()
+        (tmp_path / "run.vbs").touch()
+        (tmp_path / "movie.mp4").touch()
+        suspect = _scan_for_suspicious_files(str(tmp_path))
+        assert len(suspect) == 3
