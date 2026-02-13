@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import requests
@@ -5,20 +6,47 @@ import requests
 from .config import GENERIC_SUBJECTS
 from .types import BookMetadata
 
+_ARTICLES = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
 
-def lookup_book(query: str) -> BookMetadata | None:
+
+def _query_variations(query: str) -> list[str]:
+    """Generate query variations: original, without articles, without subtitle."""
+    variations = [query]
+    without_article = _ARTICLES.sub("", query).strip()
+    if without_article != query:
+        variations.append(without_article)
+    for sep in (":", " - ", " — "):
+        if sep in query:
+            base = query.split(sep)[0].strip()
+            if base and base not in variations:
+                variations.append(base)
+            without_art = _ARTICLES.sub("", base).strip()
+            if without_art and without_art not in variations:
+                variations.append(without_art)
+            break
+    return variations
+
+
+def _try_query(q: str) -> list[dict]:
     resp = requests.get(
         "https://openlibrary.org/search.json",
         params={
-            "q": query,
+            "q": q,
             "limit": 5,
             "fields": "title,author_name,subject,key,first_publish_year,cover_i",
         },
         timeout=10,
     )
     resp.raise_for_status()
-    docs = resp.json().get("docs", [])
-    if not docs:
+    return resp.json().get("docs", [])
+
+
+def lookup_book(query: str) -> BookMetadata | None:
+    for variation in _query_variations(query):
+        docs = _try_query(variation)
+        if docs:
+            break
+    else:
         return None
 
     doc = docs[0]

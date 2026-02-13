@@ -330,10 +330,17 @@ def cmd_search(args: argparse.Namespace) -> None:
     port = args.port
     keep = args.keep
 
-    if source == "tpb":
-        _cmd_search_tpb(query, limit, json_mode, args.auto, args.category, args.min_seeds, args.quality, stream_mode, player, port, keep, proxy)
-    else:
-        _cmd_search_abb(query, limit, json_mode, args.auto, narrator_pref, stream_mode, player, port, keep)
+    try:
+        if source == "tpb":
+            _cmd_search_tpb(query, limit, json_mode, args.auto, args.category, args.min_seeds, args.quality, stream_mode, player, port, keep, proxy)
+        else:
+            _cmd_search_abb(query, limit, json_mode, args.auto, narrator_pref, stream_mode, player, port, keep)
+    except Exception as e:
+        if json_mode:
+            _json_error(f"{type(e).__name__}: {e}")
+        else:
+            print(f"\n  Error: {type(e).__name__}: {e}", file=sys.stderr)
+            sys.exit(1)
 
 
 def _cmd_search_tpb(
@@ -419,6 +426,12 @@ def _cmd_search_tpb(
     _action(selected.title, selected.magnet)
 
 
+def _direct_abb_search(query: str) -> list[SearchResult]:
+    """Search ABB directly with a raw query string (no Open Library metadata)."""
+    _log(f'  Searching ABB directly: "{query}"')
+    return list(abb.search(query, max_pages=1))
+
+
 def _cmd_search_abb(
     query: str,
     limit: int,
@@ -431,26 +444,31 @@ def _cmd_search_abb(
     keep: bool = False,
 ) -> None:
     _log(f"\n  Looking up: {query}")
-    book = lookup_book(query)
-    if not book:
-        if json_mode:
-            _json_error("No results on Open Library")
-        else:
-            print("  No results on Open Library.")
-        return
 
-    _log(f"\n  Title:  {book.title}")
-    _log(f"  Author: {book.author}")
-    if book.series:
-        _log(f"  Series: {book.series}")
-    if book.year:
-        _log(f"  Year:   {book.year}")
-    if narrator_pref:
-        _log(f"  Prefer: {narrator_pref}")
-
-    _log("")
+    book: BookMetadata | None = None
     try:
-        results = _fan_out_search(book)
+        book = lookup_book(query)
+    except Exception as e:
+        _log(f"  Open Library lookup failed ({e}), searching ABB directly...")
+
+    if book:
+        _log(f"\n  Title:  {book.title}")
+        _log(f"  Author: {book.author}")
+        if book.series:
+            _log(f"  Series: {book.series}")
+        if book.year:
+            _log(f"  Year:   {book.year}")
+        if narrator_pref:
+            _log(f"  Prefer: {narrator_pref}")
+        _log("")
+    else:
+        _log("  No Open Library match, searching ABB directly...")
+
+    try:
+        if book:
+            results = _fan_out_search(book)
+        else:
+            results = _direct_abb_search(query)
     except ABBError as e:
         if json_mode:
             _json_error(str(e))
@@ -466,14 +484,20 @@ def _cmd_search_abb(
         return
 
     max_enrich = limit * 2
-    if len(results) > max_enrich:
+    if book and len(results) > max_enrich:
         results.sort(key=lambda r: quick_score(r, book), reverse=True)
+        results = results[:max_enrich]
+    elif not book and len(results) > max_enrich:
         results = results[:max_enrich]
 
     _log(f"\n  Found {len(results)} candidates, loading details...")
     results = _enrich_results(results)
 
-    scored = score_and_sort(results, book, narrator_pref, MIN_SCORE)
+    if book:
+        scored = score_and_sort(results, book, narrator_pref, MIN_SCORE)
+    else:
+        scored = [ScoredResult(result=r, score=50) for r in results if r.magnet]
+
     if not scored:
         if json_mode:
             _json_error("No good matches found")
@@ -482,23 +506,25 @@ def _cmd_search_abb(
         return
 
     scored = scored[:limit]
+    display_title = book.title if book else query
+    cover_id = book.cover_id if book else None
 
-    def _action(title: str, magnet: str, cover_id: int | None) -> dict | None:
+    def _action(title: str, magnet: str, cid: int | None) -> dict | None:
         if stream_mode:
             return _execute_stream(magnet, json_mode, player, port, keep)
-        return _execute_download_fg(title, magnet, cover_id)
+        return _execute_download_fg(title, magnet, cid)
 
     action_word = "Stream" if stream_mode else "Download"
 
     if json_mode:
         output: dict = {
-            "book": asdict(book),
+            "book": asdict(book) if book else {"title": query, "author": "", "year": None, "series": None, "cover_id": None},
             "results": [_scored_to_dict(s) for s in scored],
             "download": None,
         }
         if auto:
             best = scored[0]
-            output["download"] = _action(book.title, best.result.magnet, book.cover_id)
+            output["download"] = _action(display_title, best.result.magnet, cover_id)
         _json_out(output)
         return
 
@@ -511,7 +537,7 @@ def _cmd_search_abb(
         size = best.result.file_size or "?"
         print(f"  {fmt} | {size}")
         print()
-        _action(book.title, best.result.magnet, book.cover_id)
+        _action(display_title, best.result.magnet, cover_id)
         return
 
     print()
@@ -534,7 +560,7 @@ def _cmd_search_abb(
         print("Cancelled.")
         return
 
-    _action(book.title, selected.result.magnet, book.cover_id)
+    _action(display_title, selected.result.magnet, cover_id)
 
 
 def cmd_download(args: argparse.Namespace) -> None:
