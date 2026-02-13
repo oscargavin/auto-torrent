@@ -1,0 +1,23 @@
+[project]
+name = "auto-torrent"
+version = "0.1.0"
+description = "Search AudiobookBay and download audiobooks via aria2"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "rapidfuzz>=3.14.3",
+    "requests>=2.32.5",
+]
+
+[project.scripts]
+auto-torrent = "auto_torrent.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
