@@ -1,4 +1,4 @@
-"""Search audiobookbay.lu and download audiobooks via aria2."""
+"""Search AudiobookBay / The Pirate Bay and download via aria2."""
 
 import argparse
 import json
@@ -11,11 +11,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime, timezone
 
-from . import abb
+from . import abb, tpb
 from .abb import ABBError
 from .config import DEFAULT_LIMIT, DOWNLOAD_DIR, MIN_SCORE, SCRAPE_WORKERS, STATE_DIR
 from .openlibrary import download_cover, lookup_book
 from .scoring import quick_score, score_and_sort
+from .tpb import TPBError
 from .types import BookMetadata, ScoredResult, SearchResult
 
 _quiet = False
@@ -97,6 +98,18 @@ def _format_result(i: int, scored: ScoredResult) -> str:
 
     parts.append(f"{scored.score}% match")
 
+    info_line = " | ".join(parts) if parts else "No details"
+    return f"  [{i:>2}] {r.title}\n       {info_line}"
+
+
+def _format_plain_result(i: int, r: SearchResult) -> str:
+    parts: list[str] = []
+    if r.file_size:
+        parts.append(r.file_size)
+    if r.posted:
+        parts.append(r.posted)
+    if r.category:
+        parts.append(r.category)
     info_line = " | ".join(parts) if parts else "No details"
     return f"  [{i:>2}] {r.title}\n       {info_line}"
 
@@ -266,6 +279,7 @@ def cmd_search(args: argparse.Namespace) -> None:
     json_mode = args.json
     _quiet = json_mode
     limit = args.limit
+    source = args.source
 
     query = " ".join(args.query) if args.query else ""
     narrator_pref = " ".join(args.narrator) if args.narrator else None
@@ -278,7 +292,85 @@ def cmd_search(args: argparse.Namespace) -> None:
     if not query:
         return
 
-    # Step 1: Canonical lookup via Open Library
+    if source == "tpb":
+        _cmd_search_tpb(query, limit, json_mode, args.auto)
+    else:
+        _cmd_search_abb(query, limit, json_mode, args.auto, narrator_pref)
+
+
+def _cmd_search_tpb(
+    query: str,
+    limit: int,
+    json_mode: bool,
+    auto: bool,
+) -> None:
+    _log(f"\n  Searching The Pirate Bay: {query}")
+
+    try:
+        results = tpb.search(query)
+    except TPBError as e:
+        if json_mode:
+            _json_error(str(e))
+        else:
+            print(f"\n  {e}")
+        return
+
+    if not results:
+        if json_mode:
+            _json_error("No results on The Pirate Bay")
+        else:
+            print("  No results on The Pirate Bay.")
+        return
+
+    results = results[:limit]
+
+    if json_mode:
+        output: dict = {
+            "results": [asdict(r) for r in results],
+            "download": None,
+        }
+        if auto:
+            best = results[0]
+            download_info = _execute_download_fg(best.title, best.magnet, None)
+            output["download"] = download_info
+        _json_out(output)
+        return
+
+    if auto:
+        best = results[0]
+        print(f"\n  Auto-selected: {best.title}")
+        parts = [p for p in [best.file_size, best.posted, best.category] if p]
+        print(f"  {' | '.join(parts)}")
+        print()
+        _execute_download_fg(best.title, best.magnet, None)
+        return
+
+    print()
+    for i, r in enumerate(results, 1):
+        print(_format_plain_result(i, r))
+
+    print()
+    pick = _prompt_choice(f"Select (1-{len(results)}), or q: ", len(results))
+    if pick is None:
+        return
+
+    selected = results[pick - 1]
+    print()
+    confirm = input("Download? (y/n): ").strip().lower()
+    if confirm not in ("y", "yes"):
+        print("Cancelled.")
+        return
+
+    _execute_download_fg(selected.title, selected.magnet, None)
+
+
+def _cmd_search_abb(
+    query: str,
+    limit: int,
+    json_mode: bool,
+    auto: bool,
+    narrator_pref: str | None,
+) -> None:
     _log(f"\n  Looking up: {query}")
     book = lookup_book(query)
     if not book:
@@ -297,7 +389,6 @@ def cmd_search(args: argparse.Namespace) -> None:
     if narrator_pref:
         _log(f"  Prefer: {narrator_pref}")
 
-    # Step 2: Fan-out search on ABB
     _log("")
     try:
         results = _fan_out_search(book)
@@ -315,7 +406,6 @@ def cmd_search(args: argparse.Namespace) -> None:
             print("  No results on AudiobookBay.")
         return
 
-    # Pre-filter: quick score on title+author to reduce detail fetches
     max_enrich = limit * 2
     if len(results) > max_enrich:
         results.sort(key=lambda r: quick_score(r, book), reverse=True)
@@ -324,7 +414,6 @@ def cmd_search(args: argparse.Namespace) -> None:
     _log(f"\n  Found {len(results)} candidates, loading details...")
     results = _enrich_results(results)
 
-    # Step 3: Score, sort, filter
     scored = score_and_sort(results, book, narrator_pref, MIN_SCORE)
     if not scored:
         if json_mode:
@@ -335,9 +424,6 @@ def cmd_search(args: argparse.Namespace) -> None:
 
     scored = scored[:limit]
 
-    auto = args.auto
-
-    # JSON mode
     if json_mode:
         output: dict = {
             "book": asdict(book),
@@ -351,7 +437,6 @@ def cmd_search(args: argparse.Namespace) -> None:
         _json_out(output)
         return
 
-    # Interactive auto mode
     if auto:
         best = scored[0]
         print(f"\n  Auto-selected: {best.result.title} ({best.score}% match)")
@@ -364,7 +449,6 @@ def cmd_search(args: argparse.Namespace) -> None:
         _execute_download_fg(book.title, best.result.magnet, book.cover_id)
         return
 
-    # Interactive picker
     print()
     for i, s in enumerate(scored, 1):
         print(_format_result(i, s))
@@ -471,17 +555,21 @@ def cmd_status(args: argparse.Namespace) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="auto-torrent",
-        description="Search AudiobookBay and download audiobooks via aria2.",
+        description="Search AudiobookBay / The Pirate Bay and download via aria2.",
     )
 
     subs = parser.add_subparsers(dest="command")
 
     # search
-    search_p = subs.add_parser("search", help="Search for an audiobook")
-    search_p.add_argument("query", nargs="*", help="Book title to search for")
+    search_p = subs.add_parser("search", help="Search for a torrent")
+    search_p.add_argument("query", nargs="*", help="Title to search for")
     search_p.add_argument("--json", action="store_true", help="Output structured JSON")
     search_p.add_argument("--auto", action="store_true", help="Auto-select best match and download")
-    search_p.add_argument("--narrator", nargs="+", help="Preferred narrator name")
+    search_p.add_argument("--narrator", nargs="+", help="Preferred narrator name (ABB only)")
+    search_p.add_argument(
+        "--source", choices=["abb", "tpb"], default="abb",
+        help="Search source: abb (AudiobookBay) or tpb (The Pirate Bay)",
+    )
     search_p.add_argument(
         "--limit", type=int, default=DEFAULT_LIMIT,
         help=f"Max results to return (default: {DEFAULT_LIMIT})",
