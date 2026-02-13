@@ -327,6 +327,39 @@ class TestScoreResult:
         assert results[-1].title == "Movie.CAM"
 
 
+class TestQualityPreference:
+    def test_1080p_preferred_ranks_1080p_over_4k(self) -> None:
+        base = dict(link="", magnet="", file_size="2 GB",
+                    size_bytes=2*1024**3, seeders=100, category="HD Movies", status="member")
+        r_1080 = TPBResult(title="Movie.1080p.BluRay.x264", **base)
+        r_4k = TPBResult(title="Movie.2160p.BluRay.x264", **base)
+        assert score_result(r_1080, "1080p") > score_result(r_4k, "1080p")
+
+    def test_4k_preferred_ranks_4k_over_1080p(self) -> None:
+        base = dict(link="", magnet="", file_size="2 GB",
+                    size_bytes=2*1024**3, seeders=100, category="HD Movies", status="member")
+        r_1080 = TPBResult(title="Movie.1080p.BluRay.x264", **base)
+        r_4k = TPBResult(title="Movie.2160p.BluRay.x264", **base)
+        assert score_result(r_4k, "2160p") > score_result(r_1080, "2160p")
+
+    def test_720p_preferred_penalizes_4k(self) -> None:
+        base = dict(link="", magnet="", file_size="2 GB",
+                    size_bytes=2*1024**3, seeders=100, category="HD Movies", status="member")
+        r_720 = TPBResult(title="Movie.720p.BluRay.x264", **base)
+        r_4k = TPBResult(title="Movie.2160p.BluRay.x264", **base)
+        assert score_result(r_720, "720p") > score_result(r_4k, "720p")
+
+    @patch("auto_torrent.tpb.requests.get")
+    def test_quality_affects_sort_order(self, mock_get: MagicMock) -> None:
+        data = [
+            {"id": "1", "name": "Movie.2160p.BluRay.x265", "info_hash": "A" * 40, "seeders": "100", "size": "30000000000", "category": "211", "status": "vip"},
+            {"id": "2", "name": "Movie.1080p.BluRay.x265", "info_hash": "B" * 40, "seeders": "100", "size": "3000000000", "category": "207", "status": "vip"},
+        ]
+        mock_get.return_value = _mock_response(data)
+        results = search("test", category="all", quality="1080p")
+        assert results[0].title == "Movie.1080p.BluRay.x265"
+
+
 class TestFileScan:
     def test_detects_exe_files(self, tmp_path) -> None:
         from auto_torrent.cli import _scan_for_suspicious_files

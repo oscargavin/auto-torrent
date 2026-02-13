@@ -311,7 +311,7 @@ def cmd_search(args: argparse.Namespace) -> None:
         return
 
     if source == "tpb":
-        _cmd_search_tpb(query, limit, json_mode, args.auto, args.category, args.min_seeds)
+        _cmd_search_tpb(query, limit, json_mode, args.auto, args.category, args.min_seeds, args.quality)
     else:
         _cmd_search_abb(query, limit, json_mode, args.auto, narrator_pref)
 
@@ -323,13 +323,14 @@ def _cmd_search_tpb(
     auto: bool,
     category: str,
     min_seeds: int,
+    quality: str,
 ) -> None:
     _log(f"\n  Searching The Pirate Bay: {query}")
     if category != "all":
-        _log(f"  Category: {category} | Min seeds: {min_seeds}")
+        _log(f"  Category: {category} | Min seeds: {min_seeds} | Quality: {quality}")
 
     try:
-        results = tpb.search(query, category=category, min_seeds=min_seeds)
+        results = tpb.search(query, category=category, min_seeds=min_seeds, quality=quality)
     except TPBError as e:
         if json_mode:
             _json_error(str(e))
@@ -599,6 +600,10 @@ def _build_parser() -> argparse.ArgumentParser:
     search_p.add_argument(
         "--min-seeds", type=int, default=5,
         help="Minimum seeders to include (default: 5, TPB only)",
+    )
+    search_p.add_argument(
+        "--quality", choices=["2160p", "1080p", "720p", "480p"], default="1080p",
+        help="Preferred resolution for scoring (default: 1080p, TPB only)",
     )
     search_p.add_argument(
         "--limit", type=int, default=DEFAULT_LIMIT,

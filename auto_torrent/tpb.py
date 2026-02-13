@@ -109,8 +109,20 @@ _SOURCE_PATTERNS: list[tuple[str, re.Pattern]] = [
 ]
 
 _SOURCE_SCORES = {"bluray": 25, "web-dl": 20, "webrip": 15, "hdrip": 10, "hdtv": 8, "cam": 0}
-_RESOLUTION_SCORES = {"2160p": 18, "1080p": 20, "720p": 12, "480p": 5}
 _STATUS_SCORES = {"vip": 15, "trusted": 10, "member": 3, "helper": 5}
+
+_RES_LADDER = ["480p", "720p", "1080p", "2160p"]
+
+
+def _resolution_scores(prefer: str = "1080p") -> dict[str, int]:
+    """Score resolutions by distance from preferred. Preferred=20, ±1 step=12, ±2=5, ±3=2."""
+    scores_by_distance = {0: 20, 1: 12, 2: 5, 3: 2}
+    prefer_idx = _RES_LADDER.index(prefer) if prefer in _RES_LADDER else 2
+    scores: dict[str, int] = {}
+    for i, res in enumerate(_RES_LADDER):
+        dist = abs(i - prefer_idx)
+        scores[res] = scores_by_distance.get(dist, 2)
+    return scores
 
 
 def parse_title(title: str) -> dict:
@@ -139,23 +151,15 @@ def parse_title(title: str) -> dict:
     return {"resolution": resolution, "source": source, "codec": codec, "hdr": hdr}
 
 
-def score_result(r: TPBResult) -> int:
+def score_result(r: TPBResult, prefer_resolution: str = "1080p") -> int:
     info = parse_title(r.title)
+    res_scores = _resolution_scores(prefer_resolution)
 
-    # Seeders: log-scaled, 0-30 pts
     seed_score = min(30, int(math.log2(r.seeders + 1) * 5)) if r.seeders > 0 else 0
-
-    # Source: 0-25 pts
     source_score = _SOURCE_SCORES.get(info["source"] or "", 10)
-
-    # Resolution: 0-20 pts
-    res = info["resolution"]
-    res_score = _RESOLUTION_SCORES.get(res or "", 8)
-
-    # Uploader trust: 0-15 pts
+    res_score = res_scores.get(info["resolution"] or "", 8)
     trust_score = _STATUS_SCORES.get(r.status, 3)
 
-    # Codec: 0-5 pts
     codec = info["codec"]
     if codec in ("x265", "av1"):
         codec_score = 5
@@ -164,7 +168,6 @@ def score_result(r: TPBResult) -> int:
     else:
         codec_score = 0
 
-    # HDR bonus: 0-5 pts (only meaningful for 4K)
     hdr_score = 5 if info["hdr"] else 0
 
     total = seed_score + source_score + res_score + trust_score + codec_score + hdr_score
@@ -175,6 +178,7 @@ def search(
     query: str,
     category: str = "video",
     min_seeds: int = 5,
+    quality: str = "1080p",
 ) -> list[TPBResult]:
     allowed_cats: set[str] | None = None
     if category != "all":
@@ -220,7 +224,7 @@ def search(
             status=item.get("status", "member"),
             warning=_check_size_warning(name, size_bytes),
         )
-        results.append(replace(result, score=score_result(result)))
+        results.append(replace(result, score=score_result(result, quality)))
 
     results.sort(key=lambda r: r.score, reverse=True)
     return results
