@@ -1,11 +1,13 @@
 """Search The Pirate Bay via apibay.org JSON API."""
 
+import math
+import re
+from dataclasses import dataclass, replace
 from urllib.parse import quote
 
 import requests
 
 from .config import DEFAULT_TRACKERS
-from .types import SearchResult
 
 APIBAY_URL = "https://apibay.org"
 
@@ -43,12 +45,7 @@ CATEGORY_GROUPS: dict[str, set[str]] = {
     "games": {"400"},
 }
 
-SUSPICIOUS_EXTENSIONS = {
-    ".exe", ".bat", ".scr", ".msi", ".cmd", ".ps1",
-    ".vbs", ".js", ".wsf", ".com", ".pif", ".reg",
-}
-
-SIZE_WARNINGS: list[tuple[str, int]] = [
+_SIZE_WARNINGS: list[tuple[str, int]] = [
     ("2160p", 2 * 1024**3),
     ("4k", 2 * 1024**3),
     ("uhd", 2 * 1024**3),
@@ -61,11 +58,25 @@ class TPBError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class TPBResult:
+    title: str
+    link: str
+    magnet: str
+    file_size: str
+    size_bytes: int
+    seeders: int
+    category: str
+    status: str = "member"
+    score: int = 0
+    warning: str | None = None
+
+
 def _format_size(size_bytes: int) -> str:
-    if size_bytes >= 1024 ** 3:
-        return f"{size_bytes / 1024 ** 3:.1f} GB"
-    if size_bytes >= 1024 ** 2:
-        return f"{size_bytes / 1024 ** 2:.0f} MB"
+    if size_bytes >= 1024**3:
+        return f"{size_bytes / 1024**3:.1f} GB"
+    if size_bytes >= 1024**2:
+        return f"{size_bytes / 1024**2:.0f} MB"
     if size_bytes >= 1024:
         return f"{size_bytes / 1024:.0f} KB"
     return f"{size_bytes} B"
@@ -73,25 +84,100 @@ def _format_size(size_bytes: int) -> str:
 
 def _build_magnet(info_hash: str, name: str) -> str:
     tracker_params = "&".join(f"tr={quote(t)}" for t in DEFAULT_TRACKERS)
-    dn = quote(name)
-    return f"magnet:?xt=urn:btih:{info_hash}&dn={dn}&{tracker_params}"
+    return f"magnet:?xt=urn:btih:{info_hash}&dn={quote(name)}&{tracker_params}"
 
 
-def check_size_warning(title: str, size_bytes: int) -> str | None:
+def _check_size_warning(title: str, size_bytes: int) -> str | None:
     title_lower = title.lower()
-    for keyword, min_size in SIZE_WARNINGS:
+    for keyword, min_size in _SIZE_WARNINGS:
         if keyword in title_lower and size_bytes < min_size:
             return f"Claims {keyword} but only {_format_size(size_bytes)} — may be fake"
     return None
 
 
+_RESOLUTION_RE = re.compile(r"\b(2160p|1080p|720p|480p)\b", re.IGNORECASE)
+_CODEC_RE = re.compile(r"\b(x265|h\.?265|hevc|x264|h\.?264|avc|av1)\b", re.IGNORECASE)
+_HDR_RE = re.compile(r"\b(HDR10\+?|HDR|DV|Dolby\.?Vision|HLG)\b", re.IGNORECASE)
+
+_SOURCE_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("bluray", re.compile(r"\b(blu-?ray|bdremux|bdrip|brrip)\b", re.IGNORECASE)),
+    ("web-dl", re.compile(r"\b(web-?dl|webdl)\b", re.IGNORECASE)),
+    ("webrip", re.compile(r"\bwebrip\b", re.IGNORECASE)),
+    ("hdtv", re.compile(r"\b(hdtv|pdtv)\b", re.IGNORECASE)),
+    ("hdrip", re.compile(r"\bhdrip\b", re.IGNORECASE)),
+    ("cam", re.compile(r"\b(cam|ts|hdts|telesync|tc|hdtc|screener|scr)\b", re.IGNORECASE)),
+]
+
+_SOURCE_SCORES = {"bluray": 25, "web-dl": 20, "webrip": 15, "hdrip": 10, "hdtv": 8, "cam": 0}
+_RESOLUTION_SCORES = {"2160p": 18, "1080p": 20, "720p": 12, "480p": 5}
+_STATUS_SCORES = {"vip": 15, "trusted": 10, "member": 3, "helper": 5}
+
+
+def parse_title(title: str) -> dict:
+    res_match = _RESOLUTION_RE.search(title)
+    resolution = res_match.group(1).lower() if res_match else None
+
+    source = None
+    for name, pattern in _SOURCE_PATTERNS:
+        if pattern.search(title):
+            source = name
+            break
+
+    codec_match = _CODEC_RE.search(title)
+    codec = None
+    if codec_match:
+        raw = codec_match.group(1).lower().replace(".", "")
+        if raw in ("x265", "h265", "hevc"):
+            codec = "x265"
+        elif raw in ("x264", "h264", "avc"):
+            codec = "x264"
+        elif raw == "av1":
+            codec = "av1"
+
+    hdr = bool(_HDR_RE.search(title))
+
+    return {"resolution": resolution, "source": source, "codec": codec, "hdr": hdr}
+
+
+def score_result(r: TPBResult) -> int:
+    info = parse_title(r.title)
+
+    # Seeders: log-scaled, 0-30 pts
+    seed_score = min(30, int(math.log2(r.seeders + 1) * 5)) if r.seeders > 0 else 0
+
+    # Source: 0-25 pts
+    source_score = _SOURCE_SCORES.get(info["source"] or "", 10)
+
+    # Resolution: 0-20 pts
+    res = info["resolution"]
+    res_score = _RESOLUTION_SCORES.get(res or "", 8)
+
+    # Uploader trust: 0-15 pts
+    trust_score = _STATUS_SCORES.get(r.status, 3)
+
+    # Codec: 0-5 pts
+    codec = info["codec"]
+    if codec in ("x265", "av1"):
+        codec_score = 5
+    elif codec == "x264":
+        codec_score = 3
+    else:
+        codec_score = 0
+
+    # HDR bonus: 0-5 pts (only meaningful for 4K)
+    hdr_score = 5 if info["hdr"] else 0
+
+    total = seed_score + source_score + res_score + trust_score + codec_score + hdr_score
+    return min(100, total)
+
+
 def search(
     query: str,
-    category: str | None = "video",
+    category: str = "video",
     min_seeds: int = 5,
-) -> list[SearchResult]:
+) -> list[TPBResult]:
     allowed_cats: set[str] | None = None
-    if category and category != "all":
+    if category != "all":
         allowed_cats = CATEGORY_GROUPS.get(category)
 
     url = f"{APIBAY_URL}/q.php?q={quote(query)}"
@@ -110,7 +196,7 @@ def search(
     if not data or (len(data) == 1 and str(data[0].get("id")) == "0"):
         return []
 
-    results: list[SearchResult] = []
+    results: list[TPBResult] = []
     for item in data:
         cat_id = str(item.get("category", ""))
         seeders = int(item.get("seeders", "0"))
@@ -120,18 +206,21 @@ def search(
         if seeders < min_seeds:
             continue
 
-        info_hash = item.get("info_hash", "")
         name = item.get("name", "")
         size_bytes = int(item.get("size", 0))
-        torrent_id = item.get("id", "")
 
-        results.append(SearchResult(
+        result = TPBResult(
             title=name,
-            link=f"https://thepiratebay.org/description.php?id={torrent_id}",
-            magnet=_build_magnet(info_hash, name),
+            link=f"https://thepiratebay.org/description.php?id={item.get('id', '')}",
+            magnet=_build_magnet(item.get("info_hash", ""), name),
             file_size=_format_size(size_bytes),
-            posted=f"{seeders} seeds",
+            size_bytes=size_bytes,
+            seeders=seeders,
             category=CATEGORIES.get(cat_id, cat_id),
-        ))
+            status=item.get("status", "member"),
+            warning=_check_size_warning(name, size_bytes),
+        )
+        results.append(replace(result, score=score_result(result)))
 
+    results.sort(key=lambda r: r.score, reverse=True)
     return results

@@ -17,8 +17,13 @@ from .abb import ABBError
 from .config import DEFAULT_LIMIT, DOWNLOAD_DIR, MIN_SCORE, SCRAPE_WORKERS, STATE_DIR
 from .openlibrary import download_cover, lookup_book
 from .scoring import quick_score, score_and_sort
-from .tpb import SUSPICIOUS_EXTENSIONS, TPBError, check_size_warning
+from .tpb import TPBError, TPBResult
 from .types import BookMetadata, ScoredResult, SearchResult
+
+SUSPICIOUS_EXTENSIONS = {
+    ".exe", ".bat", ".scr", ".msi", ".cmd", ".ps1",
+    ".vbs", ".js", ".wsf", ".com", ".pif", ".reg",
+}
 
 _quiet = False
 
@@ -103,18 +108,12 @@ def _format_result(i: int, scored: ScoredResult) -> str:
     return f"  [{i:>2}] {r.title}\n       {info_line}"
 
 
-def _format_plain_result(i: int, r: SearchResult, warning: str | None = None) -> str:
-    parts: list[str] = []
-    if r.file_size:
-        parts.append(r.file_size)
-    if r.posted:
-        parts.append(r.posted)
-    if r.category:
-        parts.append(r.category)
+def _format_tpb_result(i: int, r: TPBResult) -> str:
+    parts = [p for p in [r.file_size, f"{r.seeders} seeds", r.category, f"{r.score}%"] if p]
     info_line = " | ".join(parts) if parts else "No details"
     line = f"  [{i:>2}] {r.title}\n       {info_line}"
-    if warning:
-        line += f"\n       ⚠ {warning}"
+    if r.warning:
+        line += f"\n       ⚠ {r.warning}"
     return line
 
 
@@ -195,23 +194,6 @@ def _resolve_status(state: dict) -> str:
     return state.get("status", "unknown")
 
 
-def _parse_size(size_str: str) -> int:
-    """Convert human-readable size back to bytes (approximate)."""
-    size_str = size_str.strip().upper()
-    try:
-        if size_str.endswith("GB"):
-            return int(float(size_str[:-2].strip()) * 1024**3)
-        if size_str.endswith("MB"):
-            return int(float(size_str[:-2].strip()) * 1024**2)
-        if size_str.endswith("KB"):
-            return int(float(size_str[:-2].strip()) * 1024)
-        if size_str.endswith("B"):
-            return int(float(size_str[:-1].strip()))
-    except ValueError:
-        pass
-    return 0
-
-
 # -- Safety checks --
 
 def _scan_for_suspicious_files(directory: str) -> list[str]:
@@ -223,6 +205,17 @@ def _scan_for_suspicious_files(directory: str) -> list[str]:
 
 
 # -- Download execution --
+
+def _aria2c_args(dest: Path, magnet: str) -> list[str]:
+    return [
+        "aria2c",
+        "--dir", str(dest),
+        "--seed-time=0",
+        "--summary-interval=5",
+        "--bt-stop-timeout=300",
+        magnet,
+    ]
+
 
 def _execute_download_fg(
     title: str,
@@ -242,18 +235,9 @@ def _execute_download_fg(
         else:
             _log("  Cover not available")
 
-    _log(f"\n  Downloading audio to: {dest}")
+    _log(f"\n  Downloading to: {dest}")
     _log("  Starting aria2c... (Ctrl+C to cancel)\n")
-    proc = subprocess.run(
-        [
-            "aria2c",
-            "--dir", str(dest),
-            "--seed-time=0",
-            "--summary-interval=5",
-            "--bt-stop-timeout=300",
-            magnet,
-        ],
-    )
+    proc = subprocess.run(_aria2c_args(dest, magnet))
     download_info["exit_code"] = proc.returncode
 
     if proc.returncode == 0:
@@ -285,14 +269,7 @@ def _execute_download_bg(
             cover_path = str(cover)
 
     proc = subprocess.Popen(
-        [
-            "aria2c",
-            "--dir", str(dest),
-            "--seed-time=0",
-            "--summary-interval=5",
-            "--bt-stop-timeout=300",
-            magnet,
-        ],
+        _aria2c_args(dest, magnet),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -369,47 +346,30 @@ def _cmd_search_tpb(
 
     results = results[:limit]
 
-    # Size sanity warnings
-    warnings: dict[int, str] = {}
-    for idx, r in enumerate(results):
-        size_str = r.file_size
-        size_bytes = _parse_size(size_str)
-        w = check_size_warning(r.title, size_bytes)
-        if w:
-            warnings[idx] = w
-
     if json_mode:
-        result_dicts = []
-        for idx, r in enumerate(results):
-            d = asdict(r)
-            if idx in warnings:
-                d["warning"] = warnings[idx]
-            result_dicts.append(d)
         output: dict = {
-            "results": result_dicts,
+            "results": [asdict(r) for r in results],
             "download": None,
         }
         if auto:
             best = results[0]
-            download_info = _execute_download_fg(best.title, best.magnet, None)
-            output["download"] = download_info
+            output["download"] = _execute_download_fg(best.title, best.magnet, None)
         _json_out(output)
         return
 
     if auto:
         best = results[0]
         print(f"\n  Auto-selected: {best.title}")
-        parts = [p for p in [best.file_size, best.posted, best.category] if p]
-        print(f"  {' | '.join(parts)}")
-        if 0 in warnings:
-            print(f"  ⚠ {warnings[0]}")
+        print(f"  {best.file_size} | {best.seeders} seeds | {best.category}")
+        if best.warning:
+            print(f"  ⚠ {best.warning}")
         print()
         _execute_download_fg(best.title, best.magnet, None)
         return
 
     print()
     for i, r in enumerate(results, 1):
-        print(_format_plain_result(i, r, warnings.get(i - 1)))
+        print(_format_tpb_result(i, r))
 
     print()
     pick = _prompt_choice(f"Select (1-{len(results)}), or q: ", len(results))
