@@ -12,8 +12,21 @@ dependencies = [
     "requests-cache>=1.2.1",
 ]
 
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "twilio>=9.0",
+    "httpx>=0.28",
+    "pydantic-settings>=2.7",
+    "python-multipart>=0.0.20",
+]
+
 [project.scripts]
 auto-torrent = "auto_torrent.cli:main"
+atb = "auto_torrent.cli:main_atb"
+atv = "auto_torrent.cli:main_atv"
+atb-server = "auto_torrent.server.app:serve"
 
 [build-system]
 requires = ["hatchling"]
