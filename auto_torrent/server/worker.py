@@ -21,7 +21,8 @@ SEARCH_TIMEOUT = 300  # 5 minutes
 
 def _run_atb(args: list[str], cwd: str, timeout: int = SEARCH_TIMEOUT) -> dict | None:
     """Run an atb CLI command and parse JSON output."""
-    cmd = ["uv", "run", "atb", *args, "--json"]
+    uv = "/home/oscar/.local/bin/uv"
+    cmd = [uv, "run", "atb", *args, "--json"]
     logger.info("Running: %s", " ".join(cmd))
     result = subprocess.run(
         cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
