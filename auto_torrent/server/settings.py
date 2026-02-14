@@ -6,8 +6,10 @@ class Settings(BaseSettings):
     model_config = {"env_file": ".env"}
 
     twilio_account_sid: str
-    twilio_auth_token: str
+    twilio_auth_token: str = ""
     twilio_phone_number: str
+    twilio_api_key_sid: str = ""
+    twilio_api_key_secret: str = ""
     allowed_numbers: list[str]
 
     abs_url: str = "http://localhost:13378"
