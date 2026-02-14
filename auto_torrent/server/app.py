@@ -1,5 +1,8 @@
 """FastAPI app — SMS webhook for audiobook requests."""
 
+import asyncio
+import hashlib
+import hmac
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -98,6 +101,35 @@ async def sms_webhook(
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/webhook/github")
+async def github_webhook(request: Request) -> Response:
+    body = await request.body()
+
+    # Verify GitHub signature if secret is configured
+    secret = settings.github_webhook_secret
+    if secret:
+        signature = request.headers.get("X-Hub-Signature-256", "")
+        expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return Response(status_code=403)
+
+    # Run deploy script in background
+    async def _deploy() -> None:
+        proc = await asyncio.create_subprocess_exec(
+            "/home/oscar/auto-torrent/deploy.sh",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            logger.info("Deploy OK: %s", stdout.decode().strip())
+        else:
+            logger.error("Deploy failed: %s", stderr.decode().strip())
+
+    asyncio.create_task(_deploy())
+    return Response(status_code=200)
 
 
 def serve() -> None:

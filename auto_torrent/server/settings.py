@@ -13,10 +13,11 @@ class Settings(BaseSettings):
     abs_url: str = "http://localhost:13378"
     abs_api_token: str
     abs_library_id: str
-    abs_library_path: str = "/srv/audiobooks"
+    abs_library_path: str = "/home/oscar/audiobooks"
 
     atb_cwd: str
     port: int = 8004
+    github_webhook_secret: str = ""
 
     @field_validator("allowed_numbers", mode="before")
     @classmethod

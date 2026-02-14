@@ -4,7 +4,7 @@ services:
     ports:
       - "13378:80"
     volumes:
-      - /srv/audiobooks:/audiobooks
+      - /home/oscar/audiobooks:/audiobooks
       - ./abs-config:/config
       - ./abs-metadata:/metadata
     restart: unless-stopped
