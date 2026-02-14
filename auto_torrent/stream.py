@@ -16,74 +16,16 @@ from urllib.parse import quote
 import libtorrent as lt
 
 from .config import DEFAULT_TRACKERS, STREAM_BUFFER_MB, STREAM_DIR, STREAM_PORT
+from .torrent import TorrentError, create_session, add_magnet, wait_for_metadata, format_speed
 
 MEDIA_EXTENSIONS = frozenset({
     ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm",
     ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob",
 })
 
-DHT_BOOTSTRAP_NODES = [
-    ("router.bittorrent.com", 6881),
-    ("router.utorrent.com", 6881),
-    ("dht.transmissionbt.com", 6881),
-]
-
 
 class StreamError(Exception):
     pass
-
-
-
-def _create_session() -> lt.session:
-    settings = {
-        "listen_interfaces": "0.0.0.0:6881",
-        "enable_dht": True,
-        "enable_lsd": True,
-        "enable_upnp": True,
-        "enable_natpmp": True,
-    }
-    ses = lt.session(settings)
-    for host, port in DHT_BOOTSTRAP_NODES:
-        ses.add_dht_router(host, port)
-    return ses
-
-
-def _add_magnet(
-    session: lt.session,
-    magnet: str,
-    save_path: Path,
-    trackers: list[str],
-) -> lt.torrent_handle:
-    params = lt.parse_magnet_uri(magnet)
-    params.save_path = str(save_path)
-    params.flags |= lt.torrent_flags.sequential_download
-
-    for tracker in trackers:
-        params.trackers.append(tracker)
-
-    return session.add_torrent(params)
-
-
-
-def _wait_for_metadata(
-    session: lt.session,
-    handle: lt.torrent_handle,
-    timeout: int = 120,
-    log: Callable[..., None] = print,
-) -> lt.torrent_info:
-    deadline = time.monotonic() + timeout
-    while not handle.has_metadata():
-        session.post_torrent_updates()
-        remaining = int(deadline - time.monotonic())
-        if remaining <= 0:
-            raise StreamError(
-                f"No metadata received after {timeout}s — "
-                "check your connection or try a torrent with more seeders"
-            )
-        log(f"\r  Waiting for metadata... {remaining}s remaining", end="", flush=True)
-        time.sleep(1)
-    log("\r" + " " * 60 + "\r", end="", flush=True)
-    return handle.torrent_file()
 
 
 def _select_media_file(
@@ -319,12 +261,6 @@ def _launch_player(player: str, url: str) -> subprocess.Popen | None:
 
 
 
-def _format_speed(bps: int) -> str:
-    if bps >= 1024**2:
-        return f"{bps / 1024**2:.1f} MB/s"
-    if bps >= 1024:
-        return f"{bps / 1024:.0f} KB/s"
-    return f"{bps} B/s"
 
 
 def _print_status(status: lt.torrent_status, log: Callable[..., None]) -> None:
@@ -333,7 +269,7 @@ def _print_status(status: lt.torrent_status, log: Callable[..., None]) -> None:
     buffered = have / len(pieces) * 100 if pieces else 0
 
     log(
-        f"\r  Streaming: {status.progress * 100:.0f}% | {_format_speed(status.download_rate)} | "
+        f"\r  Streaming: {status.progress * 100:.0f}% | {format_speed(status.download_rate)} | "
         f"{status.num_peers} peers | buffered: {buffered:.0f}%",
         end="", flush=True,
     )
@@ -395,14 +331,14 @@ def stream(
 
     try:
         log("  Starting libtorrent session...")
-        session = _create_session()
-        handle = _add_magnet(session, magnet, save_path, trackers)
+        session = create_session()
+        handle = add_magnet(session, magnet, save_path, trackers, sequential=True)
 
-        torrent_info = _wait_for_metadata(session, handle, log=log)
+        torrent_info = wait_for_metadata(session, handle, log=log)
         log(f"  Torrent: {torrent_info.name()}")
 
         file_idx, filename, file_size = _select_media_file(torrent_info, handle)
-        log(f"  Media:   {filename} ({_format_speed(file_size).replace('/s', '')})")
+        log(f"  Media:   {filename} ({format_speed(file_size).replace('/s', '')})")
 
         first_piece, last_piece = _file_piece_range(torrent_info, file_idx)
         _prioritize_for_streaming(handle, first_piece, last_piece)
@@ -498,7 +434,7 @@ def stream(
             "keep": keep,
         }
 
-    except StreamError:
+    except (StreamError, TorrentError):
         raise
     except Exception as e:
         raise StreamError(str(e)) from e

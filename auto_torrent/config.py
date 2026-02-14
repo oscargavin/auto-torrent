@@ -33,8 +33,25 @@ STREAM_DIR = Path.home() / ".auto-torrent" / "stream"
 DEFAULT_LIMIT = 10
 
 # Streaming
-STREAM_BUFFER_MB = 5
+STREAM_BUFFER_MB = 15
 STREAM_PORT = 8888
+
+# Seed probing
+PROBE_TIMEOUT = 15
+PROBE_CANDIDATES = 3
+
+# LLM selection
+LLM_MODEL = "sonnet"
+LLM_TIMEOUT = 30
+
+# Download progress
+DOWNLOAD_PROGRESS_INTERVAL = 5  # seconds between state file updates
+
+DHT_BOOTSTRAP_NODES = [
+    ("router.bittorrent.com", 6881),
+    ("router.utorrent.com", 6881),
+    ("dht.transmissionbt.com", 6881),
+]
 
 # Scoring weights
 TITLE_WEIGHT = 0.5
