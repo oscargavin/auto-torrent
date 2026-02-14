@@ -29,7 +29,19 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     yield
 
 
-app = FastAPI(title="atb-server", lifespan=lifespan)
+app = FastAPI(title="atb-server", lifespan=lifespan, docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+    response.headers.pop("server", None)
+    return response
 
 
 def _reconstruct_url(request: Request) -> str:
@@ -137,7 +149,7 @@ def serve() -> None:
 
     uvicorn.run(
         "auto_torrent.server.app:app",
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=settings.port,  # default 8004
         log_level="info",
     )
