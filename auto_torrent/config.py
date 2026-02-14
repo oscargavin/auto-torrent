@@ -16,12 +16,14 @@ HEADERS = {
 }
 
 DEFAULT_TRACKERS = [
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.stealth.si:80/announce",
-    "udp://tracker.torrent.eu.org:451/announce",
+    "http://tracker.opentrackr.org:1337/announce",
     "udp://open.demonii.com:1337/announce",
+    "udp://open.stealth.si:80/announce",
     "udp://exodus.desync.com:6969/announce",
-    "udp://tracker.moeking.me:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://tracker.qu.ax:6969/announce",
+    "udp://tracker.filemail.com:6969/announce",
+    "udp://zer0day.ch:1337/announce",
 ]
 
 DOWNLOAD_DIR = Path.home() / "Downloads" / "audiobooks"

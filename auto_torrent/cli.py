@@ -14,7 +14,7 @@ from pathlib import Path
 
 from . import abb, tpb
 from .abb import ABBError
-from .config import DEFAULT_LIMIT, DOWNLOAD_DIR, MIN_SCORE, SCRAPE_WORKERS, STATE_DIR, STREAM_DIR, STREAM_PORT, get_proxy
+from .config import DEFAULT_LIMIT, DEFAULT_TRACKERS, DOWNLOAD_DIR, MIN_SCORE, SCRAPE_WORKERS, STATE_DIR, STREAM_DIR, STREAM_PORT, get_proxy
 from .openlibrary import download_cover, lookup_book
 from .scoring import quick_score, score_and_sort
 from .tpb import TPBError, TPBResult
@@ -211,6 +211,7 @@ def _scan_for_suspicious_files(directory: str) -> list[str]:
 # -- Download execution --
 
 def _aria2c_args(dest: Path, magnet: str) -> list[str]:
+    tracker_list = ",".join(DEFAULT_TRACKERS)
     return [
         "aria2c",
         "--dir", str(dest),
@@ -220,6 +221,9 @@ def _aria2c_args(dest: Path, magnet: str) -> list[str]:
         "--enable-dht=true",
         "--enable-peer-exchange=true",
         "--bt-enable-lpd=true",
+        f"--bt-tracker={tracker_list}",
+        "--dht-entry-point=dht.transmissionbt.com:6881",
+        "--dht-entry-point=router.bittorrent.com:6881",
         magnet,
     ]
 
