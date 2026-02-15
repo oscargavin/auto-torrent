@@ -119,7 +119,7 @@ async def _classify_and_process(
 ) -> None:
     """LLM classifies the SMS, then replies, suggests, or dispatches search pipeline."""
     classification = await asyncio.to_thread(parse_sms, query, phone)
-    action = classification.get("action", "search")
+    action = classification.get("action") or "search"
     logger.info("LLM: '%s' → %s", query, action)
 
     if action == "reply":
