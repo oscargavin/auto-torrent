@@ -111,7 +111,7 @@ async def sms_webhook(
     # which exceeds Twilio's webhook timeout. Return TwiML immediately,
     # then the background task handles classification + search + reply.
     background_tasks.add_task(_classify_and_process, query, From, settings, sms)
-    return _twiml_response(f'Got it! Looking into "{query}"...')
+    return _twiml_response("Got it! Give me a moment...")
 
 
 async def _classify_and_process(
