@@ -4,126 +4,135 @@ import json
 import logging
 import os
 import subprocess
+import time
 
 logger = logging.getLogger("atb.llm")
 
 LLM_MODEL = "claude-opus-4-6"
 LLM_TIMEOUT = 30
 
+# Per-phone conversation state: {phone: {suggestions: [...], context: str, ts: float}}
+_conversations: dict[str, dict] = {}
+CONVERSATION_TTL = 600  # 10 minutes
+
 SYSTEM_PROMPT = """\
 You are a friendly SMS assistant for an audiobook service. A person texts you \
 and you determine what they want. Your job is to either extract a searchable \
-book title or reply with a helpful message.
+book title, suggest similar books, or reply with a helpful message.
 
 Keep replies under 160 characters when possible — these are SMS messages."""
 
 CLASSIFY_PROMPT = """\
 <message>{message}</message>
-
+{context}
 <instructions>
 Determine what action to take for this SMS message.
 
 1. SEARCH — The message contains a recognisable book title (even misspelled or \
 abbreviated). Extract the corrected, canonical title. If it's a series name \
-with no specific book, use the first book in the series.
-2. REPLY — The message needs a helpful response instead of a search. This \
-includes: author names without a title, genre/mood requests, conversational \
-messages (thanks, ok, yes), questions about the service, or text too vague to \
-search.
+with no specific book, use the first book in the series. Also use this when the \
+person picks a number from pending suggestions.
+2. SUGGEST — The person wants book recommendations ("something like...", \
+"books similar to...", a genre/mood request, or an author name without a \
+specific title). Return exactly 3 numbered suggestions with title and author.
+3. REPLY — The message is conversational (thanks, ok, yes), a question about \
+the service, or too vague to act on. Reply with a warm, brief message.
 
-For REPLY messages, be warm and brief. Suggest 2-3 specific book titles when \
-relevant so the person can text back one of them.
+When there are pending suggestions and the person texts a number (1, 2, 3) or \
+a phrase like "the first one" or "number 2", treat it as SEARCH with the \
+corresponding suggestion title.
 </instructions>
 
 <examples>
 <example>
 Message: "Project Hail Mary"
 Action: search
-Reasoning: Clear book title, search directly.
 query: "Project Hail Mary"
 </example>
 
 <example>
 Message: "Hairy Potter"
 Action: search
-Reasoning: Misspelled "Harry Potter" — assume first book in series.
-query: "Harry Potter and the Philosopher's Stone"
-</example>
-
-<example>
-Message: "Harry Potter"
-Action: search
-Reasoning: Series name, pick the first book.
 query: "Harry Potter and the Philosopher's Stone"
 </example>
 
 <example>
 Message: "Harry Potter 3"
 Action: search
-Reasoning: Third Harry Potter book.
 query: "Harry Potter and the Prisoner of Azkaban"
 </example>
 
 <example>
 Message: "Discworld"
 Action: search
-Reasoning: Series name, pick the first book.
 query: "The Colour of Magic"
 </example>
 
 <example>
+Message: "something like April Lady"
+Action: suggest
+suggestions: ["The Grand Sophy by Georgette Heyer", "Cotillion by Georgette Heyer", "Venetia by Georgette Heyer"]
+</example>
+
+<example>
 Message: "Georgette Heyer"
-Action: reply
-Reasoning: Author name only, no specific book.
-reply: "Which Georgette Heyer book? Try one of these: The Grand Sophy, Cotillion, or Frederica"
+Action: suggest
+suggestions: ["The Grand Sophy by Georgette Heyer", "Cotillion by Georgette Heyer", "Frederica by Georgette Heyer"]
 </example>
 
 <example>
 Message: "something funny"
-Action: reply
-Reasoning: Genre request, suggest specific titles.
-reply: "Try one of these: The Hitchhiker's Guide to the Galaxy, Good Omens, or Anxious People"
+Action: suggest
+suggestions: ["The Hitchhiker's Guide to the Galaxy by Douglas Adams", "Good Omens by Terry Pratchett & Neil Gaiman", "Anxious People by Fredrik Backman"]
+</example>
+
+<example>
+Message: "a good thriller"
+Action: suggest
+suggestions: ["The Girl with the Dragon Tattoo by Stieg Larsson", "Gone Girl by Gillian Flynn", "The Silent Patient by Alex Michaelides"]
+</example>
+
+<example>
+Pending suggestions: 1. The Grand Sophy  2. Cotillion  3. Frederica
+Message: "2"
+Action: search
+query: "Cotillion"
+</example>
+
+<example>
+Pending suggestions: 1. The Hitchhiker's Guide  2. Good Omens  3. Anxious People
+Message: "the first one"
+Action: search
+query: "The Hitchhiker's Guide to the Galaxy"
 </example>
 
 <example>
 Message: "thank you!"
 Action: reply
-Reasoning: Conversational, no book request.
 reply: "You're welcome! Text me a book title anytime."
 </example>
 
 <example>
 Message: "the next one"
 Action: reply
-Reasoning: Follow-up with no context — need the book name.
 reply: "Which book would you like next? Text me the title!"
 </example>
 
 <example>
 Message: "My friend recommended a book about a man on Mars"
 Action: search
-Reasoning: Likely "The Martian" by Andy Weir.
 query: "The Martian"
-</example>
-
-<example>
-Message: "📚"
-Action: reply
-Reasoning: Just an emoji, no book title.
-reply: "Send me a book title and I'll find the audiobook!"
 </example>
 
 <example>
 Message: "can you get me that one about the girl with the dragon tattoo"
 Action: search
-Reasoning: Recognisable description of a specific book.
 query: "The Girl with the Dragon Tattoo"
 </example>
 
 <example>
 Message: "what books do I have"
 Action: reply
-Reasoning: Question about the service.
 reply: "Open the BookPlayer app to see your library! Text me a title to add more."
 </example>
 </examples>
@@ -131,25 +140,55 @@ reply: "Open the BookPlayer app to see your library! Text me a title to add more
 Classify the message above."""
 
 
-def parse_sms(message: str) -> dict:
+def _get_context(phone: str) -> str:
+    """Build context block from conversation state for the LLM prompt."""
+    conv = _conversations.get(phone)
+    if not conv:
+        return ""
+    if time.time() - conv["ts"] > CONVERSATION_TTL:
+        del _conversations[phone]
+        return ""
+    suggestions = conv.get("suggestions", [])
+    if not suggestions:
+        return ""
+    numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(suggestions))
+    return f"\n<pending_suggestions>\n{numbered}\n</pending_suggestions>\n"
+
+
+def store_suggestions(phone: str, suggestions: list[str]) -> None:
+    """Store suggestions for a phone number so the next message can reference them."""
+    _conversations[phone] = {
+        "suggestions": suggestions,
+        "ts": time.time(),
+    }
+
+
+def parse_sms(message: str, phone: str = "") -> dict:
     """Parse an SMS message using Claude to classify intent.
 
     Returns:
         {"action": "search", "query": "..."} or
+        {"action": "suggest", "suggestions": ["...", "...", "..."]} or
         {"action": "reply", "reply": "..."}
     """
-    prompt = CLASSIFY_PROMPT.format(message=message)
+    context = _get_context(phone) if phone else ""
+    prompt = CLASSIFY_PROMPT.format(message=message, context=context)
 
     schema = json.dumps({
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["search", "reply"],
+                "enum": ["search", "suggest", "reply"],
             },
             "query": {
                 "type": "string",
                 "description": "Corrected book title to search for (when action is search)",
+            },
+            "suggestions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "3 book suggestions with author (when action is suggest)",
             },
             "reply": {
                 "type": "string",

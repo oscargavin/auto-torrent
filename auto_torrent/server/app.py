@@ -11,7 +11,7 @@ from fastapi import BackgroundTasks, FastAPI, Form, Header, Request, Response
 
 from .settings import Settings
 from .sms import SMSClient
-from .llm import parse_sms
+from .llm import parse_sms, store_suggestions
 from .worker import get_active_downloads, process_audiobook_request
 
 logger = logging.getLogger("atb.server")
@@ -117,14 +117,25 @@ async def sms_webhook(
 async def _classify_and_process(
     query: str, phone: str, settings: Settings, sms: SMSClient,
 ) -> None:
-    """LLM classifies the SMS, then either replies or dispatches search pipeline."""
-    classification = await asyncio.to_thread(parse_sms, query)
+    """LLM classifies the SMS, then replies, suggests, or dispatches search pipeline."""
+    classification = await asyncio.to_thread(parse_sms, query, phone)
     action = classification.get("action", "search")
     logger.info("LLM: '%s' → %s", query, action)
 
     if action == "reply":
         reply_text = classification.get("reply", "Send me a book title and I'll find it for you!")
         sms.send(phone, reply_text)
+        return
+
+    if action == "suggest":
+        suggestions = classification.get("suggestions", [])
+        if not suggestions:
+            sms.send(phone, "Send me a book title and I'll find it for you!")
+            return
+        # Store suggestions so next message can reference by number
+        store_suggestions(phone, suggestions)
+        numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(suggestions))
+        sms.send(phone, f"How about one of these?\n{numbered}\n\nReply with a number to download!")
         return
 
     # Action is "search" — run the full pipeline with the cleaned query
