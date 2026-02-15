@@ -99,16 +99,16 @@ async def process_audiobook_request(
     download_id = download["id"]
     download_path = download.get("path", "")
 
-    # Step 2: Notify — found and downloading
     display = f'"{title}"'
     if author:
         display += f" by {author}"
-    sms.send(phone, f"Found {display}! Downloading now...")
 
-    # Step 3: Poll for completion
+    # Step 2: Poll for completion — delay "downloading" SMS until we know
+    # the download isn't instant (avoids back-to-back "Found" + "Ready" texts)
     logger.info("Polling download %s", download_id)
     elapsed = 0
     final_status = "failed"
+    notified_downloading = False
 
     while elapsed < POLL_TIMEOUT:
         await asyncio.sleep(POLL_INTERVAL)
@@ -131,6 +131,11 @@ async def process_audiobook_request(
         elif status == "failed":
             final_status = "failed"
             break
+
+        # Still downloading — send "Found" SMS on first non-instant poll
+        if not notified_downloading:
+            sms.send(phone, f"Found {display}! Downloading now...")
+            notified_downloading = True
 
     if final_status != "completed":
         sms.send(phone, "Download didn't work. Send the title again to retry?")
