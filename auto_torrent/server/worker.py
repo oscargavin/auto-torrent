@@ -89,8 +89,8 @@ async def process_audiobook_request(
     # Extract info from search result
     download = search_result.get("download")
     book = search_result.get("book", {})
-    title = book.get("title", query)
-    author = book.get("author", "")
+    title = book.get("title") or query
+    author = book.get("author") or ""
 
     if not download or "id" not in download:
         sms.send(phone, f'Couldn\'t find "{query}". Try a different title?')
