@@ -168,7 +168,7 @@ def parse_sms(message: str) -> dict:
                 "--model", LLM_MODEL,
                 "--output-format", "json",
                 "--json-schema", schema,
-                "--max-turns", "1",
+                "--max-turns", "2",
                 "--system-prompt", SYSTEM_PROMPT,
             ],
             capture_output=True, text=True, timeout=LLM_TIMEOUT,
