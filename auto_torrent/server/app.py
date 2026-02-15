@@ -11,6 +11,7 @@ from fastapi import BackgroundTasks, FastAPI, Form, Header, Request, Response
 
 from .settings import Settings
 from .sms import SMSClient
+from .llm import parse_sms
 from .worker import get_active_downloads, process_audiobook_request
 
 logger = logging.getLogger("atb.server")
@@ -106,9 +107,31 @@ async def sms_webhook(
             lines.append(f'{d.get("title", "Unknown")} ({pct}%)')
         return _twiml_response("Downloading:\n" + "\n".join(lines))
 
-    # Dispatch background pipeline
-    background_tasks.add_task(process_audiobook_request, query, From, settings, sms)
-    return _twiml_response(f'Searching for "{query}"...')
+    # LLM classifies the message in a background task — Opus can take 10-15s
+    # which exceeds Twilio's webhook timeout. Return TwiML immediately,
+    # then the background task handles classification + search + reply.
+    background_tasks.add_task(_classify_and_process, query, From, settings, sms)
+    return _twiml_response(f'Got it! Looking into "{query}"...')
+
+
+async def _classify_and_process(
+    query: str, phone: str, settings: Settings, sms: SMSClient,
+) -> None:
+    """LLM classifies the SMS, then either replies or dispatches search pipeline."""
+    classification = await asyncio.to_thread(parse_sms, query)
+    action = classification.get("action", "search")
+    logger.info("LLM: '%s' → %s", query, action)
+
+    if action == "reply":
+        reply_text = classification.get("reply", "Send me a book title and I'll find it for you!")
+        sms.send(phone, reply_text)
+        return
+
+    # Action is "search" — run the full pipeline with the cleaned query
+    search_query = classification.get("query", query)
+    if search_query != query:
+        logger.info("LLM cleaned query: '%s' → '%s'", query, search_query)
+    await process_audiobook_request(search_query, phone, settings, sms)
 
 
 @app.get("/health")
