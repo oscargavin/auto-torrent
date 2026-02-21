@@ -91,6 +91,9 @@ async def search_audiobook(query: str, settings: Settings) -> dict | None:
     return result
 
 
+DOWNLOAD_TIMEOUT = 120  # --bg should return after metadata fetch (~30s), 120s gives headroom
+
+
 async def download_audiobook(
     magnet: str, title: str, author: str, settings: Settings,
 ) -> dict | None:
@@ -99,6 +102,7 @@ async def download_audiobook(
         _run_atb,
         ["download", magnet, "--title", f"{title} - {author}" if author else title, "--bg"],
         settings.atb_cwd,
+        DOWNLOAD_TIMEOUT,
     )
     return result
 
@@ -108,9 +112,13 @@ def _run_atb(args: list[str], cwd: str, timeout: int = SEARCH_TIMEOUT) -> dict |
     uv = "/home/oscar/.local/bin/uv"
     cmd = [uv, "run", "atb", *args, "--json"]
     logger.info("Running: %s", " ".join(cmd))
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
-    )
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("atb timed out after %ds: %s", timeout, " ".join(cmd[:5]))
+        return None
     if result.returncode != 0:
         logger.error("atb failed (exit %d): %s", result.returncode, result.stderr)
         return None
