@@ -163,6 +163,44 @@ def store_suggestions(phone: str, suggestions: list[str]) -> None:
     }
 
 
+def store_pending_results(phone: str, results: list[dict]) -> None:
+    """Store search results with magnets. Clears any existing suggestions."""
+    _conversations[phone] = {
+        "pending_results": results,
+        "ts": time.time(),
+    }
+
+
+def get_pending_result(phone: str, index: int) -> dict | None:
+    """Get a pending result by 1-based index. Returns None if expired/invalid."""
+    conv = _conversations.get(phone)
+    if not conv:
+        return None
+    if time.time() - conv["ts"] > CONVERSATION_TTL:
+        del _conversations[phone]
+        return None
+    results = conv.get("pending_results", [])
+    if index < 1 or index > len(results):
+        return None
+    return results[index - 1]
+
+
+def has_pending_results(phone: str) -> bool:
+    """Check if a phone number has non-expired pending results."""
+    conv = _conversations.get(phone)
+    if not conv:
+        return False
+    if time.time() - conv["ts"] > CONVERSATION_TTL:
+        del _conversations[phone]
+        return False
+    return bool(conv.get("pending_results"))
+
+
+def clear_conversation(phone: str) -> None:
+    """Remove all state for a phone number."""
+    _conversations.pop(phone, None)
+
+
 def parse_sms(message: str, phone: str = "") -> dict:
     """Parse an SMS message using Claude to classify intent.
 

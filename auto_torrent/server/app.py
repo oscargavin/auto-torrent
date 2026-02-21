@@ -11,8 +11,8 @@ from fastapi import BackgroundTasks, FastAPI, Form, Header, Request, Response
 
 from .settings import Settings
 from .sms import SMSClient
-from .llm import parse_sms, store_suggestions
-from .worker import get_active_downloads, process_audiobook_request
+from .llm import clear_conversation, get_pending_result, parse_sms, store_suggestions
+from .worker import _download_and_notify, get_active_downloads, process_audiobook_request
 
 logger = logging.getLogger("atb.server")
 
@@ -59,6 +59,17 @@ def _twiml_response(message: str) -> Response:
         f"<Response><Message>{message}</Message></Response>"
     )
     return Response(content=body, media_type="application/xml")
+
+
+def _try_quick_pick(query: str, phone: str) -> dict | None:
+    """Check if query is a bare digit selecting a pending search result."""
+    stripped = query.strip()
+    if not stripped.isdigit():
+        return None
+    index = int(stripped)
+    if index < 1:
+        return None
+    return get_pending_result(phone, index)
 
 
 @app.post("/sms")
@@ -118,6 +129,14 @@ async def _classify_and_process(
     query: str, phone: str, settings: Settings, sms: SMSClient,
 ) -> None:
     """LLM classifies the SMS, then replies, suggests, or dispatches search pipeline."""
+    # Fast path: bare digit picks a pending search result (skips 10-15s LLM call)
+    picked = _try_quick_pick(query, phone)
+    if picked:
+        logger.info("Quick pick: '%s' → result '%s'", query, picked.get("title"))
+        clear_conversation(phone)
+        await _download_and_notify(picked, phone, settings, sms)
+        return
+
     classification = await asyncio.to_thread(parse_sms, query, phone)
     action = classification.get("action") or "search"
     logger.info("LLM: '%s' → %s", query, action)
@@ -132,7 +151,6 @@ async def _classify_and_process(
         if not suggestions:
             sms.send(phone, "Send me a book title and I'll find it for you!")
             return
-        # Store suggestions so next message can reference by number
         store_suggestions(phone, suggestions)
         numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(suggestions))
         sms.send(phone, f"How about one of these?\n{numbered}\n\nReply with a number to download!")
