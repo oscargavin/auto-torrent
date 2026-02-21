@@ -111,8 +111,10 @@ title: "Project Hail Mary", author: "Andy Weir", series: null, narrator: null
     ), s.get("narrator")
 
 
-def _fan_out_search(book: BookMetadata) -> list[SearchResult]:
+def _fan_out_search(book: BookMetadata, raw_query: str | None = None) -> list[SearchResult]:
     queries = [book.title]
+    if raw_query and raw_query.lower() != book.title.lower():
+        queries.append(raw_query)
     if book.series:
         queries.append(book.series)
     if book.author:
@@ -899,7 +901,7 @@ def _cmd_search_abb(
     # Step 3: Search ABB with fan-out queries
     try:
         if book:
-            results = _fan_out_search(book)
+            results = _fan_out_search(book, raw_query=query)
         else:
             results = _direct_abb_search(query)
     except ABBError as e:
