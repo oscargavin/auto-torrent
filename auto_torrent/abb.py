@@ -13,6 +13,7 @@ from .config import ABB_BASE_URL, CACHE_DIR, DEFAULT_TRACKERS, HEADERS
 from .types import SearchResult
 
 _REQUEST_DELAY = (1.5, 3.0)
+_REQUEST_TIMEOUT = 45
 
 
 class ABBError(Exception):
@@ -80,7 +81,7 @@ def search(query: str, max_pages: int = 2) -> list[SearchResult]:
 
         url = f"{ABB_BASE_URL}/page/{page}/?s={query.lower().replace(' ', '+')}"
         try:
-            resp = session.get(url, timeout=15)
+            resp = session.get(url, timeout=_REQUEST_TIMEOUT)
             resp.raise_for_status()
         except requests.ConnectTimeout:
             raise ABBError("AudiobookBay is not responding (connection timed out)")
@@ -140,7 +141,7 @@ def search(query: str, max_pages: int = 2) -> list[SearchResult]:
 def get_details(result: SearchResult) -> SearchResult:
     session = _get_session()
     _delay()
-    resp = session.get(result.link, timeout=15)
+    resp = session.get(result.link, timeout=_REQUEST_TIMEOUT)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")

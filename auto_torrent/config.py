@@ -42,7 +42,7 @@ PROBE_CANDIDATES = 3
 
 # LLM selection
 LLM_MODEL = "sonnet"
-LLM_TIMEOUT = 30
+LLM_TIMEOUT = 90
 
 # Download progress
 DOWNLOAD_PROGRESS_INTERVAL = 5  # seconds between state file updates
