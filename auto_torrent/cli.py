@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import multiprocessing
 import os
 import re
 import subprocess
@@ -26,7 +25,7 @@ from .config import (
     MIN_SCORE, PROBE_CANDIDATES, PROBE_TIMEOUT, SCRAPE_WORKERS, STATE_DIR,
     STREAM_DIR, STREAM_PORT, get_proxy,
 )
-from .download import download_torrent, run_background_download
+from .download import download_torrent
 from .openlibrary import download_cover, lookup_book
 from .scoring import quick_score, score_and_sort
 from .torrent import TorrentError
@@ -415,12 +414,17 @@ def _execute_download_bg(
     _write_state(state)
 
     state_file = str(STATE_DIR / f"{download_id}.json")
-    proc = multiprocessing.Process(
-        target=run_background_download,
-        args=(magnet, str(dest), state_file, list(DEFAULT_TRACKERS)),
-        daemon=False,
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "auto_torrent.download",
+            magnet, str(dest), state_file,
+            ",".join(DEFAULT_TRACKERS),
+        ],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    proc.start()
 
     state["pid"] = proc.pid
     _write_state(state)
@@ -1032,10 +1036,6 @@ def cmd_download(args: argparse.Namespace) -> None:
             print(f"  Download started in background (id: {state['id']})")
             print(f"  Path: {state['path']}")
             print(f"  Check progress: auto-torrent status {state['id']}")
-        # Exit immediately so parent doesn't wait for the non-daemon child
-        import sys
-        sys.stdout.flush()
-        os._exit(0)
     else:
         info = _execute_download_fg(title, magnet, cover_id)
         if json_mode:

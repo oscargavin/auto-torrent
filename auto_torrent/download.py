@@ -143,3 +143,13 @@ def run_background_download(
             _update_state_progress(Path(state_file), 0.0, status="failed")
         except Exception:
             pass
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    run_background_download(
+        magnet=_sys.argv[1],
+        dest=_sys.argv[2],
+        state_file=_sys.argv[3],
+        trackers=_sys.argv[4].split(",") if len(_sys.argv) > 4 else None,
+    )
