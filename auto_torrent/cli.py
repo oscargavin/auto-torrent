@@ -1032,6 +1032,10 @@ def cmd_download(args: argparse.Namespace) -> None:
             print(f"  Download started in background (id: {state['id']})")
             print(f"  Path: {state['path']}")
             print(f"  Check progress: auto-torrent status {state['id']}")
+        # Exit immediately so parent doesn't wait for the non-daemon child
+        import sys
+        sys.stdout.flush()
+        os._exit(0)
     else:
         info = _execute_download_fg(title, magnet, cover_id)
         if json_mode:
