@@ -172,7 +172,7 @@ async def _download_and_notify(
         sms.send(phone, "Download didn't start. Send the title again to retry?")
         return
 
-    download = dl_result.get("download", {})
+    download = dl_result.get("download") or dl_result
     download_id = download.get("id")
     download_path = download.get("path", "")
 
