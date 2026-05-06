@@ -1,4 +1,6 @@
-"""FastAPI app — SMS webhook for audiobook requests."""
+"""FastAPI app — Twilio SMS webhook → agentic worker → deterministic poll."""
+
+from __future__ import annotations
 
 import asyncio
 import hashlib
@@ -9,10 +11,11 @@ from typing import AsyncIterator
 
 from fastapi import BackgroundTasks, FastAPI, Form, Header, Request, Response
 
+from .agent import AgentOutcome, run_agent
+from .llm import clear_conversation, get_pending_options, get_pending_result
 from .settings import Settings
 from .sms import SMSClient
-from .llm import clear_conversation, get_pending_result, parse_sms, store_suggestions
-from .worker import _download_and_notify, get_active_downloads, process_audiobook_request
+from .worker import get_active_downloads, poll_and_finalise
 
 logger = logging.getLogger("atb.server")
 
@@ -61,15 +64,12 @@ def _twiml_response(message: str) -> Response:
     return Response(content=body, media_type="application/xml")
 
 
-def _try_quick_pick(query: str, phone: str) -> dict | None:
-    """Check if query is a bare digit selecting a pending search result."""
+def _maybe_quick_pick(query: str, phone: str) -> dict | None:
+    """If query is a bare digit, resolve it against pending results."""
     stripped = query.strip()
     if not stripped.isdigit():
         return None
-    index = int(stripped)
-    if index < 1:
-        return None
-    return get_pending_result(phone, index)
+    return get_pending_result(phone, int(stripped))
 
 
 @app.post("/sms")
@@ -80,7 +80,6 @@ async def sms_webhook(
     From: str = Form(""),
     x_twilio_signature: str = Header("", alias="X-Twilio-Signature"),
 ) -> Response:
-    # Validate Twilio signature
     form_data = dict(await request.form())
     url = _reconstruct_url(request)
 
@@ -88,7 +87,6 @@ async def sms_webhook(
         logger.warning("Invalid Twilio signature from %s", From)
         return Response(status_code=403)
 
-    # Check whitelist
     if From not in settings.allowed_numbers:
         logger.warning("Unauthorized number: %s", From)
         return Response(status_code=403)
@@ -96,12 +94,10 @@ async def sms_webhook(
     query = Body.strip()
     logger.info("SMS from %s: %s", From, query)
 
-    # Handle special commands
     if not query:
         return _twiml_response("Send me a book title and I'll find it for you!")
 
     lower = query.lower()
-
     if lower == "help":
         return _twiml_response(
             "Text me a book title and I'll find the audiobook! "
@@ -118,49 +114,86 @@ async def sms_webhook(
             lines.append(f'{d.get("title", "Unknown")} ({pct}%)')
         return _twiml_response("Downloading:\n" + "\n".join(lines))
 
-    # LLM classifies the message in a background task — Opus can take 10-15s
-    # which exceeds Twilio's webhook timeout. Return TwiML immediately,
-    # then the background task handles classification + search + reply.
-    background_tasks.add_task(_classify_and_process, query, From, settings, sms)
-    return _twiml_response("Got it! Give me a moment...")
+    background_tasks.add_task(_handle_request, query, From)
+    return _twiml_response("Got it!")
 
 
-async def _classify_and_process(
-    query: str, phone: str, settings: Settings, sms: SMSClient,
-) -> None:
-    """LLM classifies the SMS, then replies, suggests, or dispatches search pipeline."""
-    # Fast path: bare digit picks a pending search result (skips 10-15s LLM call)
-    picked = _try_quick_pick(query, phone)
+async def _handle_request(query: str, phone: str) -> None:
+    """Resolve a digit-pick if pending, else hand to the agent. Then poll."""
+    picked = _maybe_quick_pick(query, phone)
+
     if picked:
-        logger.info("Quick pick: '%s' → result '%s'", query, picked.get("title"))
         clear_conversation(phone)
-        await _download_and_notify(picked, phone, settings, sms)
+        await _commit_and_poll_from_pick(picked, phone)
         return
 
-    classification = await asyncio.to_thread(parse_sms, query, phone)
-    action = classification.get("action") or "search"
-    logger.info("LLM: '%s' → %s", query, action)
+    pending = get_pending_options(phone)
+    outcome = await run_agent(query, phone, settings, sms, pending_options=pending)
 
-    if action == "reply":
-        reply_text = classification.get("reply", "Send me a book title and I'll find it for you!")
-        sms.send(phone, reply_text)
+    if outcome.kind == "committed":
+        clear_conversation(phone)
+        try:
+            await poll_and_finalise(
+                download=outcome.download,
+                fallbacks=outcome.fallbacks,
+                display=outcome.display,
+                author=outcome.author,
+                title=outcome.title,
+                phone=phone,
+                settings=settings,
+                sms=sms,
+            )
+        except Exception:
+            logger.exception("poll_and_finalise crashed")
+            sms.send(phone, "Something went wrong while downloading. Send the title again to retry?")
+    elif outcome.kind in ("asked", "no_results"):
+        # Agent already sent any user-facing SMS.
+        pass
+    else:
+        logger.warning("agent error outcome: %s", outcome.message)
+        sms.send(phone, "I had trouble with that — try again with the full title?")
+
+
+async def _commit_and_poll_from_pick(picked: dict, phone: str) -> None:
+    """User picked a number from a pending list. Start the download and poll."""
+    from ..cli import _execute_download_bg
+
+    title = picked.get("title") or "Unknown"
+    author = picked.get("author") or ""
+    magnet = picked.get("magnet") or ""
+    if not magnet:
+        sms.send(phone, "That option's gone stale, sorry — search again?")
         return
 
-    if action == "suggest":
-        suggestions = classification.get("suggestions", [])
-        if not suggestions:
-            sms.send(phone, "Send me a book title and I'll find it for you!")
-            return
-        store_suggestions(phone, suggestions)
-        numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(suggestions))
-        sms.send(phone, f"How about one of these?\n{numbered}\n\nReply with a number to download!")
+    bg_title = f"{title} - {author}" if author else title
+    try:
+        download = await asyncio.to_thread(_execute_download_bg, bg_title, magnet, None)
+    except Exception:
+        logger.exception("pick → BG start failed")
+        sms.send(phone, "Couldn't start that download. Try again?")
         return
 
-    # Action is "search" — run the full pipeline with the cleaned query
-    search_query = classification.get("query", query)
-    if search_query != query:
-        logger.info("LLM cleaned query: '%s' → '%s'", query, search_query)
-    await process_audiobook_request(search_query, phone, settings, sms)
+    display = f"“{title}”" + (f" by {author}" if author else "")
+    narrator = picked.get("narrator")
+    if narrator:
+        sms.send(phone, f"Found {display}, narrated by {narrator}. Downloading now…")
+    else:
+        sms.send(phone, f"Found {display}. Downloading now…")
+
+    try:
+        await poll_and_finalise(
+            download=download,
+            fallbacks=[],
+            display=display,
+            author=author,
+            title=title,
+            phone=phone,
+            settings=settings,
+            sms=sms,
+        )
+    except Exception:
+        logger.exception("poll_and_finalise after pick crashed")
+        sms.send(phone, "Something went wrong while downloading. Send the title again to retry?")
 
 
 @app.get("/health")
@@ -172,7 +205,6 @@ async def health() -> dict[str, str]:
 async def github_webhook(request: Request) -> Response:
     body = await request.body()
 
-    # Verify GitHub signature if secret is configured
     secret = settings.github_webhook_secret
     if secret:
         signature = request.headers.get("X-Hub-Signature-256", "")
@@ -180,7 +212,6 @@ async def github_webhook(request: Request) -> Response:
         if not hmac.compare_digest(signature, expected):
             return Response(status_code=403)
 
-    # Run deploy script in background
     async def _deploy() -> None:
         proc = await asyncio.create_subprocess_exec(
             "/home/oscar/auto-torrent/deploy.sh",
@@ -203,6 +234,6 @@ def serve() -> None:
     uvicorn.run(
         "auto_torrent.server.app:app",
         host="127.0.0.1",
-        port=settings.port,  # default 8004
+        port=settings.port,
         log_level="info",
     )

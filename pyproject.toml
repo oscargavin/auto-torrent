@@ -20,6 +20,7 @@ server = [
     "httpx>=0.28",
     "pydantic-settings>=2.7",
     "python-multipart>=0.0.20",
+    "claude-agent-sdk>=0.1.73",
 ]
 
 [project.scripts]

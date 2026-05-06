@@ -149,6 +149,15 @@ def get_details(result: SearchResult) -> SearchResult:
 
     content = soup.select_one(".postContent")
     if content:
+        cover_img = content.find("img")
+        if cover_img and cover_img.get("src"):
+            src = cover_img["src"]
+            if src.startswith("//"):
+                src = "https:" + src
+            elif src.startswith("/"):
+                src = ABB_BASE_URL + src
+            updates["cover_url"] = src
+
         desc_parts: list[str] = []
         for p in content.find_all("p"):
             text = p.get_text(strip=True)

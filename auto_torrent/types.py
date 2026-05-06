@@ -25,6 +25,7 @@ class SearchResult:
     language: str = ""
     abridged: bool | None = None
     magnet: str = ""
+    cover_url: str = ""
 
 
 @dataclass(frozen=True)
