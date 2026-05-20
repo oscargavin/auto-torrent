@@ -18,7 +18,7 @@ from .agent import AgentOutcome, run_agent
 from .llm import clear_conversation, get_pending_options, get_pending_result
 from .settings import Settings
 from .sms import SMSClient
-from .worker import get_active_downloads, poll_and_finalise
+from .worker import _refresh_state, get_active_downloads, poll_and_finalise
 
 logger = logging.getLogger("atb.server")
 
@@ -241,10 +241,16 @@ class ChatEventBus:
 
     def __init__(self) -> None:
         self.queue: asyncio.Queue[tuple[str, dict] | None] = asyncio.Queue()
-        self._loop = asyncio.get_event_loop()
+        # Constructed inside an async request handler, so the loop is running.
+        self._loop = asyncio.get_running_loop()
+        # Whether the agent has surfaced anything to the user via send(). Used
+        # by /chat to decide if an "agent ended without commit/ask" outcome is
+        # a real failure or just a graceful no-results that already messaged.
+        self.messaged = False
 
     def send(self, to: str, body: str) -> None:
         # `to` is the session id in chat mode — ignored, the SSE stream is the channel.
+        self.messaged = True
         self._loop.call_soon_threadsafe(
             self.queue.put_nowait, ("progress", {"text": body})
         )
@@ -261,6 +267,11 @@ class ChatRequest(BaseModel):
     session_id: str = "default"
 
 
+# How often the chat path polls download state and emits "Downloading… N%" as
+# a progress event so the bubble shows motion. Tests override.
+CHAT_PROGRESS_INTERVAL_S: float = 30.0
+
+
 def _require_bearer(authorization: str = Header("", alias="Authorization")) -> None:
     token = settings.atb_api_token
     if not token:
@@ -268,6 +279,72 @@ def _require_bearer(authorization: str = Header("", alias="Authorization")) -> N
     expected = f"Bearer {token}"
     if not hmac.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="unauthorized")
+
+
+async def _chat_progress_pump(
+    download_id: str, bus: "ChatEventBus", stop: asyncio.Event
+) -> None:
+    """Emit a progress event whenever the download's percentage changes.
+
+    Why: poll_and_finalise blocks for the entire download (minutes to hours)
+    without sending SMS — fine for SMS UX, dead silent for chat UX. The pump
+    fills the gap so the bubble shows motion.
+    """
+    last_pct = -1
+    while True:
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=CHAT_PROGRESS_INTERVAL_S)
+            return
+        except asyncio.TimeoutError:
+            pass
+        state = _refresh_state(download_id)
+        if not state:
+            continue
+        pct = int(float(state.get("progress") or 0) * 100)
+        if pct != last_pct:
+            bus.send("", f"Downloading… {pct}%")
+            last_pct = pct
+
+
+async def _emit_download_and_poll(
+    bus: "ChatEventBus",
+    *,
+    download: dict,
+    fallbacks: list[dict],
+    display: str,
+    title: str,
+    author: str,
+    session: str,
+) -> None:
+    """Emit `committed`, run the poll with a progress pump, then `completed`."""
+    download_id = download.get("id", "")
+    bus.emit(
+        "committed",
+        {"id": download_id, "title": title, "author": author, "display": display},
+    )
+    stop = asyncio.Event()
+    pump = asyncio.create_task(_chat_progress_pump(download_id, bus, stop))
+    try:
+        await poll_and_finalise(
+            download=download,
+            fallbacks=fallbacks,
+            display=display,
+            author=author,
+            title=title,
+            phone=session,
+            settings=settings,
+            sms=bus,
+        )
+        bus.emit("completed", {"title": title, "author": author})
+    except Exception as e:  # noqa: BLE001
+        logger.exception("chat poll_and_finalise crashed")
+        bus.emit("error", {"message": f"download error: {e}"})
+    finally:
+        stop.set()
+        try:
+            await pump
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @app.post("/chat")
@@ -294,32 +371,22 @@ async def chat(req: ChatRequest, _: None = Depends(_require_bearer)) -> Streamin
 
             if outcome.kind == "committed":
                 clear_conversation(session)
-                bus.emit(
-                    "committed",
-                    {
-                        "id": (outcome.download or {}).get("id", ""),
-                        "title": outcome.title,
-                        "author": outcome.author,
-                        "display": outcome.display,
-                    },
+                await _emit_download_and_poll(
+                    bus,
+                    download=outcome.download or {},
+                    fallbacks=outcome.fallbacks,
+                    display=outcome.display,
+                    title=outcome.title,
+                    author=outcome.author,
+                    session=session,
                 )
-                try:
-                    await poll_and_finalise(
-                        download=outcome.download,
-                        fallbacks=outcome.fallbacks,
-                        display=outcome.display,
-                        author=outcome.author,
-                        title=outcome.title,
-                        phone=session,
-                        settings=settings,
-                        sms=bus,
-                    )
-                    bus.emit("completed", {"title": outcome.title, "author": outcome.author})
-                except Exception as e:  # noqa: BLE001
-                    logger.exception("chat poll_and_finalise crashed")
-                    bus.emit("error", {"message": f"download error: {e}"})
             elif outcome.kind in ("asked", "no_results"):
                 # Agent already pushed user-facing text via bus.send (→ progress events).
+                pass
+            elif bus.messaged:
+                # Agent ended in error but already informed the user (graceful
+                # no-results path returns kind="error" with no commit/ask).
+                # Suppress the phantom red bubble after a real message.
                 pass
             else:
                 bus.emit("error", {"message": outcome.message or "agent error"})
@@ -384,26 +451,15 @@ async def _chat_commit_and_poll(picked: dict, session: str, bus: ChatEventBus) -
         else f"Found {display}. Downloading now…"
     )
     bus.send(session, line)
-    bus.emit(
-        "committed",
-        {"id": download.get("id", ""), "title": title, "author": author, "display": display},
+    await _emit_download_and_poll(
+        bus,
+        download=download,
+        fallbacks=[],
+        display=display,
+        title=title,
+        author=author,
+        session=session,
     )
-
-    try:
-        await poll_and_finalise(
-            download=download,
-            fallbacks=[],
-            display=display,
-            author=author,
-            title=title,
-            phone=session,
-            settings=settings,
-            sms=bus,
-        )
-        bus.emit("completed", {"title": title, "author": author})
-    except Exception as e:  # noqa: BLE001
-        logger.exception("chat poll_and_finalise after pick crashed")
-        bus.emit("error", {"message": f"download error: {e}"})
 
 
 def serve() -> None:
