@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     atb_cwd: str
     port: int = 8004
     github_webhook_secret: str = ""
+    atb_api_token: str = ""
 
     @field_validator("allowed_numbers", mode="before")
     @classmethod
