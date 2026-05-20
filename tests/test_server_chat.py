@@ -143,8 +143,11 @@ async def test_no_results_after_agent_message_does_not_emit_error():
     assert status == 200
     names = [name for name, _ in events]
     assert "error" not in names, f"expected no error event, got: {events}"
-    assert names == ["progress"]
-    assert events[0][1]["text"].startswith("Couldn't find")
+    # Initial server "Searching…" progress, then the agent's "Couldn't find…"
+    # progress. No phantom error after.
+    assert names == ["progress", "progress"]
+    assert "Searching" in events[0][1]["text"]
+    assert events[1][1]["text"].startswith("Couldn't find")
 
 
 # --- agent crash with no message (positive control for the suppression) ---
@@ -163,8 +166,67 @@ async def test_agent_crash_without_message_still_emits_error():
 
     assert status == 200
     names = [name for name, _ in events]
-    assert names == ["error"]
-    assert "boom" in events[0][1]["message"]
+    # An initial "Searching…" progress is emitted by the server itself
+    # (system message, doesn't count as agent-messaged), then the genuine error.
+    assert "error" in names
+    assert events[-1][0] == "error"
+    assert "boom" in events[-1][1]["message"]
+
+
+# --- pre-commit gap: instant feedback so the bubble isn't a static "Thinking…" ---
+
+
+@pytest.mark.anyio
+async def test_chat_emits_searching_progress_before_agent_starts():
+    """Regression for the user-reported "stuck on Working/Thinking" bug.
+
+    The agent's search phase can take 60–90s before the first send_sms.
+    During that time the bubble was a static spinner with no context.
+    The server must emit an initial "Searching for '<query>'…" progress
+    event before run_agent starts so the bubble has motion immediately."""
+    import asyncio
+
+    seen_searching = asyncio.Event()
+
+    async def slow_agent(query, phone, settings_, sms_, pending_options=None):
+        # Don't ack until the searching event has been emitted to the bus.
+        # (The server should emit it BEFORE calling us.)
+        seen_searching.set()
+        return AgentOutcome(kind="error", message="never used")
+
+    with patch.object(app_module, "run_agent", slow_agent):
+        status, events = await _post_chat(
+            {"query": "the eye of the world", "session_id": "s-search"}
+        )
+
+    assert status == 200
+    progress_texts = [d.get("text", "") for n, d in events if n == "progress"]
+    assert progress_texts, "expected an immediate 'Searching…' progress event"
+    first = progress_texts[0].lower()
+    assert "searching" in first, f"first progress should announce searching: {first!r}"
+    assert "eye of the world" in first, (
+        f"first progress should echo the query so the user knows it landed: {first!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_initial_searching_does_not_count_as_agent_messaged():
+    """The server's own 'Searching…' line must NOT flip bus.messaged — otherwise
+    a legit agent crash with no follow-up would be wrongly suppressed."""
+
+    async def crashed_agent(query, phone, settings_, sms_, pending_options=None):
+        return AgentOutcome(kind="error", message="agent really crashed")
+
+    with patch.object(app_module, "run_agent", crashed_agent):
+        status, events = await _post_chat({"query": "x", "session_id": "s-crash2"})
+
+    assert status == 200
+    names = [name for name, _ in events]
+    # Initial searching progress is fine, but the error must still surface
+    # because the agent itself never spoke.
+    assert "progress" in names
+    assert "error" in names
+    assert names[-1] == "error"
 
 
 # --- committed → progress pump → completed (regression: bug A) -----------
@@ -214,22 +276,22 @@ async def test_committed_path_emits_periodic_progress_then_completed():
     assert status == 200
     names = [name for name, _ in events]
 
-    assert names[0] == "committed"
+    # First a "Searching…" progress, then committed, then download-progress, then completed.
+    assert names[0] == "progress"
+    assert "Searching" in events[0][1].get("text", "")
+    assert "committed" in names
     assert names[-1] == "completed"
+    assert names.index("committed") < names.index("completed")
 
-    progress_texts = [
+    download_progress_texts = [
         data.get("text", "")
         for name, data in events
-        if name == "progress"
+        if name == "progress" and "%" in data.get("text", "")
     ]
-    assert progress_texts, "expected at least one download-progress event"
-    assert any("%" in t for t in progress_texts), (
-        f"expected a percentage in progress events, got: {progress_texts}"
-    )
-    percents = [t for t in progress_texts if "%" in t]
-    assert percents == sorted(set(percents), key=percents.index), (
-        f"duplicate percentages emitted: {percents}"
-    )
+    assert download_progress_texts, "expected at least one download-progress event with a %"
+    assert download_progress_texts == sorted(
+        set(download_progress_texts), key=download_progress_texts.index
+    ), f"duplicate percentages emitted: {download_progress_texts}"
 
 
 # --- ChatEventBus tracks whether the agent ever messaged ----------------

@@ -255,6 +255,14 @@ class ChatEventBus:
             self.queue.put_nowait, ("progress", {"text": body})
         )
 
+    def system_progress(self, body: str) -> None:
+        """Server-emitted progress (e.g. "Searching…") that does NOT count as
+        the agent having messaged — so a subsequent agent crash with no output
+        still surfaces as an error rather than being suppressed."""
+        self._loop.call_soon_threadsafe(
+            self.queue.put_nowait, ("progress", {"text": body})
+        )
+
     def emit(self, event: str, data: dict) -> None:
         self._loop.call_soon_threadsafe(self.queue.put_nowait, (event, data))
 
@@ -365,6 +373,12 @@ async def chat(req: ChatRequest, _: None = Depends(_require_bearer)) -> Streamin
                 clear_conversation(session)
                 await _chat_commit_and_poll(picked, session, bus)
                 return
+
+            # Instant feedback. The agent's pre-commit phase (LLM parse →
+            # fan-out ABB search → enrich → score → rank → DHT probe) can run
+            # 60–90s before the first send_sms. Without this, the bubble sits
+            # on a static "Thinking…" spinner that looks frozen.
+            bus.system_progress(f"Searching for “{query}”…")
 
             pending = get_pending_options(session)
             outcome = await run_agent(query, session, settings, bus, pending_options=pending)
