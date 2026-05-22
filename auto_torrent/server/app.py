@@ -25,6 +25,10 @@ logger = logging.getLogger("atb.server")
 settings = Settings()
 sms = SMSClient(settings)
 
+# Strong references to detached /chat work tasks so they aren't garbage-collected
+# if the client disconnects mid-download (app backgrounded/closed).
+_background_tasks: set[asyncio.Task] = set()
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -410,26 +414,27 @@ async def chat(req: ChatRequest, _: None = Depends(_require_bearer)) -> Streamin
         finally:
             bus.close()
 
+    # Run the work detached from the SSE response. If the client disconnects
+    # (app backgrounded or closed), the download AND the library organise/scan
+    # must still finish so the book lands in the library regardless — so this
+    # task is deliberately NOT cancelled when the stream closes.
+    task = asyncio.create_task(run_chat())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
     async def event_stream() -> AsyncIterator[str]:
-        task = asyncio.create_task(run_chat())
-        try:
-            while True:
-                try:
-                    item = await asyncio.wait_for(bus.queue.get(), timeout=20.0)
-                except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
-                    continue
-                if item is None:
-                    break
-                event, data = item
-                yield f"event: {event}\ndata: {json.dumps(data)}\n\n"
-        finally:
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+        # Drain the bus while the client is connected. On disconnect this
+        # generator is closed, but `task` keeps running to completion.
+        while True:
+            try:
+                item = await asyncio.wait_for(bus.queue.get(), timeout=20.0)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            if item is None:
+                break
+            event, data = item
+            yield f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
     return StreamingResponse(
         event_stream(),
