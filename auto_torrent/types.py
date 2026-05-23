@@ -32,3 +32,24 @@ class SearchResult:
 class ScoredResult:
     result: SearchResult
     score: int
+
+
+@dataclass(frozen=True)
+class BookCard:
+    """Display metadata for a recommended audiobook, hydrated from Audible/
+    Audnexus (square cover) with Open Library as a fallback. Tuples (not lists)
+    so the dataclass stays immutable/hashable and JSON-serialises cleanly."""
+
+    title: str
+    author: str
+    asin: str | None = None
+    subtitle: str | None = None
+    narrators: tuple[str, ...] = ()
+    description: str = ""
+    cover_url: str | None = None
+    series: str | None = None
+    series_position: str | None = None
+    genres: tuple[str, ...] = ()
+    runtime_min: int | None = None
+    year: int | None = None
+    source: str = "audible"

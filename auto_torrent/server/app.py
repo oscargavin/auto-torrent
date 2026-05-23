@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from .agent import AgentOutcome, run_agent
 from .llm import clear_conversation, get_pending_options, get_pending_result
 from .profiles import ALLOWED_AVATAR_STYLES, ProfileStore, public_view
+from .recommend import DEFAULT_N, RecCache, build_recommendations
 from .settings import Settings
 from .sms import SMSClient
 from .worker import _refresh_state, get_active_downloads, poll_and_finalise
@@ -27,6 +28,7 @@ logger = logging.getLogger("atb.server")
 settings = Settings()
 sms = SMSClient(settings)
 profile_store = ProfileStore(settings)
+rec_cache = RecCache(settings.rec_cache_path)
 
 # Strong references to detached /chat work tasks so they aren't garbage-collected
 # if the client disconnects mid-download (app backgrounded/closed).
@@ -580,6 +582,41 @@ async def sync_profiles(_: None = Depends(_require_profiles_secret)) -> dict:
         logger.warning("profile sync failed: %s", e)
         raise HTTPException(status_code=502, detail="audiobookshelf rejected the request") from e
     return {"profiles": [public_view(p) for p in profiles]}
+
+
+# --- Bookkeeper recommendations -----------------------------------------
+#
+# Claude recommends audiobooks the profile doesn't own yet, hydrated server-side
+# into rich cards (square Audible covers) so the app just renders + offers a
+# "Request" that flows into the existing Get-a-book chat. Same atb_api_token
+# bearer the app already uses for /chat. See recommend.py.
+
+
+class FinishedBook(BaseModel):
+    title: str
+    author: str = ""
+
+
+class RecommendRequest(BaseModel):
+    profile_id: str = "default"
+    finished: list[FinishedBook] = []
+    exclude: list[str] = []
+    refresh: bool = False
+    n: int = DEFAULT_N
+
+
+@app.post("/recommend")
+async def recommend(req: RecommendRequest, _: None = Depends(_require_bearer)) -> dict:
+    finished = [{"title": b.title, "author": b.author} for b in req.finished]
+    items = await build_recommendations(
+        req.profile_id,
+        finished,
+        exclude=req.exclude,
+        n=min(max(req.n, 1), 24),
+        refresh=req.refresh,
+        cache=rec_cache,
+    )
+    return {"recommendations": items}
 
 
 def serve() -> None:

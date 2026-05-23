@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     profiles_app_secret: str = ""
     profiles_store_path: str = "profiles.json"
 
+    # Per-(profile + listening history) recommendation cache, so Claude only
+    # runs when a profile's finished books change (or on refresh).
+    rec_cache_path: str = "rec-cache.json"
+
     @field_validator("allowed_numbers", mode="before")
     @classmethod
     def parse_numbers(cls, v: str | list[str]) -> list[str]:
