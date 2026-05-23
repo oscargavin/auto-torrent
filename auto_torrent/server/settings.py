@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     github_webhook_secret: str = ""
     atb_api_token: str = ""
 
+    # Bookkeeper "profiles" feature: a shared app secret the mobile app sends to
+    # manage family ABS accounts via /profiles, and the JSON file the minted
+    # per-user API keys are persisted to (tokens are only shown once by ABS).
+    profiles_app_secret: str = ""
+    profiles_store_path: str = "profiles.json"
+
     @field_validator("allowed_numbers", mode="before")
     @classmethod
     def parse_numbers(cls, v: str | list[str]) -> list[str]:

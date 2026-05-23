@@ -11,3 +11,7 @@ wheels/
 
 # Local secrets
 .env
+
+# Persisted family-profile API-key tokens (server-side only)
+profiles.json
+profiles.tmp

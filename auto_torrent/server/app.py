@@ -10,12 +10,14 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Form, Header, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .agent import AgentOutcome, run_agent
 from .llm import clear_conversation, get_pending_options, get_pending_result
+from .profiles import ProfileStore, public_view
 from .settings import Settings
 from .sms import SMSClient
 from .worker import _refresh_state, get_active_downloads, poll_and_finalise
@@ -24,6 +26,7 @@ logger = logging.getLogger("atb.server")
 
 settings = Settings()
 sms = SMSClient(settings)
+profile_store = ProfileStore(settings)
 
 # Strong references to detached /chat work tasks so they aren't garbage-collected
 # if the client disconnects mid-download (app backgrounded/closed).
@@ -479,6 +482,74 @@ async def _chat_commit_and_poll(picked: dict, session: str, bus: ChatEventBus) -
         author=author,
         session=session,
     )
+
+
+# --- Bookkeeper family profiles -----------------------------------------
+#
+# The mobile app manages family ABS accounts here using a shared app secret, so
+# the app never holds the ABS admin token. Each profile is an ABS user + a
+# long-lived API key; the app authenticates as a person by that key, giving
+# per-user listening progress. See profiles.py.
+
+
+def _require_profiles_secret(authorization: str = Header("", alias="Authorization")) -> None:
+    secret = settings.profiles_app_secret
+    if not secret:
+        raise HTTPException(status_code=503, detail="profiles endpoint not configured")
+    if not hmac.compare_digest(authorization, f"Bearer {secret}"):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+class CreateProfileRequest(BaseModel):
+    name: str
+
+
+@app.get("/profiles")
+async def get_profiles(_: None = Depends(_require_profiles_secret)) -> dict:
+    profiles = await profile_store.list()
+    return {"profiles": [public_view(p) for p in profiles]}
+
+
+@app.post("/profiles")
+async def create_profile(
+    req: CreateProfileRequest, _: None = Depends(_require_profiles_secret)
+) -> dict:
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    if len(name) > 40:
+        raise HTTPException(status_code=400, detail="name too long")
+    try:
+        profile = await profile_store.create(name)
+    except httpx.HTTPStatusError as e:
+        logger.warning("profile create failed: %s", e)
+        raise HTTPException(status_code=502, detail="audiobookshelf rejected the request") from e
+    return {"profile": public_view(profile)}
+
+
+@app.delete("/profiles/{profile_id}")
+async def delete_profile(
+    profile_id: str, _: None = Depends(_require_profiles_secret)
+) -> dict:
+    try:
+        removed = await profile_store.delete(profile_id)
+    except httpx.HTTPStatusError as e:
+        logger.warning("profile delete failed: %s", e)
+        raise HTTPException(status_code=502, detail="audiobookshelf rejected the request") from e
+    if not removed:
+        raise HTTPException(status_code=404, detail="profile not found")
+    return {"ok": True}
+
+
+@app.post("/profiles/sync")
+async def sync_profiles(_: None = Depends(_require_profiles_secret)) -> dict:
+    """Seed profiles for any non-admin ABS user that doesn't have one yet."""
+    try:
+        profiles = await profile_store.sync()
+    except httpx.HTTPStatusError as e:
+        logger.warning("profile sync failed: %s", e)
+        raise HTTPException(status_code=502, detail="audiobookshelf rejected the request") from e
+    return {"profiles": [public_view(p) for p in profiles]}
 
 
 def serve() -> None:
