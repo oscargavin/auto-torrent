@@ -202,6 +202,10 @@ class TestParseBook:
         card = parse_book(data)
         assert card.description == "The full blurb, much longer than the teaser."
 
+    def test_decodes_html_entities_in_summary(self):
+        card = parse_book({**AUDNEX_PHM, "summary": "<p>She said &quot;hi&quot; &amp; left.</p>"})
+        assert card.description == 'She said "hi" & left.'
+
     def test_falls_back_to_description_when_no_summary(self):
         card = parse_book(AUDNEX_PHM)  # fixture has description, no summary
         assert card.description.startswith("When the Sun")

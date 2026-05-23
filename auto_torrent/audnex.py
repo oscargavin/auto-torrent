@@ -12,6 +12,7 @@ the recommendation builder; this module stays a pure pipeline.
 
 from __future__ import annotations
 
+import html
 import re
 
 import requests
@@ -100,8 +101,8 @@ def parse_book(data: dict, cover_px: int = 500) -> BookCard:
     """Audnexus /books/{asin} JSON → BookCard."""
     series = data.get("seriesPrimary") or None
     # `summary` is the full blurb (HTML); `description` is a short teaser that
-    # ends in "…". Prefer the full one, stripped of tags.
-    summary = _TAGS.sub("", data.get("summary") or "").strip()
+    # ends in "…". Prefer the full one, stripped of tags and entity-decoded.
+    summary = html.unescape(_TAGS.sub("", data.get("summary") or "")).strip()
     return BookCard(
         title=data.get("title", ""),
         author=_author_of(data),
@@ -138,7 +139,7 @@ def parse_audible_product(product: dict, cover_px: int = 500) -> BookCard:
         asin=product.get("asin"),
         subtitle=product.get("subtitle") or None,
         narrators=tuple(n["name"] for n in (product.get("narrators") or []) if n.get("name")),
-        description=_TAGS.sub("", summary).strip(),
+        description=html.unescape(_TAGS.sub("", summary)).strip(),
         cover_url=cover,
         series=series.get("title") if series else None,
         series_position=str(series["sequence"]) if series and series.get("sequence") else None,
