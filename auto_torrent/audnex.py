@@ -99,13 +99,16 @@ def _year(date_str: str | None) -> int | None:
 def parse_book(data: dict, cover_px: int = 500) -> BookCard:
     """Audnexus /books/{asin} JSON → BookCard."""
     series = data.get("seriesPrimary") or None
+    # `summary` is the full blurb (HTML); `description` is a short teaser that
+    # ends in "…". Prefer the full one, stripped of tags.
+    summary = _TAGS.sub("", data.get("summary") or "").strip()
     return BookCard(
         title=data.get("title", ""),
         author=_author_of(data),
         asin=data.get("asin"),
         subtitle=data.get("subtitle") or None,
         narrators=tuple(n["name"] for n in (data.get("narrators") or []) if n.get("name")),
-        description=data.get("description") or "",
+        description=summary or (data.get("description") or ""),
         cover_url=sized_cover(data.get("image"), cover_px),
         series=series.get("name") if series else None,
         series_position=series.get("position") if series else None,

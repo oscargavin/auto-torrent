@@ -193,6 +193,19 @@ class TestParseBook:
         assert card.series == "The Kingkiller Chronicle"
         assert card.series_position == "2"
 
+    def test_prefers_full_summary_over_short_description(self):
+        data = {
+            **AUDNEX_PHM,
+            "summary": "<p>The <b>full</b> blurb, much longer than the teaser.</p>",
+            "description": "Short teaser…",
+        }
+        card = parse_book(data)
+        assert card.description == "The full blurb, much longer than the teaser."
+
+    def test_falls_back_to_description_when_no_summary(self):
+        card = parse_book(AUDNEX_PHM)  # fixture has description, no summary
+        assert card.description.startswith("When the Sun")
+
     def test_missing_optional_fields_do_not_crash(self):
         card = parse_book({"title": "Bare", "authors": [{"name": "A"}]})
         assert card.title == "Bare"
