@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from .agent import AgentOutcome, run_agent
 from .llm import clear_conversation, get_pending_options, get_pending_result
-from .profiles import ProfileStore, public_view
+from .profiles import ALLOWED_AVATAR_STYLES, ProfileStore, public_view
 from .settings import Settings
 from .sms import SMSClient
 from .worker import _refresh_state, get_active_downloads, poll_and_finalise
@@ -525,6 +525,36 @@ async def create_profile(
         logger.warning("profile create failed: %s", e)
         raise HTTPException(status_code=502, detail="audiobookshelf rejected the request") from e
     return {"profile": public_view(profile)}
+
+
+class AvatarSpec(BaseModel):
+    style: str
+    seed: str
+
+
+class UpdateProfileRequest(BaseModel):
+    avatar: AvatarSpec | None = None
+    color: str | None = None
+
+
+@app.patch("/profiles/{profile_id}")
+async def update_profile(
+    profile_id: str,
+    req: UpdateProfileRequest,
+    _: None = Depends(_require_profiles_secret),
+) -> dict:
+    avatar: dict | None = None
+    if req.avatar is not None:
+        if req.avatar.style not in ALLOWED_AVATAR_STYLES:
+            raise HTTPException(status_code=400, detail="unknown avatar style")
+        seed = req.avatar.seed.strip()[:64]
+        if not seed:
+            raise HTTPException(status_code=400, detail="seed required")
+        avatar = {"style": req.avatar.style, "seed": seed}
+    updated = await profile_store.update(profile_id, avatar=avatar, color=req.color)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="profile not found")
+    return {"profile": public_view(updated)}
 
 
 @app.delete("/profiles/{profile_id}")

@@ -150,3 +150,48 @@ async def test_store_create_generates_unique_username(store):
     assert first["username"] == "sam"
     assert second["username"] != "sam"
     assert second["username"].startswith("sam-")
+
+
+@pytest.mark.anyio
+async def test_create_includes_default_avatar(store):
+    store._abs.create_user.return_value = {"id": "u1", "username": "tom"}
+    store._abs.create_api_key.return_value = {"apiKey": "tok", "id": "k1"}
+    async with _client() as ac:
+        r = await ac.post("/profiles", headers=_AUTH, json={"name": "Tom"})
+        avatar = r.json()["profile"]["avatar"]
+        assert avatar["style"] == "adventurer"
+        assert avatar["seed"] == "tom"
+
+
+@pytest.mark.anyio
+async def test_patch_updates_and_persists_avatar(store):
+    store._abs.create_user.return_value = {"id": "u1", "username": "tom"}
+    store._abs.create_api_key.return_value = {"apiKey": "tok", "id": "k1"}
+    async with _client() as ac:
+        await ac.post("/profiles", headers=_AUTH, json={"name": "Tom"})
+        r = await ac.patch(
+            "/profiles/u1", headers=_AUTH, json={"avatar": {"style": "bottts", "seed": "xyz"}}
+        )
+        assert r.status_code == 200
+        assert r.json()["profile"]["avatar"] == {"style": "bottts", "seed": "xyz"}
+        listed = (await ac.get("/profiles", headers=_AUTH)).json()["profiles"]
+        assert listed[0]["avatar"]["style"] == "bottts"
+
+
+@pytest.mark.anyio
+async def test_patch_rejects_unknown_style(store):
+    store._abs.create_user.return_value = {"id": "u1", "username": "tom"}
+    store._abs.create_api_key.return_value = {"apiKey": "tok", "id": "k1"}
+    async with _client() as ac:
+        await ac.post("/profiles", headers=_AUTH, json={"name": "Tom"})
+        r = await ac.patch(
+            "/profiles/u1", headers=_AUTH, json={"avatar": {"style": "nope", "seed": "x"}}
+        )
+        assert r.status_code == 400
+
+
+@pytest.mark.anyio
+async def test_patch_404_for_missing_profile(store):
+    async with _client() as ac:
+        r = await ac.patch("/profiles/ghost", headers=_AUTH, json={"color": "#ffffff"})
+        assert r.status_code == 404

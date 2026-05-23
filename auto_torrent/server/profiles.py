@@ -39,10 +39,34 @@ _COLORS = [
 
 _KEY_NAME_PREFIX = "bookkeeper-profile"
 
+# Avatars are DiceBear (https://www.dicebear.com) — the app renders
+# `https://api.dicebear.com/9.x/{style}/png?seed={seed}`. We store just the
+# {style, seed} so it syncs as two short strings; the allowlist keeps the app
+# from being handed an unknown style.
+ALLOWED_AVATAR_STYLES = {
+    "adventurer",
+    "fun-emoji",
+    "bottts",
+    "lorelei",
+    "big-smile",
+    "thumbs",
+    "micah",
+    "notionists",
+    "avataaars",
+    "big-ears",
+    "pixel-art",
+    "croodles",
+}
+DEFAULT_AVATAR_STYLE = "adventurer"
+
 
 def _slugify(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
     return slug or "user"
+
+
+def _default_avatar(seed: str) -> dict:
+    return {"style": DEFAULT_AVATAR_STYLE, "seed": seed}
 
 
 def public_view(profile: dict) -> dict:
@@ -52,6 +76,8 @@ def public_view(profile: dict) -> dict:
         "name": profile["name"],
         "color": profile["color"],
         "token": profile["token"],
+        "avatar": profile.get("avatar")
+        or _default_avatar(profile.get("username") or profile["name"]),
     }
 
 
@@ -82,6 +108,7 @@ class ProfileStore:
             "color": _COLORS[index % len(_COLORS)],
             "token": key["apiKey"],
             "absKeyId": key["id"],
+            "avatar": _default_avatar(username),
         }
 
     async def list(self) -> list[dict]:
@@ -129,10 +156,26 @@ class ProfileStore:
             self._write([p for p in profiles if p["id"] != profile_id])
             return True
 
+    async def update(
+        self, profile_id: str, *, avatar: dict | None = None, color: str | None = None
+    ) -> dict | None:
+        async with self._lock:
+            profiles = self._read()
+            target = next((p for p in profiles if p["id"] == profile_id), None)
+            if target is None:
+                return None
+            if avatar is not None:
+                target["avatar"] = avatar
+            if color is not None:
+                target["color"] = color
+            self._write(profiles)
+            return target
+
     async def sync(self) -> list[dict]:
-        """Ensure every non-admin ABS user has a profile + key. Seeds accounts
-        that predate this feature (mum/rafay/angela) or were added in the ABS
-        web UI. Idempotent."""
+        """Ensure every non-admin ABS user has a profile + key, and backfill a
+        default avatar on any record missing one. Seeds accounts that predate
+        this feature (mum/rafay/angela) or were added in the ABS web UI.
+        Idempotent."""
         async with self._lock:
             profiles = self._read()
             known = {p["id"] for p in profiles}
@@ -151,5 +194,8 @@ class ProfileStore:
                         index=len(profiles),
                     )
                 )
+            for p in profiles:
+                if not p.get("avatar"):
+                    p["avatar"] = _default_avatar(p.get("username") or p["name"])
             self._write(profiles)
             return profiles
