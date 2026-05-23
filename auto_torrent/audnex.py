@@ -33,6 +33,14 @@ _EXT = re.compile(r"(\.[A-Za-z]+)$")
 _ARTICLE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
 _NONWORD = re.compile(r"[^\w\s]")
 _TAGS = re.compile(r"<[^>]+>")
+_BR = re.compile(r"<\s*br\s*/?\s*>", re.IGNORECASE)
+_BLOCK = re.compile(r"</?\s*(?:p|div|li|ul|ol|h[1-6])[^>]*>", re.IGNORECASE)
+# Promotional endmatter that bloats Audible summaries: review-quote spam and
+# "Other books by …" series lists. Trim everything from the first such marker.
+_TAIL = re.compile(
+    r"other books by|also by the author|praise for|readers love|don't miss|[⭐★]|goodreads reviewer",
+    re.IGNORECASE,
+)
 
 TITLE_WEIGHT = 0.6
 AUTHOR_WEIGHT = 0.4
@@ -97,12 +105,31 @@ def _year(date_str: str | None) -> int | None:
     return None
 
 
+def _clean_summary(raw: str | None) -> str:
+    """HTML blurb → clean plain text: <br>/block tags become line breaks, inline
+    tags are stripped, entities decoded, and the promotional tail (review-quote
+    spam, "Other books by …" lists) trimmed off."""
+    if not raw:
+        return ""
+    text = _BLOCK.sub("\n", _BR.sub("\n", raw))
+    text = html.unescape(_TAGS.sub("", text))
+    cut = _TAIL.search(text)
+    if cut and cut.start() > 150:  # guard so a short blurb mentioning a marker survives
+        text = text[: cut.start()]
+    # Trim each line; collapse runs of blanks to a single paragraph break.
+    lines: list[str] = []
+    for line in (ln.strip() for ln in text.split("\n")):
+        if line or (lines and lines[-1] != ""):
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def parse_book(data: dict, cover_px: int = 500) -> BookCard:
     """Audnexus /books/{asin} JSON → BookCard."""
     series = data.get("seriesPrimary") or None
-    # `summary` is the full blurb (HTML); `description` is a short teaser that
-    # ends in "…". Prefer the full one, stripped of tags and entity-decoded.
-    summary = html.unescape(_TAGS.sub("", data.get("summary") or "")).strip()
+    # `summary` is the full blurb (HTML); `description` is a short teaser ending
+    # in "…". Prefer the cleaned full one (line breaks kept, marketing tail cut).
+    summary = _clean_summary(data.get("summary"))
     return BookCard(
         title=data.get("title", ""),
         author=_author_of(data),
@@ -139,7 +166,7 @@ def parse_audible_product(product: dict, cover_px: int = 500) -> BookCard:
         asin=product.get("asin"),
         subtitle=product.get("subtitle") or None,
         narrators=tuple(n["name"] for n in (product.get("narrators") or []) if n.get("name")),
-        description=html.unescape(_TAGS.sub("", summary)).strip(),
+        description=_clean_summary(summary),
         cover_url=cover,
         series=series.get("title") if series else None,
         series_position=str(series["sequence"]) if series and series.get("sequence") else None,

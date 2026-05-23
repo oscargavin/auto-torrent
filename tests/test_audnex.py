@@ -206,6 +206,32 @@ class TestParseBook:
         card = parse_book({**AUDNEX_PHM, "summary": "<p>She said &quot;hi&quot; &amp; left.</p>"})
         assert card.description == 'She said "hi" & left.'
 
+    def test_br_tags_become_paragraph_breaks(self):
+        card = parse_book({**AUDNEX_PHM, "summary": "First para.<br /><br />Second para."})
+        assert card.description == "First para.\n\nSecond para."
+
+    def test_trims_other_books_tail(self):
+        synopsis = (
+            "A genuinely long synopsis that comfortably clears the one hundred and fifty "
+            "character guard, padded with sufficient extra words so the trimmer reliably "
+            "engages on the promotional block that follows it below."
+        )
+        summary = f"{synopsis}<br /><br /><b>Other books by Someone</b><br /><i>Book One</i>"
+        card = parse_book({**AUDNEX_PHM, "summary": summary})
+        assert "Other books" not in card.description
+        assert card.description.startswith("A genuinely long synopsis")
+
+    def test_trims_star_review_spam(self):
+        synopsis = (
+            "Another sufficiently long synopsis sentence written to go well beyond the one "
+            "hundred and fifty character guard threshold, ensuring the starred review spam "
+            "appended after it gets removed cleanly from the text."
+        )
+        card = parse_book(
+            {**AUDNEX_PHM, "summary": f"{synopsis}<br />⭐ ⭐ ⭐ ⭐ ⭐ Goodreads reviewer"}
+        )
+        assert "⭐" not in card.description and "Goodreads" not in card.description
+
     def test_falls_back_to_description_when_no_summary(self):
         card = parse_book(AUDNEX_PHM)  # fixture has description, no summary
         assert card.description.startswith("When the Sun")
