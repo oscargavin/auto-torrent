@@ -41,6 +41,9 @@ _TAIL = re.compile(
     r"other books by|also by the author|praise for|readers love|don't miss|[⭐★]|goodreads reviewer",
     re.IGNORECASE,
 )
+# A review pull-quote line: "…quote…" — Attribution. These get sprinkled through
+# Audible blurbs (sometimes mid-text, so the tail trim misses them).
+_PULLQUOTE = re.compile(r"^[\"'‘“].{0,400}[\"'’”]\s*[\-–—]\s*\S")
 
 TITLE_WEIGHT = 0.6
 AUTHOR_WEIGHT = 0.4
@@ -116,9 +119,11 @@ def _clean_summary(raw: str | None) -> str:
     cut = _TAIL.search(text)
     if cut and cut.start() > 150:  # guard so a short blurb mentioning a marker survives
         text = text[: cut.start()]
-    # Trim each line; collapse runs of blanks to a single paragraph break.
+    # Trim each line; drop review pull-quotes; collapse blank runs to one break.
     lines: list[str] = []
     for line in (ln.strip() for ln in text.split("\n")):
+        if _PULLQUOTE.match(line):
+            continue
         if line or (lines and lines[-1] != ""):
             lines.append(line)
     return "\n".join(lines).strip()

@@ -221,6 +221,17 @@ class TestParseBook:
         assert "Other books" not in card.description
         assert card.description.startswith("A genuinely long synopsis")
 
+    def test_drops_attributed_pull_quotes(self):
+        summary = (
+            "Real synopsis paragraph.<br /><br />"
+            "'A staggering work of genius' - The Times<br /><br />"
+            "More synopsis here."
+        )
+        card = parse_book({**AUDNEX_PHM, "summary": summary})
+        assert "staggering work of genius" not in card.description
+        assert "Real synopsis paragraph." in card.description
+        assert "More synopsis here." in card.description
+
     def test_trims_star_review_spam(self):
         synopsis = (
             "Another sufficiently long synopsis sentence written to go well beyond the one "
