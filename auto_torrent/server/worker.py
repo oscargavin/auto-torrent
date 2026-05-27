@@ -106,6 +106,13 @@ async def poll_and_finalise(
             stale = _refresh_state(download_id)
             if stale:
                 _kill_download(stale)
+                # Wipe partial files the killed attempt left behind — the fallback
+                # writes to the same DOWNLOAD_DIR/<sanitize(title)> path, so anything
+                # still on disk gets merged with the fallback at organise time and
+                # produces a malformed ABS item (e.g. m4b + a partial MP3 set).
+                stale_path = stale.get('path')
+                if stale_path:
+                    shutil.rmtree(stale_path, ignore_errors=True)
 
             next_fb = fallbacks.pop(0)
             bg_title = f"{title} - {author}" if author else title
