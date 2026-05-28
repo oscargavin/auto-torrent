@@ -12,6 +12,8 @@ from ..agent import run_agent
 from ..app import _emit_download_and_poll  # re-uses the existing pump
 from ..llm import clear_conversation, get_pending_options
 from ..settings import Settings
+from ..worker import _kill_download_and_clean
+from ...cli import _read_state
 from .bus import StreamEventBus
 from .events import EventLog
 from .store import JobStore
@@ -69,9 +71,18 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                 # and skipped the kill. We just registered the download_id, so
                 # we own the responsibility to kill the orphan subprocess.
                 if download_id:
-                    from .api import _kill_subprocess_and_clean
-                    await _kill_subprocess_and_clean(download_id)
+                    state = _read_state(download_id)
+                    if state:
+                        await _kill_download_and_clean(state)
                 return
+            # Keep the store's download_id current as poll_and_finalise swaps
+            # to fallback magnets on stall — otherwise cancel would kill (or
+            # try to kill) the dead original instead of the running fallback,
+            # and the fallback would land in the library against the user's
+            # cancel intent.
+            async def _track_download_change(new_id: str) -> None:
+                await store.set_download_id(job.id, new_id)
+
             await _emit_download_and_poll(
                 bus,
                 download=outcome.download or {},
@@ -80,6 +91,7 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                 title=outcome.title,
                 author=outcome.author,
                 session=job.id,
+                on_download_change=_track_download_change,
             )
             # If cancel fired during the poll, _emit_download_and_poll's error
             # branch will have published an event but update_status here is a

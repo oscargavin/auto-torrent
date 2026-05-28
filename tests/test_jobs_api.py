@@ -108,25 +108,23 @@ async def test_sse_streams_events_then_keepalive(app, client, redis):
 
 
 async def test_delete_kills_subprocess_and_cleans(app, client, monkeypatch, tmp_path):
-    """When a job has a download_id registered, DELETE kills the running
-    subprocess, removes the partial landing dir, and removes the state file."""
+    """When a job has a download_id registered, DELETE calls the unified
+    kill+clean helper which kills the running subprocess and removes the
+    partial landing dir + state file."""
     from auto_torrent.server.jobs import api as api_mod
 
-    # Build a fake landing dir + state file the cancel handler will tear down.
     landing = tmp_path / "downloads" / "Some Book"
     landing.mkdir(parents=True)
-    (landing / "partial.m4b").write_bytes(b"x" * 100)
-    state_path = tmp_path / "state" / "abc12345.json"
-    state_path.parent.mkdir()
-    state_path.write_text('{"id":"abc12345","pid":99999,"path":"%s"}' % landing)
-
-    monkeypatch.setattr(api_mod, "STATE_DIR", state_path.parent)
     monkeypatch.setattr(
         api_mod, "_read_state",
         lambda did: {"id": did, "pid": 99999, "path": str(landing)},
     )
     killed: list[dict] = []
-    monkeypatch.setattr(api_mod, "_kill_download", lambda s: killed.append(s))
+
+    async def _fake_kill_and_clean(state: dict) -> None:
+        killed.append(state)
+
+    monkeypatch.setattr(api_mod, "_kill_download_and_clean", _fake_kill_and_clean)
 
     # Seed the job + register a download_id (simulates the worker's
     # post-commit registration step).
@@ -138,22 +136,24 @@ async def test_delete_kills_subprocess_and_cleans(app, client, monkeypatch, tmp_
     assert r.status_code == 200
     assert r.json() == {"ok": True, "status": "cancelled"}
 
-    # Subprocess kill fired with the state dict.
+    # kill+clean fired exactly once with the resolved state dict.
     assert len(killed) == 1
+    assert killed[0]["id"] == "abc12345"
     assert killed[0]["pid"] == 99999
-    # Partial landing dir removed.
-    assert not landing.exists()
-    # State file removed.
-    assert not state_path.exists()
+    assert killed[0]["path"] == str(landing)
 
 
 async def test_delete_without_download_id_does_not_call_killer(app, client, monkeypatch):
     """A cancel issued before the agent committed has no download_id — must
-    NOT attempt to read/kill anything (would log noise + race the open file)."""
+    NOT call the kill helper (would log noise + race the open state file)."""
     from auto_torrent.server.jobs import api as api_mod
 
     calls: list[str] = []
-    monkeypatch.setattr(api_mod, "_kill_subprocess_and_clean", lambda d: calls.append(d))
+
+    async def _record(did: str) -> None:
+        calls.append(did)
+
+    monkeypatch.setattr(api_mod, "_kill_subprocess_and_clean", _record)
 
     create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
     job_id = create.json()["id"]

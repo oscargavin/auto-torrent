@@ -12,7 +12,10 @@ import subprocess
 import time
 from pathlib import Path
 
+from typing import Awaitable, Callable
+
 from ..cli import _execute_download_bg, _read_state, _resolve_status
+from ..config import STATE_DIR
 from .audiobookshelf import ABSClient
 from .settings import Settings
 from .sms import SMSClient
@@ -67,6 +70,45 @@ def _kill_download(state: dict) -> None:
             pass
 
 
+async def _kill_download_and_clean(state: dict) -> None:
+    """SIGTERM the subprocess group, wait up to 2s for it to actually exit
+    (SIGKILL escalation if it ignores us), then remove the partial landing
+    directory and the state file.
+
+    Async because the wait-for-death poll must not block the event loop.
+    Used by both the cancel handler (jobs/api.py) and any future caller that
+    needs a complete, single-call teardown — the previous _kill_download was
+    SIGTERM-only and left the caller to do rmtree + state-file unlink in
+    parallel idioms that didn't fully converge."""
+    _kill_download(state)
+    pid = state.get("pid")
+    if isinstance(pid, int):
+        for _ in range(20):  # up to 2s
+            try:
+                os.kill(pid, 0)  # signal 0 = "is it alive?"
+            except (ProcessLookupError, PermissionError):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            # Still alive after 2s — SIGKILL the group.
+            try:
+                os.killpg(os.getpgid(pid), 9)
+            except (OSError, ProcessLookupError):
+                pass
+    landing_path = state.get("path")
+    if landing_path:
+        try:
+            shutil.rmtree(landing_path, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            logger.exception("kill_and_clean: rmtree %s failed", landing_path)
+    download_id = state.get("id")
+    if download_id:
+        try:
+            (STATE_DIR / f"{download_id}.json").unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            logger.exception("kill_and_clean: unlink state %s failed", download_id)
+
+
 async def poll_and_finalise(
     download: dict,
     fallbacks: list[dict],
@@ -76,11 +118,16 @@ async def poll_and_finalise(
     phone: str,
     settings: Settings,
     sms: SMSClient,
+    on_download_change: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
     """Poll active download to completion, fall back through alternates on stall.
 
     `display` is the human-friendly title used in messages.
     `author`/`title` drive the ABS library folder.
+    `on_download_change` (optional) is invoked with each new download_id when
+    the stall handler swaps to a fallback magnet — lets the caller (the jobs
+    worker) keep its store pointer current so the cancel handler kills the
+    RUNNING subprocess, not the dead original.
     """
     abs_client = ABSClient(settings)
     fallback_announced = False
@@ -105,14 +152,11 @@ async def poll_and_finalise(
 
             stale = _refresh_state(download_id)
             if stale:
-                _kill_download(stale)
-                # Wipe partial files the killed attempt left behind — the fallback
-                # writes to the same DOWNLOAD_DIR/<sanitize(title)> path, so anything
-                # still on disk gets merged with the fallback at organise time and
-                # produces a malformed ABS item (e.g. m4b + a partial MP3 set).
-                stale_path = stale.get('path')
-                if stale_path:
-                    shutil.rmtree(stale_path, ignore_errors=True)
+                # Unified kill+wait+SIGKILL+rmtree+unlink — the fallback writes
+                # to the same DOWNLOAD_DIR/<sanitize(title)> path, so anything
+                # still on disk would get merged with the fallback at organise
+                # time and produce a malformed ABS item.
+                await _kill_download_and_clean(stale)
 
             next_fb = fallbacks.pop(0)
             bg_title = f"{title} - {author}" if author else title
@@ -123,6 +167,13 @@ async def poll_and_finalise(
             except Exception:
                 logger.exception("failed to start fallback")
                 continue
+            # Tell the caller about the new subprocess so cancel can find it.
+            new_id = download.get("id")
+            if on_download_change and new_id:
+                try:
+                    await on_download_change(new_id)
+                except Exception:  # noqa: BLE001
+                    logger.exception("on_download_change(%s) raised", new_id)
             await asyncio.sleep(0)
             continue
         # Unknown outcome → bail.

@@ -8,7 +8,7 @@ import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable, Callable
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, Form, Header, HTTPException, Request, Response
@@ -371,8 +371,13 @@ async def _emit_download_and_poll(
     title: str,
     author: str,
     session: str,
+    on_download_change: Callable[[str], Awaitable[None]] | None = None,
 ) -> None:
-    """Emit `committed`, run the poll with a progress pump, then `completed`."""
+    """Emit `committed`, run the poll with a progress pump, then `completed`.
+
+    `on_download_change` forwards the per-fallback download_id update from
+    poll_and_finalise to the caller — the jobs worker uses it to keep
+    store.set_download_id current so cancel kills the right subprocess."""
     download_id = download.get("id", "")
     bus.emit(
         "committed",
@@ -390,6 +395,7 @@ async def _emit_download_and_poll(
             phone=session,
             settings=settings,
             sms=bus,
+            on_download_change=on_download_change,
         )
         bus.emit("completed", {"title": title, "author": author})
     except Exception as e:  # noqa: BLE001
