@@ -110,9 +110,10 @@ class JobStore:
         if current.status in TERMINAL_STATUSES:
             return current
 
+        updated_at = time.time()
         fields: dict[str, str] = {
             "status": status.value,
-            "updated_at": str(time.time()),
+            "updated_at": str(updated_at),
         }
         if picked_title is not None:
             fields["picked_title"] = picked_title
@@ -128,7 +129,17 @@ class JobStore:
             await self._r.delete(_hash_key(dedup_hash(current.profile_id, current.query)))
             await self._log.expire(job_id, self._state_ttl)
 
-        return await self.get(job_id)
+        # Build the updated job locally — avoids a third Redis round-trip.
+        updated = current.model_copy(
+            update={
+                "status": status,
+                "updated_at": updated_at,
+                **({"picked_title": picked_title} if picked_title is not None else {}),
+                **({"picked_author": picked_author} if picked_author is not None else {}),
+                **({"error": error} if error is not None else {}),
+            }
+        )
+        return updated
 
     async def list_for_profile(self, profile_id: str, *, limit: int = 20) -> list[Job]:
         # ZRANGEBYSCORE with REV — most recent first.
