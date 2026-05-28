@@ -44,11 +44,11 @@ class StreamEventBus:
     def __init__(self, job_id: str, log: EventLog) -> None:
         self.job_id = job_id
         self._log = log
-        try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No running loop (e.g. sync test context); fall back.
-            self._loop = asyncio.get_event_loop()
+        # The bus is always constructed inside an async context (arq worker or SSE
+        # handler), so get_running_loop() is guaranteed to succeed. Raising
+        # RuntimeError here is the right failure mode — it means a construction
+        # site moved outside async and needs fixing.
+        self._loop = asyncio.get_running_loop()
         self.messaged = False
 
     # --- async core ---

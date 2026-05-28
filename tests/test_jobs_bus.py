@@ -27,11 +27,12 @@ async def test_send_emits_progress(log):
     assert bus.messaged is True
 
 
-def test_sync_emit_from_thread_uses_loop_bridge(log):
+async def test_sync_emit_from_thread_uses_loop_bridge(log):
     """Existing worker code calls bus.send() from asyncio.to_thread paths.
     The sync wrappers schedule onto the loop via call_soon_threadsafe so the
     BG-process polling thread can publish."""
-    # Smoke-test the sync entrypoint exists.
+    # Smoke-test the sync entrypoint exists. Must be async so get_running_loop()
+    # succeeds in the StreamEventBus constructor.
     bus = StreamEventBus("j1", log)
     assert callable(bus.emit)
     assert callable(bus.send)
