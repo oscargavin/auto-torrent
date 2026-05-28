@@ -66,7 +66,11 @@ def build_router(
         if (await store.get(job_id)) is None:
             raise HTTPException(status_code=404, detail="job not found")
 
-        _TERMINAL_EVENTS = frozenset({"completed", "error", "cancelled"})
+        # Derive terminal event types from the canonical status set. "error" and
+        # "completed" are event-type aliases for "failed"/"succeeded" respectively.
+        _TERMINAL_EVENT_TYPES = (
+            frozenset(s.value for s in TERMINAL_STATUSES) | {"error", "completed"}
+        )
 
         async def gen():
             # Poll in short windows so client disconnect is detected promptly
@@ -93,7 +97,7 @@ def build_router(
                     }
                     # Stop streaming once the job reaches a terminal state —
                     # no further events will be published after this point.
-                    if event["type"] in _TERMINAL_EVENTS:
+                    if event["type"] in _TERMINAL_EVENT_TYPES:
                         return
             finally:
                 await subscriber.aclose()
