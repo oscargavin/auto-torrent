@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -14,7 +15,7 @@ from ..settings import Settings
 from .bus import StreamEventBus
 from .events import EventLog
 from .store import JobStore
-from .types import JobStatus
+from .types import TERMINAL_STATUSES, JobStatus
 
 logger = logging.getLogger("atb.jobs.worker")
 settings = Settings()
@@ -27,6 +28,10 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
     job = await store.get(job_id)
     if job is None:
         logger.warning("run_chat_job: missing job %s", job_id)
+        return
+
+    if job.status in TERMINAL_STATUSES:
+        logger.info("run_chat_job: job %s already %s, skipping", job_id, job.status.value)
         return
 
     await store.update_status(job.id, JobStatus.running)
@@ -58,17 +63,29 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                 picked_author=outcome.author,
             )
             await bus.emit_async("completed", {"title": outcome.title, "author": outcome.author})
+            await log.expire(job.id, settings.job_state_ttl_s)
         else:
             # asked / no_results / error — agent already published progress events.
             msg = outcome.message or f"agent ended: {outcome.kind}"
             await store.update_status(job.id, JobStatus.failed, error=msg)
+            await log.expire(job.id, settings.job_state_ttl_s)
             if outcome.kind not in ("asked", "no_results") and not bus.messaged:
                 await bus.emit_async("error", {"message": msg})
 
+    except asyncio.CancelledError:
+        logger.info("run_chat_job: cancelled (likely SIGTERM) for %s", job_id)
+        await store.update_status(job.id, JobStatus.failed, error="worker cancelled")
+        try:
+            await bus.emit_async("error", {"message": "worker cancelled"})
+        except Exception:  # noqa: BLE001
+            pass  # bus publish may also fail mid-shutdown — best effort
+        await log.expire(job.id, settings.job_state_ttl_s)
+        raise
     except Exception as e:  # noqa: BLE001
         logger.exception("run_chat_job crashed for %s", job_id)
         await store.update_status(job.id, JobStatus.failed, error=f"{type(e).__name__}: {e}")
         await bus.emit_async("error", {"message": f"{type(e).__name__}: {e}"})
+        await log.expire(job.id, settings.job_state_ttl_s)
 
 
 class WorkerSettings:
