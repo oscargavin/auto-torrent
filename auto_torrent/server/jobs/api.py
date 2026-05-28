@@ -11,7 +11,7 @@ from sse_starlette.sse import EventSourceResponse
 from ..app import _require_bearer  # re-use the existing bearer check
 from .events import EventLog
 from .store import JobStore
-from .types import CreateJobRequest, Job, JobStatus
+from .types import TERMINAL_STATUSES, CreateJobRequest, Job, JobStatus
 
 
 def build_router(
@@ -114,11 +114,14 @@ def build_router(
         Task 13's _TERMINAL_EVENTS already includes "cancelled", so any open
         SSE stream will close on receiving this event.
         """
-        updated = await store.update_status(job_id, JobStatus.cancelled)
-        if updated is None:
+        current = await store.get(job_id)
+        if current is None:
             raise HTTPException(status_code=404, detail="job not found")
-        # Best-effort signal to subscribers so they see cancellation immediately.
+        if current.status in TERMINAL_STATUSES:
+            # Idempotent no-op — return the existing terminal state.
+            return {"ok": True, "status": current.status.value}
+        await store.update_status(job_id, JobStatus.cancelled)
         await log.publish(job_id, "cancelled", {})
-        return {"ok": True}
+        return {"ok": True, "status": "cancelled"}
 
     return router

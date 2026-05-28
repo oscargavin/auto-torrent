@@ -81,22 +81,32 @@ class JobStore:
         picked_author: str | None = None,
         error: str | None = None,
     ) -> Job | None:
-        job = await self.get(job_id)
-        if job is None:
+        current = await self.get(job_id)
+        if current is None:
             return None
-        job.status = status
-        job.updated_at = time.time()
+        # Terminal status is final — refuse any further transitions. Returning the
+        # unchanged job lets callers (e.g. DELETE) treat re-cancellation as a no-op
+        # rather than 404.
+        if current.status in TERMINAL_STATUSES and current.status != status:
+            return current
+
+        fields: dict[str, str] = {
+            "status": status.value,
+            "updated_at": str(time.time()),
+        }
         if picked_title is not None:
-            job.picked_title = picked_title
+            fields["picked_title"] = picked_title
         if picked_author is not None:
-            job.picked_author = picked_author
+            fields["picked_author"] = picked_author
         if error is not None:
-            job.error = error
-        await self._r.hset(_job_key(job.id), mapping=job.to_redis_hash())
-        if status in TERMINAL_STATUSES:
-            # Release the dedup key so a re-request can start fresh.
-            await self._r.delete(_hash_key(dedup_hash(job.profile_id, job.query)))
-        return job
+            fields["error"] = error
+        await self._r.hset(_job_key(job_id), mapping=fields)
+
+        if status in TERMINAL_STATUSES and current.status not in TERMINAL_STATUSES:
+            # First terminal write → release the dedup key so a re-request can start fresh.
+            await self._r.delete(_hash_key(dedup_hash(current.profile_id, current.query)))
+
+        return await self.get(job_id)
 
     async def list_for_profile(self, profile_id: str, *, limit: int = 20) -> list[Job]:
         # ZRANGEBYSCORE with REV — most recent first.
