@@ -81,3 +81,26 @@ async def test_list_filters_by_profile(client):
     assert r.status_code == 200
     queries = [j["query"] for j in r.json()]
     assert sorted(queries) == ["a", "b"]
+
+
+async def test_sse_streams_events_then_keepalive(app, client, redis):
+    # Use the real EventLog to publish a few events, then read via the route.
+    from auto_torrent.server.jobs.events import EventLog
+
+    log = EventLog(redis)
+    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
+    job_id = create.json()["id"]
+
+    await log.publish(job_id, "progress", {"text": "hello"})
+    await log.publish(job_id, "completed", {"title": "Dune"})
+
+    async with client.stream("GET", f"/chat/jobs/{job_id}/events") as r:
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/event-stream")
+        seen_types: list[str] = []
+        async for line in r.aiter_lines():
+            if line.startswith("event: "):
+                seen_types.append(line[len("event: "):])
+            if "completed" in seen_types:
+                break
+        assert "progress" in seen_types and "completed" in seen_types
