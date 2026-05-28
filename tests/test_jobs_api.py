@@ -56,3 +56,28 @@ async def test_post_is_idempotent(app, client):
 async def test_post_rejects_empty_query(client):
     r = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "   "})
     assert r.status_code == 422
+
+
+async def test_get_job_returns_state(client):
+    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
+    job_id = create.json()["id"]
+
+    r = await client.get(f"/chat/jobs/{job_id}")
+    assert r.status_code == 200
+    assert r.json()["id"] == job_id
+
+
+async def test_get_job_404_for_missing(client):
+    r = await client.get("/chat/jobs/nope")
+    assert r.status_code == 404
+
+
+async def test_list_filters_by_profile(client):
+    await client.post("/chat/jobs", json={"profile_id": "p1", "query": "a"})
+    await client.post("/chat/jobs", json={"profile_id": "p1", "query": "b"})
+    await client.post("/chat/jobs", json={"profile_id": "p2", "query": "c"})
+
+    r = await client.get("/chat/jobs?profile_id=p1")
+    assert r.status_code == 200
+    queries = [j["query"] for j in r.json()]
+    assert sorted(queries) == ["a", "b"]

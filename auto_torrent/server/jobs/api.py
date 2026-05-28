@@ -34,4 +34,21 @@ def build_router(
             response.status_code = 200
         return job
 
+    @router.get("/chat/jobs/{job_id}", response_model=Job)
+    async def get_job(job_id: str, _: None = Depends(_require_bearer)) -> Job:
+        job = await store.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return job
+
+    @router.get("/chat/jobs", response_model=list[Job])
+    async def list_jobs(
+        profile_id: str,
+        limit: int = 20,
+        _: None = Depends(_require_bearer),
+    ) -> list[Job]:
+        if limit < 1 or limit > 100:
+            raise HTTPException(status_code=400, detail="limit must be 1..100")
+        return await store.list_for_profile(profile_id, limit=limit)
+
     return router
