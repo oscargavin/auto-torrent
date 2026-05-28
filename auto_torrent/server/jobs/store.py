@@ -48,30 +48,34 @@ class JobStore:
         sha = dedup_hash(req.profile_id, req.query)
         hash_key = _hash_key(sha)
 
-        job = Job.new(req.profile_id, req.query)
-        # Atomic claim: SET NX wins exactly once per (profile, query) within the
-        # dedup TTL. If it loses, another caller is already in flight — fetch and
-        # return that job (or treat as stale if its key vanished mid-race).
-        claimed = await self._r.set(hash_key, job.id, ex=self._dedup_ttl, nx=True)
-        if not claimed:
+        for _ in range(3):
+            job = Job.new(req.profile_id, req.query)
+            # Atomic claim: SET NX wins exactly once per (profile, query) within the
+            # dedup TTL. If it loses, another caller is already in flight — fetch and
+            # return that job (or treat as stale if its key vanished mid-race).
+            claimed = await self._r.set(hash_key, job.id, ex=self._dedup_ttl, nx=True)
+            if claimed:
+                # We own the dedup key. Write the job state + index.
+                async with self._r.pipeline(transaction=True) as pipe:
+                    pipe.hset(_job_key(job.id), mapping=job.to_redis_hash())
+                    pipe.expire(_job_key(job.id), self._state_ttl)
+                    pipe.zadd(_profile_key(job.profile_id), {job.id: job.created_at})
+                    await pipe.execute()
+                return job, True
+
             existing_id = await self._r.get(hash_key)
             if existing_id:
                 existing = await self.get(existing_id)
                 if existing and existing.status not in TERMINAL_STATUSES:
                     return existing, False
-                # Stale dedup key or terminal job — drop and recurse once.
+                # Stale dedup key (job vanished or terminal) — drop and retry.
                 await self._r.delete(hash_key)
-                return await self.create(req)
-            # Race: hash_key vanished between SET NX failing and GET. Retry once.
-            return await self.create(req)
+                continue
+            # Race: hash_key vanished between SET NX failing and GET. Retry.
+            continue
 
-        # We own the dedup key. Write the job state + index.
-        async with self._r.pipeline(transaction=True) as pipe:
-            pipe.hset(_job_key(job.id), mapping=job.to_redis_hash())
-            pipe.expire(_job_key(job.id), self._state_ttl)
-            pipe.zadd(_profile_key(job.profile_id), {job.id: job.created_at})
-            await pipe.execute()
-        return job, True
+        # TTL must have flapped 3 times — Redis is under heavy churn or there is a bug.
+        raise RuntimeError("jobs/store: dedup race did not converge in 3 attempts")
 
     async def get(self, job_id: str) -> Job | None:
         data = await self._r.hgetall(_job_key(job_id))
