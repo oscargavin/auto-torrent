@@ -16,6 +16,29 @@ from .events import EventLog
 
 logger = logging.getLogger("atb.jobs.bus")
 
+# Strong references so GC cannot collect a task before it completes.
+_PENDING_PUBLISHES: set[asyncio.Task] = set()
+
+
+def _schedule(coro: Any) -> asyncio.Task:
+    """Schedule a fire-and-forget publish from a thread callback.
+
+    Keeps a strong ref so the task can't be GC'd, and logs any exception
+    instead of letting it disappear into an unhandled-exception warning.
+    """
+    task = asyncio.create_task(coro)
+    _PENDING_PUBLISHES.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _PENDING_PUBLISHES.discard(t)
+        if not t.cancelled():
+            exc = t.exception()
+            if exc is not None:
+                logger.error("bus publish failed: %r", exc)
+
+    task.add_done_callback(_done)
+    return task
+
 
 class StreamEventBus:
     def __init__(self, job_id: str, log: EventLog) -> None:
@@ -46,20 +69,21 @@ class StreamEventBus:
     # --- sync wrappers (callable from threads) ---
     # Fire-and-forget is intentional: the event loop is owned by the running arq
     # job, so tasks created here always complete before the job function returns.
+    # _schedule() keeps a strong ref and logs any Redis publish failure.
 
     def emit(self, type: str, data: dict | None = None) -> None:
         self._loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(self.emit_async(type, data))
+            lambda: _schedule(self.emit_async(type, data))
         )
 
     def send(self, _phone: str, text: str) -> None:
         self._loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(self.send_async(_phone, text))
+            lambda: _schedule(self.send_async(_phone, text))
         )
 
     def system_progress(self, text: str) -> None:
         self._loop.call_soon_threadsafe(
-            lambda: asyncio.create_task(self.system_progress_async(text))
+            lambda: _schedule(self.system_progress_async(text))
         )
 
     def close(self) -> None:
