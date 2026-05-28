@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import shutil
-from pathlib import Path
 from typing import Awaitable, Callable
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
@@ -146,10 +145,14 @@ def build_router(
         # Only act on a fresh transition — update_status returns the unchanged
         # job for already-terminal jobs (Fix 1), so a re-DELETE is a no-op.
         if updated.status == JobStatus.cancelled and pre.status != JobStatus.cancelled:
-            # Kill the subprocess + clean the landing dir BEFORE publishing the
-            # event. If the kill raises, we still publish (the state flip is
-            # what matters to the client) — but the partial file may linger.
-            download_id = pre.download_id
+            # Re-read to capture a download_id the worker may have written
+            # between `pre` (above) and now — the worker's set_download_id
+            # fires at the agent-commit boundary and can race a fast cancel.
+            # The worker's own post-register status re-check covers the
+            # symmetric race (cancel happens BEFORE register), so between
+            # the two we don't leak an orphan.
+            latest = await store.get(job_id)
+            download_id = latest.download_id if latest else pre.download_id
             if download_id:
                 await _kill_subprocess_and_clean(download_id)
             await log.publish(job_id, "cancelled", {})

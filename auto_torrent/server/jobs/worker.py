@@ -64,6 +64,13 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                     "run_chat_job: %s cancelled during agent run; not entering poll",
                     job.id,
                 )
+                # Race close-out: cancel_job's DELETE handler may have read
+                # download_id as None (set_download_id above hadn't landed yet)
+                # and skipped the kill. We just registered the download_id, so
+                # we own the responsibility to kill the orphan subprocess.
+                if download_id:
+                    from .api import _kill_subprocess_and_clean
+                    await _kill_subprocess_and_clean(download_id)
                 return
             await _emit_download_and_poll(
                 bus,
