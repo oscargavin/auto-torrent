@@ -11,7 +11,7 @@ from sse_starlette.sse import EventSourceResponse
 from ..app import _require_bearer  # re-use the existing bearer check
 from .events import EventLog
 from .store import JobStore
-from .types import CreateJobRequest, Job
+from .types import CreateJobRequest, Job, JobStatus
 
 
 def build_router(
@@ -104,5 +104,21 @@ def build_router(
             gen(),
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
+
+    @router.delete("/chat/jobs/{job_id}")
+    async def cancel_job(job_id: str, _: None = Depends(_require_bearer)) -> dict:
+        """Mark a job as cancelled and notify any open SSE subscribers.
+
+        This is a state-only signal — the BG aria2 download process is NOT
+        aborted here (aborting the arq worker mid-download is future work).
+        Task 13's _TERMINAL_EVENTS already includes "cancelled", so any open
+        SSE stream will close on receiving this event.
+        """
+        updated = await store.update_status(job_id, JobStatus.cancelled)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        # Best-effort signal to subscribers so they see cancellation immediately.
+        await log.publish(job_id, "cancelled", {})
+        return {"ok": True}
 
     return router

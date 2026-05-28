@@ -104,3 +104,14 @@ async def test_sse_streams_events_then_keepalive(app, client, redis):
             if "completed" in seen_types:
                 break
         assert "progress" in seen_types and "completed" in seen_types
+
+
+async def test_delete_marks_cancelled(client):
+    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
+    job_id = create.json()["id"]
+
+    r = await client.delete(f"/chat/jobs/{job_id}")
+    assert r.status_code == 200
+
+    g = await client.get(f"/chat/jobs/{job_id}")
+    assert g.json()["status"] == "cancelled"
