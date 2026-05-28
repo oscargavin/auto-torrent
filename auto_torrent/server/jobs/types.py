@@ -60,6 +60,10 @@ class Job(BaseModel):
     picked_title: str | None = None
     picked_author: str | None = None
     error: str | None = None
+    # 8-char hex assigned by _execute_download_bg; the worker registers it as
+    # soon as the agent commits, so the DELETE handler can look up the running
+    # subprocess via STATE_DIR/{download_id}.json and kill it on cancel.
+    download_id: str | None = None
 
     @classmethod
     def new(cls, profile_id: str, query: str) -> Self:

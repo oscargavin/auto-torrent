@@ -141,6 +141,18 @@ class JobStore:
         )
         return updated
 
+    async def set_download_id(self, job_id: str, download_id: str) -> None:
+        """Register the running download's state-file id against the job.
+
+        This deliberately bypasses the terminal-state guard in update_status:
+        the field is metadata (a pointer to the subprocess), not a transition.
+        If the job was just cancelled between the agent committing and this
+        write, we still want the pointer so cancel_job can find + kill the
+        already-spawned subprocess (otherwise the cancel is half-done — state
+        flipped but the aria2 fetch keeps running to completion).
+        """
+        await self._r.hset(_job_key(job_id), "download_id", download_id)
+
     async def list_for_profile(self, profile_id: str, *, limit: int = 20) -> list[Job]:
         # ZRANGEBYSCORE with REV — most recent first.
         ids = await self._r.zrevrange(_profile_key(profile_id), 0, limit - 1)

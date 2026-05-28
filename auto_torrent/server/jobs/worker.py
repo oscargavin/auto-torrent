@@ -47,6 +47,24 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
 
         if outcome.kind == "committed":
             clear_conversation(job.id)
+            # The agent has already spawned the download subprocess; register
+            # its state-file id against the job so a subsequent DELETE can find
+            # the running PID + landing path and tear them down.
+            download_id = (outcome.download or {}).get("id")
+            if download_id:
+                await store.set_download_id(job.id, download_id)
+            # Re-check status: cancel may have fired during the agent's search
+            # (which can take 10–30s). If so, skip the poll — _emit_download
+            # would otherwise loop on the subprocess that cancel_job is about
+            # to kill (or already killed), producing a confusing extra error
+            # event after the user already saw cancelled.
+            current = await store.get(job.id)
+            if current and current.status == JobStatus.cancelled:
+                logger.info(
+                    "run_chat_job: %s cancelled during agent run; not entering poll",
+                    job.id,
+                )
+                return
             await _emit_download_and_poll(
                 bus,
                 download=outcome.download or {},
@@ -56,6 +74,18 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                 author=outcome.author,
                 session=job.id,
             )
+            # If cancel fired during the poll, _emit_download_and_poll's error
+            # branch will have published an event but update_status here is a
+            # no-op against the cancelled terminal state — and we also skip the
+            # success event so the SSE consumer doesn't see committed → completed
+            # for a job they cancelled.
+            post = await store.get(job.id)
+            if post and post.status == JobStatus.cancelled:
+                logger.info(
+                    "run_chat_job: %s cancelled mid-poll; skipping success emit",
+                    job.id,
+                )
+                return
             await store.update_status(
                 job.id,
                 JobStatus.succeeded,
