@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -149,17 +151,18 @@ def build_router(
             # what matters to the client) — but the partial file may linger.
             download_id = pre.download_id
             if download_id:
-                _kill_subprocess_and_clean(download_id)
+                await _kill_subprocess_and_clean(download_id)
             await log.publish(job_id, "cancelled", {})
         return {"ok": True, "status": updated.status.value}
 
     return router
 
 
-def _kill_subprocess_and_clean(download_id: str) -> None:
-    """Best-effort: kill the aria2 subprocess, remove its state file, remove
-    the partial landing directory. Logs and swallows every error — DELETE
-    state-flip is the load-bearing part; cleanup is a courtesy."""
+async def _kill_subprocess_and_clean(download_id: str) -> None:
+    """Best-effort: kill the aria2 subprocess, wait for it to actually exit,
+    then remove the state file + partial landing directory. Async so the wait
+    doesn't block the event loop. Every step logs and swallows — the load-
+    bearing part of DELETE is the state flip; cleanup is a courtesy."""
     try:
         state = _read_state(download_id)
     except Exception:  # noqa: BLE001
@@ -173,6 +176,24 @@ def _kill_subprocess_and_clean(download_id: str) -> None:
         _kill_download(state)
     except Exception:  # noqa: BLE001
         logger.exception("cancel: _kill_download failed for %s", download_id)
+    # Wait for the subprocess to actually exit before rmtree — aria2's SIGTERM
+    # handler can take a moment to flush + close files, and rmtree racing the
+    # cleanup leaves an empty landing dir behind (aria2 recreates the dir as
+    # it writes one last partial file between our rmtree and its own exit).
+    pid = state.get("pid")
+    if isinstance(pid, int):
+        for _ in range(20):  # up to 2s
+            try:
+                os.kill(pid, 0)  # signal 0 = "is it alive?"
+            except (ProcessLookupError, PermissionError):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            # Still alive after 2s — SIGKILL the group.
+            try:
+                os.killpg(os.getpgid(pid), 9)
+            except (OSError, ProcessLookupError):
+                pass
     # Remove the partial landing dir so a half-finished .m4b doesn't get
     # scanned into the ABS library.
     landing_path = state.get("path")
