@@ -1,0 +1,15 @@
+[Unit]
+Description=ATB jobs worker (arq) — chat downloads
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/oscar/auto-torrent
+ExecStart=/home/oscar/.local/bin/uv run arq auto_torrent.server.jobs.worker.WorkerSettings
+# Give the worker time to drain in-flight downloads on SIGTERM before SIGKILL.
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
