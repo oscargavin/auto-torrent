@@ -91,10 +91,10 @@ class JobStore:
         current = await self.get(job_id)
         if current is None:
             return None
-        # Terminal status is final — refuse any further transitions. Returning the
-        # unchanged job lets callers (e.g. DELETE) treat re-cancellation as a no-op
-        # rather than 404.
-        if current.status in TERMINAL_STATUSES and current.status != status:
+        # Terminal status is final — refuse any further transitions (including
+        # same-status re-writes). Returning the unchanged job lets callers (e.g.
+        # DELETE) treat re-cancellation as a no-op rather than 404.
+        if current.status in TERMINAL_STATUSES:
             return current
 
         fields: dict[str, str] = {
