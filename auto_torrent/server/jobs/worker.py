@@ -80,8 +80,10 @@ class WorkerSettings:
     job_timeout = 60 * 60  # 1h hard cap — matches existing POLL_TIMEOUT_S
     keep_result = settings.job_state_ttl_s
 
+    # arq looks up `on_startup` / `on_shutdown` on WorkerSettings — NOT
+    # `startup`/`shutdown` (silently ignored otherwise → ctx missing keys).
     @staticmethod
-    async def startup(ctx: dict[str, Any]) -> None:
+    async def on_startup(ctx: dict[str, Any]) -> None:
         from redis.asyncio import Redis
 
         redis = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -94,5 +96,5 @@ class WorkerSettings:
         ctx["log"] = EventLog(redis)
 
     @staticmethod
-    async def shutdown(ctx: dict[str, Any]) -> None:
+    async def on_shutdown(ctx: dict[str, Any]) -> None:
         await ctx["redis"].aclose()
