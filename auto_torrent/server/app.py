@@ -37,12 +37,50 @@ _background_tasks: set[asyncio.Task] = set()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    from arq import create_pool
+    from arq.connections import RedisSettings
+    from redis.asyncio import Redis
+
+    from .jobs.api import build_router
+    from .jobs.events import EventLog
+    from .jobs.store import JobStore
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     logger.info("atb-server starting on port %d", settings.port)
-    yield
+
+    redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    arq_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+    store = JobStore(
+        redis,
+        state_ttl_s=settings.job_state_ttl_s,
+        dedup_ttl_s=settings.job_dedup_ttl_s,
+    )
+    log = EventLog(redis)
+
+    async def enqueue(job_id: str) -> None:
+        await arq_pool.enqueue_job("run_chat_job", job_id)
+
+    _app.include_router(build_router(store=store, log=log, enqueue=enqueue))
+
+    try:
+        yield
+    finally:
+        # Drain in-flight detached SSE-generator tasks (not the arq worker — that
+        # has its own lifecycle). 30s grace covers a normal stream close.
+        if _background_tasks:
+            logger.info("draining %d in-flight tasks…", len(_background_tasks))
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*_background_tasks, return_exceptions=True),
+                    timeout=30,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("drain timed out; %d still in flight", len(_background_tasks))
+        await arq_pool.close()
+        await redis.aclose()
 
 
 app = FastAPI(title="atb-server", lifespan=lifespan, docs_url=None, redoc_url=None)

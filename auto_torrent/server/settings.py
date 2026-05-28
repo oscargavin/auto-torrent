@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     # runs when a profile's finished books change (or on refresh).
     rec_cache_path: str = "rec-cache.json"
 
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    # How long completed/failed job rows live in Redis before GC.
+    job_state_ttl_s: int = 7 * 24 * 3600
+    # How long the dedup key lives so a re-request hits the same in-flight job.
+    job_dedup_ttl_s: int = 3600
+
     @field_validator("allowed_numbers", mode="before")
     @classmethod
     def parse_numbers(cls, v: str | list[str]) -> list[str]:
