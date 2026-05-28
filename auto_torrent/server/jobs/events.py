@@ -35,6 +35,11 @@ class EventLog:
         )
         return event_id
 
+    async def expire(self, job_id: str, ttl_s: int) -> None:
+        """Set a TTL on the stream key — call after a terminal event so the
+        stream GC's alongside the job hash."""
+        await self._r.expire(_stream_key(job_id), ttl_s)
+
     async def subscribe(
         self,
         job_id: str,
