@@ -44,24 +44,31 @@ class JobStore:
         self._dedup_ttl = dedup_ttl_s
 
     async def create(self, req: CreateJobRequest) -> tuple[Job, bool]:
-        """Idempotent create. Returns (job, created). If a non-terminal job
-        already exists for this (profile, query), returns it with created=False."""
+        """Idempotent create. Returns (job, created)."""
         sha = dedup_hash(req.profile_id, req.query)
         hash_key = _hash_key(sha)
 
-        existing_id = await self._r.get(hash_key)
-        if existing_id:
-            existing = await self.get(existing_id)
-            if existing and existing.status not in TERMINAL_STATUSES:
-                return existing, False
-            # Stale dedup key → drop and re-create.
-            await self._r.delete(hash_key)
-
         job = Job.new(req.profile_id, req.query)
+        # Atomic claim: SET NX wins exactly once per (profile, query) within the
+        # dedup TTL. If it loses, another caller is already in flight — fetch and
+        # return that job (or treat as stale if its key vanished mid-race).
+        claimed = await self._r.set(hash_key, job.id, ex=self._dedup_ttl, nx=True)
+        if not claimed:
+            existing_id = await self._r.get(hash_key)
+            if existing_id:
+                existing = await self.get(existing_id)
+                if existing and existing.status not in TERMINAL_STATUSES:
+                    return existing, False
+                # Stale dedup key or terminal job — drop and recurse once.
+                await self._r.delete(hash_key)
+                return await self.create(req)
+            # Race: hash_key vanished between SET NX failing and GET. Retry once.
+            return await self.create(req)
+
+        # We own the dedup key. Write the job state + index.
         async with self._r.pipeline(transaction=True) as pipe:
             pipe.hset(_job_key(job.id), mapping=job.to_redis_hash())
             pipe.expire(_job_key(job.id), self._state_ttl)
-            pipe.set(hash_key, job.id, ex=self._dedup_ttl)
             pipe.zadd(_profile_key(job.profile_id), {job.id: job.created_at})
             await pipe.execute()
         return job, True
