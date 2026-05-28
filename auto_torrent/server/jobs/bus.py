@@ -44,6 +44,8 @@ class StreamEventBus:
         await self._log.publish(self.job_id, "progress", {"text": text})
 
     # --- sync wrappers (callable from threads) ---
+    # Fire-and-forget is intentional: the event loop is owned by the running arq
+    # job, so tasks created here always complete before the job function returns.
 
     def emit(self, type: str, data: dict | None = None) -> None:
         self._loop.call_soon_threadsafe(
