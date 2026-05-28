@@ -50,3 +50,8 @@ def test_job_roundtrip_through_redis_hash():
     assert all(isinstance(v, str) for v in encoded.values())
     decoded = Job.from_redis_hash(encoded)
     assert decoded == job
+
+
+async def test_redis_fixture_works(redis):
+    await redis.set("k", "v")
+    assert await redis.get("k") == "v"
