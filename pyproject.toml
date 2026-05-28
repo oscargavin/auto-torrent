@@ -21,6 +21,9 @@ server = [
     "pydantic-settings>=2.7",
     "python-multipart>=0.0.20",
     "claude-agent-sdk>=0.1.73",
+    "redis>=5.0",
+    "arq>=0.26",
+    "sse-starlette>=2.1",
 ]
 
 [project.scripts]
@@ -36,4 +39,6 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "fakeredis>=2.26",
+    "pytest-asyncio>=0.24",
 ]
