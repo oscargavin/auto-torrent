@@ -97,3 +97,14 @@ class JobStore:
             # Release the dedup key so a re-request can start fresh.
             await self._r.delete(_hash_key(dedup_hash(job.profile_id, job.query)))
         return job
+
+    async def list_for_profile(self, profile_id: str, *, limit: int = 20) -> list[Job]:
+        # ZRANGEBYSCORE with REV — most recent first.
+        ids = await self._r.zrevrange(_profile_key(profile_id), 0, limit - 1)
+        if not ids:
+            return []
+        async with self._r.pipeline(transaction=False) as pipe:
+            for jid in ids:
+                pipe.hgetall(_job_key(jid))
+            rows = await pipe.execute()
+        return [Job.from_redis_hash(r) for r in rows if r]

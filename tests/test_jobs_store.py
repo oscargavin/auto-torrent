@@ -40,3 +40,21 @@ async def test_dedup_releases_after_terminal_status(store):
     b, created_b = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
     assert created_b is True
     assert a.id != b.id
+
+
+async def test_list_returns_recent_jobs_for_profile(store):
+    a, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    b, _ = await store.create(CreateJobRequest(profile_id="p1", query="hyperion"))
+    _, _ = await store.create(CreateJobRequest(profile_id="p2", query="dune"))
+
+    jobs = await store.list_for_profile("p1", limit=10)
+    ids = [j.id for j in jobs]
+    # Newest first (b created after a).
+    assert ids == [b.id, a.id]
+
+
+async def test_list_respects_limit(store):
+    for i in range(5):
+        await store.create(CreateJobRequest(profile_id="p1", query=f"q{i}"))
+    jobs = await store.list_for_profile("p1", limit=3)
+    assert len(jobs) == 3
