@@ -17,8 +17,8 @@ def app(redis, monkeypatch):
 
     monkeypatch.setattr(api_mod, "_require_bearer", _no_auth)
 
-    store = JobStore(redis, state_ttl_s=3600, dedup_ttl_s=600)
     log = EventLog(redis)
+    store = JobStore(redis, log, state_ttl_s=3600, dedup_ttl_s=600)
     enqueued: list[str] = []
 
     async def fake_enqueue(job_id: str) -> None:

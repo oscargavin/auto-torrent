@@ -9,8 +9,8 @@ from auto_torrent.server.jobs.worker import run_chat_job
 
 
 @pytest.fixture
-def store(redis):
-    return JobStore(redis, state_ttl_s=3600, dedup_ttl_s=600)
+def store(redis, log):
+    return JobStore(redis, log, state_ttl_s=3600, dedup_ttl_s=600)
 
 
 @pytest.fixture

@@ -111,17 +111,21 @@ def build_router(
 
         This is a state-only signal — the BG aria2 download process is NOT
         aborted here (aborting the arq worker mid-download is future work).
-        Task 13's _TERMINAL_EVENTS already includes "cancelled", so any open
-        SSE stream will close on receiving this event.
+        _TERMINAL_EVENT_TYPES already includes "cancelled", so any open SSE
+        stream will close on receiving this event.
         """
-        current = await store.get(job_id)
-        if current is None:
+        pre = await store.get(job_id)
+        if pre is None:
             raise HTTPException(status_code=404, detail="job not found")
-        if current.status in TERMINAL_STATUSES:
-            # Idempotent no-op — return the existing terminal state.
-            return {"ok": True, "status": current.status.value}
-        await store.update_status(job_id, JobStatus.cancelled)
-        await log.publish(job_id, "cancelled", {})
-        return {"ok": True, "status": "cancelled"}
+        updated = await store.update_status(job_id, JobStatus.cancelled)
+        if updated is None:
+            # Race: job expired between the initial get and update_status.
+            raise HTTPException(status_code=404, detail="job not found")
+        # Only publish a fresh cancelled event when this call actually transitioned
+        # the state — update_status returns the unchanged job for already-terminal
+        # jobs (Fix 1), so compare pre-state.
+        if updated.status == JobStatus.cancelled and pre.status != JobStatus.cancelled:
+            await log.publish(job_id, "cancelled", {})
+        return {"ok": True, "status": updated.status.value}
 
     return router

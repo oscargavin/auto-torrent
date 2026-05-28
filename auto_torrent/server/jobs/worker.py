@@ -63,12 +63,10 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                 picked_author=outcome.author,
             )
             await bus.emit_async("completed", {"title": outcome.title, "author": outcome.author})
-            await log.expire(job.id, settings.job_state_ttl_s)
         else:
             # asked / no_results / error — agent already published progress events.
             msg = outcome.message or f"agent ended: {outcome.kind}"
             await store.update_status(job.id, JobStatus.failed, error=msg)
-            await log.expire(job.id, settings.job_state_ttl_s)
             if outcome.kind not in ("asked", "no_results") and not bus.messaged:
                 await bus.emit_async("error", {"message": msg})
 
@@ -79,13 +77,11 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
             await bus.emit_async("error", {"message": "worker cancelled"})
         except Exception:  # noqa: BLE001
             pass  # bus publish may also fail mid-shutdown — best effort
-        await log.expire(job.id, settings.job_state_ttl_s)
         raise
     except Exception as e:  # noqa: BLE001
         logger.exception("run_chat_job crashed for %s", job_id)
         await store.update_status(job.id, JobStatus.failed, error=f"{type(e).__name__}: {e}")
         await bus.emit_async("error", {"message": f"{type(e).__name__}: {e}"})
-        await log.expire(job.id, settings.job_state_ttl_s)
 
 
 class WorkerSettings:
@@ -104,13 +100,15 @@ class WorkerSettings:
         from redis.asyncio import Redis
 
         redis = Redis.from_url(settings.redis_url, decode_responses=True)
+        log = EventLog(redis)
         ctx["redis"] = redis
+        ctx["log"] = log
         ctx["store"] = JobStore(
             redis,
+            log,
             state_ttl_s=settings.job_state_ttl_s,
             dedup_ttl_s=settings.job_dedup_ttl_s,
         )
-        ctx["log"] = EventLog(redis)
 
     @staticmethod
     async def on_shutdown(ctx: dict[str, Any]) -> None:

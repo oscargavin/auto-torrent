@@ -53,12 +53,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     arq_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+    log = EventLog(redis)
     store = JobStore(
         redis,
+        log,
         state_ttl_s=settings.job_state_ttl_s,
         dedup_ttl_s=settings.job_dedup_ttl_s,
     )
-    log = EventLog(redis)
 
     async def enqueue(job_id: str) -> None:
         await arq_pool.enqueue_job("run_chat_job", job_id)

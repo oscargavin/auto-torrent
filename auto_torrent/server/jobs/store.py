@@ -16,6 +16,7 @@ from typing import Final
 
 from redis.asyncio import Redis
 
+from .events import EventLog
 from .types import (
     TERMINAL_STATUSES,
     CreateJobRequest,
@@ -38,8 +39,16 @@ def _profile_key(profile_id: str) -> str:
 
 
 class JobStore:
-    def __init__(self, redis: Redis, *, state_ttl_s: int, dedup_ttl_s: int) -> None:
+    def __init__(
+        self,
+        redis: Redis,
+        log: EventLog,
+        *,
+        state_ttl_s: int,
+        dedup_ttl_s: int,
+    ) -> None:
         self._r: Final[Redis] = redis
+        self._log: Final[EventLog] = log
         self._state_ttl = state_ttl_s
         self._dedup_ttl = dedup_ttl_s
 
@@ -114,8 +123,10 @@ class JobStore:
         await self._r.hset(_job_key(job_id), mapping=fields)
 
         if status in TERMINAL_STATUSES and current.status not in TERMINAL_STATUSES:
-            # First terminal write → release the dedup key so a re-request can start fresh.
+            # First terminal write → release the dedup key so a re-request can
+            # start fresh, and expire the event stream alongside the job hash.
             await self._r.delete(_hash_key(dedup_hash(current.profile_id, current.query)))
+            await self._log.expire(job_id, self._state_ttl)
 
         return await self.get(job_id)
 

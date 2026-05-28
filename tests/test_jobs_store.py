@@ -1,13 +1,19 @@
 import pytest
 
+from auto_torrent.server.jobs.events import EventLog
 from auto_torrent.server.jobs.store import JobStore
 from auto_torrent.server.jobs.types import CreateJobRequest, JobStatus
 
 
 @pytest.fixture
-def store(redis):
+def log(redis):
+    return EventLog(redis)
+
+
+@pytest.fixture
+def store(redis, log):
     # 1h dedup TTL, 7d state TTL — concrete numbers are fine in tests.
-    return JobStore(redis, state_ttl_s=7 * 24 * 3600, dedup_ttl_s=3600)
+    return JobStore(redis, log, state_ttl_s=7 * 24 * 3600, dedup_ttl_s=3600)
 
 
 async def test_create_returns_pending_job(store):
