@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -57,3 +57,19 @@ async def test_run_chat_job_marks_failed_on_exception(redis, store, log, monkeyp
     refreshed = await store.get(job.id)
     assert refreshed.status == JobStatus.failed
     assert "boom" in refreshed.error
+
+
+async def test_run_chat_job_skips_already_terminal(redis, store, log, monkeypatch):
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    # Pre-cancel before the worker picks it up.
+    await store.update_status(job.id, JobStatus.cancelled)
+
+    # If run_chat_job didn't short-circuit, it'd hit run_agent. Set a poison
+    # mock — if it's called, the test fails loudly.
+    monkeypatch.setattr(
+        "auto_torrent.server.jobs.worker.run_agent",
+        AsyncMock(side_effect=AssertionError("agent should not run for terminal job")),
+    )
+    await run_chat_job({"redis": redis, "store": store, "log": log}, job.id)
+    final = await store.get(job.id)
+    assert final.status == JobStatus.cancelled  # unchanged
