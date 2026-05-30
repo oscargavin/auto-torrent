@@ -39,6 +39,11 @@ class ABSClient:
             "username": username,
             "password": secrets.token_urlsafe(24),
             "type": "user",
+            # ABS defaults API-created users to inactive, and its file-download
+            # routes require an ACTIVE account (canDownload && isActive) — so
+            # without this the profile's offline downloads 403 despite the
+            # download permission. Must be set at creation.
+            "isActive": True,
             "permissions": PROFILE_PERMISSIONS,
         }
         async with httpx.AsyncClient() as client:
