@@ -17,7 +17,7 @@ from typing import Awaitable, Callable
 from ..cli import _execute_download_bg, _read_state, _resolve_status
 from ..config import STATE_DIR
 from .audiobookshelf import ABSClient
-from .event_types import EVENT_PROGRESS, STAGE_IMPORT_FAILED, STAGE_IMPORTING
+from .event_types import EVENT_PROGRESS, STAGE_IMPORT_FAILED, STAGE_IMPORTING, STAGE_RETRYING
 from .settings import Settings
 from .sms import SMSClient
 
@@ -26,6 +26,40 @@ logger = logging.getLogger("atb.worker")
 POLL_INTERVAL_S = 15
 POLL_TIMEOUT_S = 60 * 60       # 60 min total per attempt
 STALL_GRACE_S = 3 * 60         # progress must move within 3 min or we declare stalled
+MAX_REDISCOVERY_ROUNDS = 2     # how many times to re-search when fallbacks run dry
+
+
+async def _reprobe_seeders(magnet: str) -> int:
+    """Live seeder count for a magnet via the DHT probe. 0 on any failure —
+    a probe error must not block the stall/fallback decision."""
+    try:
+        from ..cli import _probe_seeds_batch
+        counts = await asyncio.to_thread(_probe_seeds_batch, [magnet])
+        return int(counts.get(magnet, 0))
+    except Exception:  # noqa: BLE001
+        logger.exception("seeder re-probe failed for %s", magnet[:60])
+        return 0
+
+
+async def _rediscover_candidates(query: str, tried_magnets: set[str]) -> list[dict]:
+    """Re-run the search pipeline for `query` and return fresh fallback dicts
+    ({magnet, title}) whose magnets haven't been tried yet. Empty on any
+    failure (ABB down, rate-limited, no query) so rediscovery degrades to
+    'give up' rather than crashing the poll."""
+    if not query:
+        return []
+    try:
+        from .agent import _search_pipeline_sync
+        data = await asyncio.to_thread(_search_pipeline_sync, query, 5)
+    except Exception:  # noqa: BLE001
+        logger.exception("rediscovery search failed for %r", query)
+        return []
+    out: list[dict] = []
+    for r in data.get("results", []):
+        magnet = r.get("magnet")
+        if magnet and magnet not in tried_magnets:
+            out.append({"magnet": magnet, "title": r.get("title", "")})
+    return out
 
 
 def _emit_event(sink: object, event: str, data: dict) -> None:
@@ -151,11 +185,15 @@ async def poll_and_finalise(
     settings: Settings,
     sms: SMSClient,
     on_download_change: Callable[[str], Awaitable[None]] | None = None,
+    query: str | None = None,
 ) -> None:
     """Poll active download to completion, fall back through alternates on stall.
 
     `display` is the human-friendly title used in messages.
     `author`/`title` drive the ABS library folder.
+    `query` (optional) is the original search text — when the fixed fallback
+    list runs dry on a stall, it's re-run through the search pipeline to
+    discover fresh candidates rather than giving up.
     `on_download_change` (optional) is invoked with each new download_id when
     the stall handler swaps to a fallback magnet — lets the caller (the jobs
     worker) keep its store pointer current so the cancel handler kills the
@@ -164,6 +202,14 @@ async def poll_and_finalise(
     abs_client = ABSClient(settings)
     fallback_announced = False
     attempt = 0
+    rediscovery_rounds = 0
+    # Magnets we've already tried, so rediscovery never re-suggests a dead one.
+    tried_magnets: set[str] = set()
+    if download.get("magnet"):
+        tried_magnets.add(download["magnet"])
+    # Magnets we've already given a second chance to on a seeder re-probe — a
+    # magnet only earns one grace extension before we move on.
+    grace_extended: set[str] = set()
 
     while True:
         attempt += 1
@@ -174,10 +220,35 @@ async def poll_and_finalise(
         if outcome == "completed":
             break
         if outcome == "stalled" or outcome == "failed":
+            # R14: on a stall (not a hard failure), check whether the torrent
+            # still has seeders. If it does it's just slow — give it one more
+            # grace window rather than throwing away a viable download.
+            if outcome == "stalled":
+                cur_state = _refresh_state(download_id) or {}
+                cur_magnet = cur_state.get("magnet")
+                if cur_magnet and cur_magnet not in grace_extended:
+                    if await _reprobe_seeders(cur_magnet) > 0:
+                        grace_extended.add(cur_magnet)
+                        logger.info("Stall but %s still seeded — extending grace", display)
+                        _emit_event(sms, EVENT_PROGRESS, {
+                            "stage": STAGE_RETRYING,
+                            "text": f"{display} is slow but still seeded — giving it longer…",
+                        })
+                        continue
+
             if not fallbacks:
-                logger.info("No fallbacks left for %s", display)
-                sms.send(phone, f"Couldn't get {display} tonight, sorry — try in the morning?")
-                return
+                # R13: the fixed list is exhausted — re-search for fresh
+                # candidates before giving up, capped to bound runtime.
+                if rediscovery_rounds < MAX_REDISCOVERY_ROUNDS and query:
+                    rediscovery_rounds += 1
+                    logger.info("Rediscovery round %d for %s", rediscovery_rounds, display)
+                    found = await _rediscover_candidates(query, tried_magnets)
+                    if found:
+                        fallbacks.extend(found)
+                if not fallbacks:
+                    logger.info("No fallbacks left for %s", display)
+                    sms.send(phone, f"Couldn't get {display} tonight, sorry — try in the morning?")
+                    return
             if not fallback_announced:
                 sms.send(phone, f"That one stalled — trying another version…")
                 fallback_announced = True
@@ -191,6 +262,11 @@ async def poll_and_finalise(
                 await _kill_download_and_clean(stale)
 
             next_fb = fallbacks.pop(0)
+            tried_magnets.add(next_fb["magnet"])
+            _emit_event(sms, EVENT_PROGRESS, {
+                "stage": STAGE_RETRYING,
+                "text": f"Trying another copy of {display}…",
+            })
             bg_title = f"{title} - {author}" if author else title
             try:
                 download = await asyncio.to_thread(

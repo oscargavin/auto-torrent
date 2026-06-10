@@ -96,6 +96,7 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                 author=outcome.author,
                 session=job.id,
                 on_download_change=_track_download_change,
+                query=job.query,
             )
             # If cancel fired during the poll, update_status here is a no-op
             # against the cancelled terminal state — and we skip the success

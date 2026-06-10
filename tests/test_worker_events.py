@@ -15,6 +15,7 @@ from auto_torrent.server.event_types import (
     EVENT_PROGRESS,
     STAGE_IMPORT_FAILED,
     STAGE_IMPORTING,
+    STAGE_RETRYING,
 )
 from auto_torrent.server.worker import (
     ImportIncompleteError,
@@ -27,6 +28,20 @@ from auto_torrent.server.worker import (
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+async def _async(value):
+    """Wrap a value as an awaitable so a plain lambda can stand in for an
+    async function being monkeypatched."""
+    return value
+
+
+def _mk(tmp_path):
+    """A landing dir with one file (so organise has something to move)."""
+    d = tmp_path / "landing"
+    d.mkdir(exist_ok=True)
+    (d / "a.m4b").write_text("x")
+    return d
 
 
 class BusSink:
@@ -141,6 +156,118 @@ async def test_scan_failure_raises_import_incomplete(tmp_path, monkeypatch):
         ev == EVENT_PROGRESS and d.get("stage") == STAGE_IMPORT_FAILED
         for ev, d in sink.emitted
     )
+
+
+@pytest.mark.anyio
+async def test_stall_with_seeders_extends_grace_once(tmp_path, monkeypatch):
+    """R14: a stall on a torrent that still has seeders earns one extra grace
+    window (no fallback switch) before being abandoned."""
+    monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
+
+    outcomes = iter(["stalled", "completed"])
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id: _async(next(outcomes)))
+    monkeypatch.setattr(
+        worker_module, "_refresh_state",
+        lambda _id: {"id": _id, "magnet": "magnet:seeded", "path": str(_mk(tmp_path)), "status": "completed"},
+    )
+    monkeypatch.setattr(worker_module, "_organize_files", lambda *a, **k: tmp_path / "dest")
+    # Still seeded → extend grace, don't switch.
+    monkeypatch.setattr(worker_module, "_reprobe_seeders", lambda _m: _async(5))
+
+    # No fallback should ever be started.
+    monkeypatch.setattr(
+        worker_module, "_execute_download_bg",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not switch when seeded")),
+    )
+
+    sink = BusSink()
+    settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
+    await poll_and_finalise(
+        download={"id": "d1", "magnet": "magnet:seeded"}, fallbacks=[],
+        display="“Book”", author="A", title="Book", phone="s", settings=settings, sms=sink,
+    )
+
+    assert any(d.get("stage") == STAGE_RETRYING for _, d in sink.emitted)
+
+
+@pytest.mark.anyio
+async def test_rediscovery_when_fallbacks_empty(tmp_path, monkeypatch):
+    """R13: when the fixed list is empty, rediscovery supplies a fresh
+    candidate (excluding already-tried magnets) and the download continues."""
+    monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
+
+    outcomes = iter(["failed", "completed"])
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id: _async(next(outcomes)))
+    monkeypatch.setattr(
+        worker_module, "_refresh_state",
+        lambda _id: {"id": _id, "magnet": "magnet:dead", "path": str(_mk(tmp_path)), "status": "failed"},
+    )
+    monkeypatch.setattr(worker_module, "_organize_files", lambda *a, **k: tmp_path / "dest")
+    monkeypatch.setattr(worker_module, "_kill_download_and_clean", lambda _s: _async(None))
+
+    seen = {}
+
+    def fake_exec(title, magnet, cover):
+        seen["magnet"] = magnet
+        return {"id": "d2", "magnet": magnet}
+
+    monkeypatch.setattr(worker_module, "_execute_download_bg", fake_exec)
+
+    async def fake_rediscover(query, tried):
+        assert "magnet:dead" in tried  # original excluded
+        return [{"magnet": "magnet:fresh", "title": "Book"}]
+
+    monkeypatch.setattr(worker_module, "_rediscover_candidates", fake_rediscover)
+
+    sink = BusSink()
+    settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
+    await poll_and_finalise(
+        download={"id": "d1", "magnet": "magnet:dead"}, fallbacks=[],
+        display="“Book”", author="A", title="Book", phone="s", settings=settings,
+        sms=sink, query="the book",
+    )
+
+    assert seen.get("magnet") == "magnet:fresh"
+    assert any(d.get("stage") == STAGE_RETRYING for _, d in sink.emitted)
+
+
+@pytest.mark.anyio
+async def test_rediscovery_capped(tmp_path, monkeypatch):
+    """Rediscovery is bounded: it re-searches at most MAX_REDISCOVERY_ROUNDS
+    times across repeated stalls, then gives up rather than looping forever."""
+    monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
+    # Every download fails; never seeded.
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id: _async("failed"))
+    monkeypatch.setattr(
+        worker_module, "_refresh_state",
+        lambda _id: {"id": _id, "magnet": "magnet:dead", "status": "failed"},
+    )
+    monkeypatch.setattr(worker_module, "_kill_download_and_clean", lambda _s: _async(None))
+    monkeypatch.setattr(
+        worker_module, "_execute_download_bg",
+        lambda title, magnet, cover: {"id": "dN", "magnet": magnet},
+    )
+
+    calls = {"n": 0}
+
+    async def fake_rediscover(query, tried):
+        calls["n"] += 1
+        # First round finds a candidate (so the poll continues), later rounds
+        # come up empty.
+        return [{"magnet": f"magnet:fresh{calls['n']}", "title": "Book"}] if calls["n"] == 1 else []
+
+    monkeypatch.setattr(worker_module, "_rediscover_candidates", fake_rediscover)
+
+    sink = BusSink()
+    settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
+    await poll_and_finalise(
+        download={"id": "d1", "magnet": "magnet:dead"}, fallbacks=[],
+        display="“Book”", author="A", title="Book", phone="s", settings=settings,
+        sms=sink, query="the book",
+    )
+
+    assert calls["n"] == worker_module.MAX_REDISCOVERY_ROUNDS
+    assert any("Couldn't get" in s for s in sink.sent)
 
 
 def test_organize_files_namespaces_on_collision(tmp_path):

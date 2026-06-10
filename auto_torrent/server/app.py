@@ -383,6 +383,7 @@ async def _emit_download_and_poll(
     author: str,
     session: str,
     on_download_change: Callable[[str], Awaitable[None]] | None = None,
+    query: str | None = None,
 ) -> bool:
     """Emit `committed`, run the poll with a progress pump, then `completed`.
 
@@ -413,6 +414,7 @@ async def _emit_download_and_poll(
             settings=settings,
             sms=bus,
             on_download_change=on_download_change,
+            query=query,
         )
         bus.emit("completed", {"title": title, "author": author})
         return True
@@ -470,6 +472,7 @@ async def chat(req: ChatRequest, _: None = Depends(_require_bearer)) -> Streamin
                     title=outcome.title,
                     author=outcome.author,
                     session=session,
+                    query=query,
                 )
             elif outcome.kind in ("asked", "no_results"):
                 # Agent already pushed user-facing text via bus.send (→ progress events).
