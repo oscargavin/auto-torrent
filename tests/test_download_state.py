@@ -3,7 +3,12 @@
 import json
 from dataclasses import dataclass
 
-from auto_torrent.download import _estimate_eta, _update_state_progress
+from auto_torrent.download import (
+    _estimate_eta,
+    _load_resume_data,
+    _resume_path,
+    _update_state_progress,
+)
 
 
 @dataclass
@@ -74,3 +79,26 @@ def test_legacy_reader_unaffected(tmp_path):
     data = json.loads(state.read_text())
     # A reader that only knows 'progress' still works.
     assert data.get("progress") == 0.7
+
+
+# --- U4 resume helpers ---------------------------------------------------
+
+
+def test_resume_path_beside_state_file(tmp_path):
+    state = tmp_path / "abc123.json"
+    assert _resume_path(state) == tmp_path / "abc123.resume"
+
+
+def test_resume_path_none_without_state_file():
+    assert _resume_path(None) is None
+
+
+def test_load_resume_data_reads_blob(tmp_path):
+    blob = tmp_path / "abc123.resume"
+    blob.write_bytes(b"resume-bytes")
+    assert _load_resume_data(blob) == b"resume-bytes"
+
+
+def test_load_resume_data_missing_returns_none(tmp_path):
+    assert _load_resume_data(tmp_path / "nope.resume") is None
+    assert _load_resume_data(None) is None

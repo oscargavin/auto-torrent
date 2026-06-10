@@ -20,9 +20,13 @@ STAGE_FOUND = "found"
 STAGE_DOWNLOADING = "downloading"
 STAGE_IMPORTING = "importing"
 STAGE_RETRYING = "retrying"
+STAGE_IMPORT_FAILED = "import_failed"
 
 # The full set the app mirrors — a parity test asserts the app decoder knows
 # exactly these stages.
 ALL_STAGES = frozenset(
-    {STAGE_SEARCHING, STAGE_FOUND, STAGE_DOWNLOADING, STAGE_IMPORTING, STAGE_RETRYING}
+    {
+        STAGE_SEARCHING, STAGE_FOUND, STAGE_DOWNLOADING,
+        STAGE_IMPORTING, STAGE_RETRYING, STAGE_IMPORT_FAILED,
+    }
 )

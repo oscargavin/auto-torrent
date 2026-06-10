@@ -33,8 +33,22 @@ def add_magnet(
     save_path: Path,
     trackers: list[str],
     sequential: bool = False,
+    resume_data: bytes | None = None,
 ) -> lt.torrent_handle:
-    params = lt.parse_magnet_uri(magnet)
+    # Resume from a saved checkpoint when we have one — read_resume_data
+    # reconstructs add_torrent_params (info-hash, have-pieces, etc.) so the
+    # session continues from where it left off instead of refetching from 0%.
+    # Any failure (corrupt blob, libtorrent version skew) falls back to a fresh
+    # magnet add, so resume is strictly best-effort and never worse than today.
+    params = None
+    if resume_data:
+        try:
+            params = lt.read_resume_data(resume_data)
+        except Exception:
+            params = None
+    if params is None:
+        params = lt.parse_magnet_uri(magnet)
+
     params.save_path = str(save_path)
 
     if sequential:

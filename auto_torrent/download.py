@@ -34,8 +34,13 @@ def download_torrent(
 
     dest.mkdir(parents=True, exist_ok=True)
 
+    resume_path = _resume_path(state_file)
+    resume_data = _load_resume_data(resume_path)
+
     session = create_session(listen_port=6881)
-    handle = add_magnet(session, magnet, dest, trackers, sequential=False)
+    handle = add_magnet(
+        session, magnet, dest, trackers, sequential=False, resume_data=resume_data
+    )
 
     try:
         torrent_info = wait_for_metadata(session, handle, timeout=120, log=log)
@@ -88,20 +93,46 @@ def download_torrent(
         raise TorrentError(str(e)) from e
     finally:
         try:
-            _save_resume_data(session, handle)
+            _save_resume_data(session, handle, resume_path)
         except Exception:
             pass
         session.remove_torrent(handle)
 
 
-def _save_resume_data(session: lt.session, handle: lt.torrent_handle) -> None:
-    """Request and wait for resume data save (enables fast restart)."""
+def _resume_path(state_file: Path | None) -> Path | None:
+    """Resume blob lives beside the state file: <id>.resume. None for
+    foreground/manual downloads with no state file."""
+    return state_file.with_suffix(".resume") if state_file else None
+
+
+def _load_resume_data(resume_path: Path | None) -> bytes | None:
+    if resume_path and resume_path.exists():
+        try:
+            return resume_path.read_bytes()
+        except OSError:
+            return None
+    return None
+
+
+def _save_resume_data(
+    session: lt.session,
+    handle: lt.torrent_handle,
+    resume_path: Path | None = None,
+) -> None:
+    """Request resume data and, when it arrives, persist the bytes so a
+    restarted download can continue from the checkpoint. Previously the bytes
+    were discarded, so resume never actually worked across restarts."""
     handle.save_resume_data(lt.save_resume_flags_t.save_info_dict)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         alerts = session.pop_alerts()
         for alert in alerts:
             if isinstance(alert, lt.save_resume_data_alert):
+                if resume_path is not None:
+                    try:
+                        resume_path.write_bytes(lt.write_resume_data_buf(alert.params))
+                    except Exception:
+                        pass
                 return
             if isinstance(alert, lt.save_resume_data_failed_alert):
                 return

@@ -17,7 +17,7 @@ from typing import Awaitable, Callable
 from ..cli import _execute_download_bg, _read_state, _resolve_status
 from ..config import STATE_DIR
 from .audiobookshelf import ABSClient
-from .event_types import EVENT_PROGRESS, STAGE_IMPORTING
+from .event_types import EVENT_PROGRESS, STAGE_IMPORT_FAILED, STAGE_IMPORTING
 from .settings import Settings
 from .sms import SMSClient
 
@@ -41,10 +41,32 @@ def _sanitize(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', "", name).strip()
 
 
-def _organize_files(download_path: str, library_path: str, author: str, title: str) -> Path:
-    """Move downloaded files into ABS library structure: Author/Title/."""
+class ImportIncompleteError(Exception):
+    """The bytes are down but the book did not make it into the library
+    (organise or ABS scan failed). Files remain on disk for a later scan; the
+    caller must NOT report success."""
+
+
+def _organize_files(
+    download_path: str,
+    library_path: str,
+    author: str,
+    title: str,
+    download_id: str | None = None,
+) -> Path:
+    """Move downloaded files into ABS library structure: Author/Title/.
+
+    Normally lands at the clean ``Author/Title/`` path. If that folder already
+    exists and is non-empty — i.e. a *different* download (another job, same
+    title) already claimed it — the files go to ``Author/Title [id]/`` instead
+    of overwriting, so two concurrent same-title downloads can't corrupt each
+    other."""
     src = Path(download_path)
-    dest = Path(library_path) / _sanitize(author or "Unknown") / _sanitize(title)
+    base = Path(library_path) / _sanitize(author or "Unknown") / _sanitize(title)
+
+    dest = base
+    if base.exists() and any(base.iterdir()) and download_id:
+        dest = base.parent / f"{base.name} [{_sanitize(download_id)}]"
     dest.mkdir(parents=True, exist_ok=True)
 
     for item in src.iterdir():
@@ -204,18 +226,28 @@ async def poll_and_finalise(
     download_path = final.get("path", "")
     try:
         dest = await asyncio.to_thread(
-            _organize_files, download_path, settings.abs_library_path, author, title,
+            _organize_files, download_path, settings.abs_library_path,
+            author, title, download.get("id"),
         )
         logger.info("Organised %s → %s", display, dest)
-    except Exception:
+    except Exception as e:
         logger.exception("organise failed")
         sms.send(phone, f"{display} downloaded but I couldn't move it into the library. Try again?")
-        return
+        _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORT_FAILED, "percent": 100,
+                                          "text": f"{display} downloaded but couldn't be imported."})
+        raise ImportIncompleteError(display) from e
 
     try:
         await abs_client.scan_library(settings.abs_library_id)
-    except Exception:
+    except Exception as e:
+        # Files are on disk; a later scan will pick them up. But we must NOT
+        # tell the user it's in the library — surface "downloaded, not yet
+        # imported" instead and signal the caller to skip the success event.
         logger.exception("ABS scan failed; files are in place, will be picked up on next scan")
+        sms.send(phone, f"{display} downloaded — it'll appear after the next library scan.")
+        _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORT_FAILED, "percent": 100,
+                                          "text": f"{display} downloaded, not yet imported."})
+        raise ImportIncompleteError(display) from e
 
     sms.send(phone, f"✓ {display} is in your library.")
 

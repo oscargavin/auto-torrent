@@ -22,7 +22,7 @@ from .profiles import ALLOWED_AVATAR_STYLES, ProfileStore, public_view
 from .recommend import DEFAULT_N, RecCache, build_recommendations
 from .settings import Settings
 from .sms import SMSClient
-from .worker import _refresh_state, get_active_downloads, poll_and_finalise
+from .worker import ImportIncompleteError, _refresh_state, get_active_downloads, poll_and_finalise
 
 logger = logging.getLogger("atb.server")
 
@@ -383,8 +383,14 @@ async def _emit_download_and_poll(
     author: str,
     session: str,
     on_download_change: Callable[[str], Awaitable[None]] | None = None,
-) -> None:
+) -> bool:
     """Emit `committed`, run the poll with a progress pump, then `completed`.
+
+    Returns True when the book reached the library, False when it downloaded
+    but couldn't be imported (organise/scan failed) — in which case
+    poll_and_finalise has already surfaced an `import_failed` stage and no
+    `completed` event is emitted. The jobs worker reads this to avoid marking a
+    job succeeded when the book never actually landed.
 
     `on_download_change` forwards the per-fallback download_id update from
     poll_and_finalise to the caller — the jobs worker uses it to keep
@@ -409,9 +415,15 @@ async def _emit_download_and_poll(
             on_download_change=on_download_change,
         )
         bus.emit("completed", {"title": title, "author": author})
+        return True
+    except ImportIncompleteError:
+        # Downloaded but not imported — poll_and_finalise already emitted the
+        # import_failed stage and messaged the user. Don't claim success.
+        return False
     except Exception as e:  # noqa: BLE001
         logger.exception("chat poll_and_finalise crashed")
         bus.emit("error", {"message": f"download error: {e}"})
+        return False
     finally:
         stop.set()
         try:

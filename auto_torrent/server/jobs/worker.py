@@ -83,7 +83,11 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
             async def _track_download_change(new_id: str) -> None:
                 await store.set_download_id(job.id, new_id)
 
-            await _emit_download_and_poll(
+            # Returns True only if the book actually landed in the library.
+            # False = downloaded-but-not-imported (organise/scan failed); the
+            # `completed` event is emitted inside _emit_download_and_poll on
+            # success, so we do not re-emit it here.
+            imported = await _emit_download_and_poll(
                 bus,
                 download=outcome.download or {},
                 fallbacks=outcome.fallbacks,
@@ -93,11 +97,9 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                 session=job.id,
                 on_download_change=_track_download_change,
             )
-            # If cancel fired during the poll, _emit_download_and_poll's error
-            # branch will have published an event but update_status here is a
-            # no-op against the cancelled terminal state — and we also skip the
-            # success event so the SSE consumer doesn't see committed → completed
-            # for a job they cancelled.
+            # If cancel fired during the poll, update_status here is a no-op
+            # against the cancelled terminal state — and we skip the success
+            # status so the SSE consumer doesn't see a cancelled job succeed.
             post = await store.get(job.id)
             if post and post.status == JobStatus.cancelled:
                 logger.info(
@@ -105,13 +107,21 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                     job.id,
                 )
                 return
-            await store.update_status(
-                job.id,
-                JobStatus.succeeded,
-                picked_title=outcome.title,
-                picked_author=outcome.author,
-            )
-            await bus.emit_async("completed", {"title": outcome.title, "author": outcome.author})
+            if imported:
+                await store.update_status(
+                    job.id,
+                    JobStatus.succeeded,
+                    picked_title=outcome.title,
+                    picked_author=outcome.author,
+                )
+            else:
+                await store.update_status(
+                    job.id,
+                    JobStatus.failed,
+                    error="downloaded but not imported into the library",
+                    picked_title=outcome.title,
+                    picked_author=outcome.author,
+                )
         else:
             # asked / no_results / error — agent already published progress events.
             msg = outcome.message or f"agent ended: {outcome.kind}"
