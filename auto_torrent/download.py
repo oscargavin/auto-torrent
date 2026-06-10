@@ -55,13 +55,22 @@ def download_torrent(
             )
 
             if state_file and (time.monotonic() - last_progress_write) >= DOWNLOAD_PROGRESS_INTERVAL:
-                _update_state_progress(state_file, status.progress)
+                _update_state_progress(
+                    state_file,
+                    status.progress,
+                    speed_bytes_per_s=status.download_rate,
+                    peers=status.num_peers,
+                    eta_s=_estimate_eta(status),
+                )
                 last_progress_write = time.monotonic()
 
             if status.is_seeding:
                 log(f"\n  Download complete: {dest}")
                 if state_file:
-                    _update_state_progress(state_file, 1.0, status="completed")
+                    _update_state_progress(
+                        state_file, 1.0, status="completed",
+                        speed_bytes_per_s=0, peers=status.num_peers, eta_s=0,
+                    )
                 break
 
             time.sleep(1)
@@ -99,13 +108,44 @@ def _save_resume_data(session: lt.session, handle: lt.torrent_handle) -> None:
         time.sleep(0.1)
 
 
-def _update_state_progress(state_file: Path, progress: float, status: str | None = None) -> None:
-    """Update progress (and optionally status) in a state JSON file."""
+def _estimate_eta(status: "lt.torrent_status") -> int | None:
+    """Seconds remaining = bytes left ÷ current rate. None when the rate is
+    zero (no honest estimate) or the download is already complete."""
+    rate = status.download_rate
+    if rate <= 0:
+        return None
+    remaining = status.total_wanted - status.total_wanted_done
+    if remaining <= 0:
+        return 0
+    return int(remaining / rate)
+
+
+def _update_state_progress(
+    state_file: Path,
+    progress: float,
+    status: str | None = None,
+    *,
+    speed_bytes_per_s: int | None = None,
+    peers: int | None = None,
+    eta_s: int | None = None,
+) -> None:
+    """Update progress (and optionally status + live metrics) in a state JSON
+    file. Metrics are written only when supplied so callers that just flip the
+    status don't clobber the last known speed/peers/eta. Readers that predate
+    these keys are unaffected (they use ``.get``)."""
     try:
         state = json.loads(state_file.read_text())
         state["progress"] = round(progress, 4)
         if status:
             state["status"] = status
+        if speed_bytes_per_s is not None:
+            state["speed_bytes_per_s"] = int(speed_bytes_per_s)
+        if peers is not None:
+            state["peers"] = int(peers)
+        # eta_s is meaningful even when None (unknown) — write it through so a
+        # stalled download clears a stale estimate rather than keeping it.
+        if speed_bytes_per_s is not None or eta_s is not None:
+            state["eta_s"] = eta_s
         state_file.write_text(json.dumps(state, indent=2))
     except (json.JSONDecodeError, OSError):
         pass
