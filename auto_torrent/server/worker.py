@@ -17,6 +17,7 @@ from typing import Awaitable, Callable
 from ..cli import _execute_download_bg, _read_state, _resolve_status
 from ..config import STATE_DIR
 from .audiobookshelf import ABSClient
+from .event_types import EVENT_PROGRESS, STAGE_IMPORTING
 from .settings import Settings
 from .sms import SMSClient
 
@@ -25,6 +26,15 @@ logger = logging.getLogger("atb.worker")
 POLL_INTERVAL_S = 15
 POLL_TIMEOUT_S = 60 * 60       # 60 min total per attempt
 STALL_GRACE_S = 3 * 60         # progress must move within 3 min or we declare stalled
+
+
+def _emit_event(sink: object, event: str, data: dict) -> None:
+    """Emit a structured SSE event through a sink that supports it (the chat /
+    jobs bus). The SMS sink only has `send` (string bodies) — for it this is a
+    no-op, so the shared poll path never pushes a dict at the SMS channel."""
+    emit = getattr(sink, "emit", None)
+    if callable(emit):
+        emit(event, data)
 
 
 def _sanitize(name: str) -> str:
@@ -179,6 +189,12 @@ async def poll_and_finalise(
         # Unknown outcome → bail.
         sms.send(phone, f"Something odd happened with {display}. Try again?")
         return
+
+    # The bytes are down; the user-visible work now is organise + ABS scan.
+    # Surface that as a distinct stage so the chat/jobs UI shows "importing"
+    # rather than sitting at 100% "downloading". No-op for the SMS sink.
+    _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
+                                      "text": f"Adding {display} to your library…"})
 
     final = _refresh_state(download.get("id"))
     if not final:

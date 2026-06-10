@@ -298,6 +298,54 @@ async def test_committed_path_emits_periodic_progress_then_completed():
 
 
 @pytest.mark.anyio
+async def test_download_progress_carries_structured_fields():
+    """U1: download-progress events carry percent/stage plus the human text,
+    so the app can render a determinate bar — not just parse a string."""
+    import asyncio
+
+    async def fake_run_agent(query, phone, settings_, sms_, pending_options=None):
+        return AgentOutcome(
+            kind="committed", download={"id": "test-id", "progress": 0.0},
+            fallbacks=[], display="“The Book”", title="The Book", author="Author",
+        )
+
+    async def fake_poll_and_finalise(**kwargs):
+        await asyncio.sleep(0.2)
+
+    state_iter = iter([
+        {"progress": 0.34, "status": "downloading",
+         "speed_bytes_per_s": 2_500_000, "peers": 8, "eta_s": 120},
+    ])
+
+    def fake_refresh_state(_id):
+        try:
+            return next(state_iter)
+        except StopIteration:
+            return {"progress": 1.0, "status": "completed"}
+
+    with (
+        patch.object(app_module, "run_agent", fake_run_agent),
+        patch.object(app_module, "poll_and_finalise", fake_poll_and_finalise),
+        patch.object(app_module, "_refresh_state", fake_refresh_state, create=True),
+        patch.object(app_module, "CHAT_PROGRESS_INTERVAL_S", 0.05, create=True),
+    ):
+        status, events = await _post_chat({"query": "x", "session_id": "s-struct"})
+
+    assert status == 200
+    structured = [
+        d for n, d in events
+        if n == "progress" and d.get("stage") == "downloading"
+    ]
+    assert structured, f"expected a structured downloading progress event: {events}"
+    first = structured[0]
+    assert first["percent"] == 34
+    assert first["speed_bytes_per_s"] == 2_500_000
+    assert first["peers"] == 8
+    assert first["eta_s"] == 120
+    assert "%" in first["text"]  # back-compat text retained
+
+
+@pytest.mark.anyio
 async def test_event_bus_tracks_messages():
     """Unit-level: the bus exposes a `messaged` flag flipped by send()."""
     import asyncio as _asyncio

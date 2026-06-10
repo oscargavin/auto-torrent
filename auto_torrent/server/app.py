@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .agent import AgentOutcome, run_agent
+from .event_types import EVENT_PROGRESS, STAGE_DOWNLOADING
 from .llm import clear_conversation, get_pending_options, get_pending_result
 from .profiles import ALLOWED_AVATAR_STYLES, ProfileStore, public_view
 from .recommend import DEFAULT_N, RecCache, build_recommendations
@@ -357,8 +358,18 @@ async def _chat_progress_pump(
         if not state:
             continue
         pct = int(float(state.get("progress") or 0) * 100)
+        # Emit on change only — a multi-hour download produces tens of events,
+        # not hundreds, keeping clear of the Redis stream MAXLEN trim. `text`
+        # is retained for back-compat (old consumers + the SSE test's %-check).
         if pct != last_pct:
-            bus.send("", f"Downloading… {pct}%")
+            bus.emit(EVENT_PROGRESS, {
+                "percent": pct,
+                "speed_bytes_per_s": state.get("speed_bytes_per_s"),
+                "peers": state.get("peers"),
+                "eta_s": state.get("eta_s"),
+                "stage": STAGE_DOWNLOADING,
+                "text": f"Downloading… {pct}%",
+            })
             last_pct = pct
 
 
