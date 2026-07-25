@@ -69,7 +69,9 @@ def _split_title_author(query: str) -> tuple[str, str]:
 
 
 def _try_query(q: str = "", *, title: str = "", author: str = "") -> list[dict]:
-    params: dict[str, object] = {"limit": 5, "fields": _FIELDS}
+    # 10, not 5: the single book is often outranked by editions and box sets,
+    # and scoring can only choose between what it is given.
+    params: dict[str, object] = {"limit": 10, "fields": _FIELDS}
     if q:
         params["q"] = q
     if title:
@@ -96,10 +98,13 @@ def _title_score(doc_title: str, want: str) -> int:
     a2, b2 = _ARTICLES.sub("", a).strip(), _ARTICLES.sub("", b).strip()
     if a2 == b2:
         return 95
-    # One contains the other: "Dune" vs "Dune Messiah" is a weaker match than
-    # equality but far better than sharing a couple of words.
+    # One is a prefix of the other, scaled by how much extra the longer one
+    # carries. A flat score here rated "Dune, Dune Messiah, Children of Dune"
+    # nearly as highly as "Dune" — the omnibus starts with the right word and
+    # then keeps going. "Dune Messiah" is a near miss; a 3-book collection is
+    # not the book that was asked for.
     if a2.startswith(b2) or b2.startswith(a2):
-        return 70
+        return int(70 * min(len(a2), len(b2)) / max(len(a2), len(b2)))
     wanted = set(b2.split())
     if not wanted:
         return 0
@@ -124,6 +129,26 @@ def _author_score(doc_authors: list[str] | None, want: str) -> int:
     return 0
 
 
+_COLLECTION = re.compile(
+    r"\b(trilogy|omnibus|box(ed)?\s*set|\d+\s*-?\s*book|books?\s+\d+\s*[-–]\s*\d+"
+    r"|complete\s+(series|collection|novels)|collection|anthology|series\s+set)\b",
+    re.IGNORECASE,
+)
+
+
+def _collection_penalty(doc_title: str, want_title: str) -> int:
+    """Push box sets below the single book they contain.
+
+    A collection legitimately matches the title of every book inside it, so
+    scoring alone can't separate them. Downloading one costs gigabytes and
+    produces a library item that isn't the book that was asked for. No penalty
+    when the request itself asks for a collection.
+    """
+    if _COLLECTION.search(want_title):
+        return 0
+    return -60 if _COLLECTION.search(doc_title) else 0
+
+
 def _pick_best(docs: list[dict], want_title: str, want_author: str) -> dict:
     """Choose the doc that best matches the request.
 
@@ -134,8 +159,11 @@ def _pick_best(docs: list[dict], want_title: str, want_author: str) -> dict:
     """
     best, best_score = docs[0], -1
     for doc in docs:
-        score = _title_score(doc.get("title", ""), want_title) + _author_score(
-            doc.get("author_name"), want_author
+        title = doc.get("title", "")
+        score = (
+            _title_score(title, want_title)
+            + _author_score(doc.get("author_name"), want_author)
+            + _collection_penalty(title, want_title)
         )
         if score > best_score:
             best, best_score = doc, score

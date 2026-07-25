@@ -132,3 +132,52 @@ class TestLookupBook:
             book = ol.lookup_book("Dune")
         assert book.title == "Dune"
         assert book.author == "Frank Herbert"
+
+
+class TestCollections:
+    """A box set legitimately matches the title of every book inside it, and
+    downloading one costs gigabytes and yields an item that isn't the book
+    that was asked for. Observed live for both of these queries."""
+
+    def test_prefers_the_single_book_over_a_box_set(self):
+        best = ol._pick_best(
+            [
+                _doc(
+                    "Poppy War Trilogy 3-Book Set by R. F. Kuang "
+                    "(the Poppy War, the Dragon Republic, the Burning God)",
+                    ["R. F. Kuang"],
+                ),
+                _doc("The Poppy War", ["R. F. Kuang"]),
+            ],
+            "The Poppy War",
+            "R.F. Kuang",
+        )
+        assert best["title"] == "The Poppy War"
+
+    def test_prefers_the_single_book_over_an_omnibus(self):
+        best = ol._pick_best(
+            [
+                _doc("Dune, Dune Messiah, Children of Dune", ["Frank Herbert"]),
+                _doc("Dune", ["Frank Herbert"]),
+            ],
+            "Dune",
+            "Frank Herbert",
+        )
+        assert best["title"] == "Dune"
+
+    def test_an_omnibus_still_wins_when_the_user_asked_for_one(self):
+        best = ol._pick_best(
+            [
+                _doc("Dune", ["Frank Herbert"]),
+                _doc("The Dune Trilogy", ["Frank Herbert"]),
+            ],
+            "The Dune Trilogy",
+            "Frank Herbert",
+        )
+        assert best["title"] == "The Dune Trilogy"
+
+    def test_a_sequel_scores_below_the_book_but_above_a_collection(self):
+        exact = ol._title_score("Dune", "Dune")
+        sequel = ol._title_score("Dune Messiah", "Dune")
+        omnibus = ol._title_score("Dune, Dune Messiah, Children of Dune", "Dune")
+        assert exact > sequel > omnibus
