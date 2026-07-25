@@ -147,3 +147,75 @@ def test_no_ask_clause_forbids_ending_on_a_question():
     # Normalise: the clause is hard-wrapped, so the phrase spans a newline.
     clause = " ".join(agent_module.NO_ASK_CLAUSE.split())
     assert "Never end your turn with a question" in clause
+
+
+# --- narration during the agent phase ---------------------------------------
+#
+# Measured on a real run: 67 seconds between "Searching for X" and the agent's
+# announce, with nothing in between. That's the longest gap in the whole
+# lifecycle and it lands when the user is most attentive.
+
+
+class _RecordingBus:
+    """Chat-shaped sink: has emit(), like StreamEventBus."""
+
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event, data):
+        self.events.append((event, data))
+
+    def send(self, _to, text):
+        self.events.append(("send", {"text": text}))
+
+
+class _SmsOnlySink:
+    """SMS-shaped sink: send only, no emit."""
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, _to, text):
+        self.sent.append(text)
+
+
+def test_narrate_emits_a_progress_frame_on_a_chat_sink():
+    bus = _RecordingBus()
+    agent_module._narrate(bus, "searching", "Looking for x…")
+    assert bus.events == [("progress", {"stage": "searching", "text": "Looking for x…"})]
+
+
+def test_narrate_is_a_noop_for_the_sms_sink():
+    """The SMS client has no emit(); pushing a dict at it would be a crash or
+    a nonsense text message."""
+    sink = _SmsOnlySink()
+    agent_module._narrate(sink, "searching", "Looking for x…")
+    assert sink.sent == []
+
+
+async def test_search_narrates_before_doing_the_slow_work():
+    """The search tool is the single longest step in the agent phase."""
+    captured = {}
+
+    def fake_server(name, tools):
+        captured["tools"] = {getattr(t, "name", None) or t.__name__: t for t in tools}
+        return object()
+
+    async def fake_query(prompt, options):
+        return
+        yield
+
+    bus = _RecordingBus()
+    with (
+        patch.object(agent_module, "create_sdk_mcp_server", fake_server),
+        patch.object(agent_module, "query", fake_query),
+        patch.object(agent_module, "_search_pipeline_sync",
+                     lambda q, limit: {"book": {}, "results": []}),
+    ):
+        await agent_module.run_agent("dune", "s1", object(), bus, allow_ask=False)
+        tool = captured["tools"]["search_audiobookbay"]
+        handler = getattr(tool, "handler", None) or tool
+        await handler({"query": "dune", "limit": 5})
+
+    stages = [d.get("stage") for e, d in bus.events if e == "progress"]
+    assert "searching" in stages

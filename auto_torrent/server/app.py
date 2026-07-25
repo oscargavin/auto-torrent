@@ -332,7 +332,9 @@ class ChatRequest(BaseModel):
 
 # How often the chat path polls download state and emits "Downloading… N%" as
 # a progress event so the bubble shows motion. Tests override.
-CHAT_PROGRESS_INTERVAL_S: float = 30.0
+# 10s, down from 30s: the pump emits only on percent change, so a slow
+# download is unaffected while a fast one stops leaping ~40 points a frame.
+CHAT_PROGRESS_INTERVAL_S: float = 10.0
 
 
 def _require_bearer(authorization: str = Header("", alias="Authorization")) -> None:

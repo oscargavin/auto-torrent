@@ -29,6 +29,7 @@ from ..config import MIN_SCORE, get_proxy
 from ..openlibrary import lookup_book
 from ..scoring import quick_score, score_and_sort
 from ..types import BookMetadata, ScoredResult, SearchResult
+from .event_types import EVENT_PROGRESS, STAGE_FOUND, STAGE_SEARCHING
 from .llm import store_pending_results
 from .settings import Settings
 from .sms import SMSClient
@@ -191,6 +192,19 @@ def _book_to_dict(book: BookMetadata) -> dict:
     }
 
 
+def _narrate(sink: object, stage: str, text: str) -> None:
+    """Tell the UI what the agent is doing right now.
+
+    The progress pump only starts once a download commits, so everything
+    before that — searching, checking seeders, reading a cover — was a single
+    frame followed by a minute of silence on the card. Measured at 67s on a
+    real run. These are no-ops for the SMS sink, which has no `emit`.
+    """
+    emit = getattr(sink, "emit", None)
+    if callable(emit):
+        emit(EVENT_PROGRESS, {"stage": stage, "text": text})
+
+
 async def run_agent(
     raw_query: str,
     phone: str,
@@ -218,6 +232,8 @@ async def run_agent(
         input_schema={"query": str, "limit": int},
     )
     async def search_audiobookbay(args: dict) -> dict:
+        q = (args.get("query") or raw_query).strip()
+        _narrate(sms, STAGE_SEARCHING, f"Looking for “{q}”…")
         try:
             data = await asyncio.to_thread(
                 _search_pipeline_sync,
@@ -235,6 +251,7 @@ async def run_agent(
         input_schema={"cover_url": str},
     )
     async def analyze_cover(args: dict) -> dict:
+        _narrate(sms, STAGE_SEARCHING, "Checking the cover for the narrator…")
         try:
             data = await _analyze_cover(args.get("cover_url", ""))
             return {"content": [{"type": "text", "text": json.dumps(data)}]}
@@ -248,6 +265,7 @@ async def run_agent(
     )
     async def probe_peers(args: dict) -> dict:
         magnet = args.get("magnet", "")
+        _narrate(sms, STAGE_SEARCHING, "Checking who's sharing it…")
         try:
             counts = await asyncio.to_thread(_probe_seeds_batch, [magnet], 10)
             return {"content": [{"type": "text", "text": json.dumps({"peers": counts.get(magnet, 0)})}]}
@@ -322,6 +340,7 @@ async def run_agent(
             return {"content": [{"type": "text", "text": "error: primary.magnet required"}]}
 
         bg_title = f"{title} - {author}" if author else title
+        _narrate(sms, STAGE_FOUND, f"Starting “{title}”…")
         try:
             download = await asyncio.to_thread(_execute_download_bg, bg_title, magnet, None)
         except Exception as e:
