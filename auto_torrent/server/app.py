@@ -391,6 +391,7 @@ async def _emit_download_and_poll(
     on_download_change: Callable[[str], Awaitable[None]] | None = None,
     query: str | None = None,
     emit_terminal: bool = True,
+    deadline: float | None = None,
 ) -> DownloadResult:
     """Emit `committed`, run the poll with a progress pump, then `completed`.
 
@@ -431,6 +432,7 @@ async def _emit_download_and_poll(
             sms=bus,
             on_download_change=on_download_change,
             query=query,
+            deadline=deadline,
         )
         if emit_terminal:
             bus.emit("completed", {"title": title, "author": author})

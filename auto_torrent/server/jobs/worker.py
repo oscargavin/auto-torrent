@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from arq.connections import RedisSettings
@@ -12,7 +13,7 @@ from ..agent import run_agent
 from ..app import _emit_download_and_poll  # re-uses the existing pump
 from ..llm import clear_conversation, get_pending_options
 from ..settings import Settings
-from ..worker import _kill_download_and_clean
+from ..worker import JOB_BUDGET_S, _kill_download_and_clean
 from ...cli import _read_state
 from .bus import StreamEventBus
 from .events import EventLog
@@ -101,6 +102,10 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                 # JobStore.update_status is the sole producer of terminal
                 # events on the jobs path — see U1 in the plan.
                 emit_terminal=False,
+                # One budget for the whole job: attempts, grace extensions and
+                # fallback swaps all draw from it, so arq's timeout stays a
+                # backstop instead of the thing that actually ends the job.
+                deadline=time.monotonic() + JOB_BUDGET_S,
             )
             # If cancel fired during the poll, update_status here is a no-op
             # against the cancelled terminal state — and we skip the success
@@ -154,7 +159,11 @@ class WorkerSettings:
     functions = [run_chat_job]
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     max_jobs = 4  # modest concurrency; downloads are I/O-bound but ABS scans are heavy
-    job_timeout = 60 * 60  # 1h hard cap — matches existing POLL_TIMEOUT_S
+    # Deliberately ABOVE the poll layer's own JOB_BUDGET_S so arq is a backstop
+    # for a wedged worker, not the thing that normally ends a long job. When the
+    # two were equal, any job that swapped to a fallback got killed here
+    # mid-attempt and the user was told "worker cancelled".
+    job_timeout = JOB_BUDGET_S + 10 * 60
     keep_result = settings.job_state_ttl_s
 
     # arq looks up `on_startup` / `on_shutdown` on WorkerSettings — NOT

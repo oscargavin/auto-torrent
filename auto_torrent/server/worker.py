@@ -25,7 +25,8 @@ from .sms import SMSClient
 logger = logging.getLogger("atb.worker")
 
 POLL_INTERVAL_S = 15
-POLL_TIMEOUT_S = 60 * 60       # 60 min total per attempt
+POLL_TIMEOUT_S = 60 * 60       # 60 min per attempt (legacy callers, no job deadline)
+JOB_BUDGET_S = 60 * 60         # whole-job wall clock when a deadline is supplied
 STALL_GRACE_S = 3 * 60         # progress must move within 3 min or we declare stalled
 MAX_REDISCOVERY_ROUNDS = 2     # how many times to re-search when fallbacks run dry
 
@@ -113,6 +114,17 @@ class DownloadStateLostError(DownloadNotFinishedError):
 class UnknownDownloadOutcomeError(DownloadNotFinishedError):
     """The poll returned a status we have no branch for. Distinct from the
     others because it means a bug here, not a bad torrent."""
+
+
+class DownloadTimedOutError(DownloadNotFinishedError):
+    """The job's wall-clock budget ran out while the download was still going.
+
+    Distinct from arq killing the job: that surfaces as CancelledError and used
+    to reach the user as "worker cancelled", which describes our plumbing
+    rather than what happened to their book.
+    """
+
+    failure_class = "download_timeout"
 
 
 @dataclass(frozen=True)
@@ -246,6 +258,7 @@ async def poll_and_finalise(
     sms: SMSClient,
     on_download_change: Callable[[str], Awaitable[None]] | None = None,
     query: str | None = None,
+    deadline: float | None = None,
 ) -> None:
     """Poll active download to completion, fall back through alternates on stall.
 
@@ -258,6 +271,14 @@ async def poll_and_finalise(
     the stall handler swaps to a fallback magnet — lets the caller (the jobs
     worker) keep its store pointer current so the cancel handler kills the
     RUNNING subprocess, not the dead original.
+
+    `deadline` (optional, a time.monotonic() value) caps the WHOLE job rather
+    than each attempt. Without it, POLL_TIMEOUT_S applies per attempt and
+    resets on every fallback swap and grace extension — so the real worst case
+    is unbounded, and arq's own 1h job timeout would kill the job mid-attempt
+    and report it as "worker cancelled". Passing a deadline makes every
+    attempt, swap and extension draw from one budget. Left None for the SMS
+    and legacy /chat callers, which keep today's behaviour.
     """
     abs_client = ABSClient(settings)
     fallback_announced = False
@@ -276,9 +297,16 @@ async def poll_and_finalise(
         download_id = download.get("id")
         logger.info("Polling %s (attempt %d, fallbacks left=%d)", download_id, attempt, len(fallbacks))
 
-        outcome = await _watch_until_done(download_id)
+        outcome = await _watch_until_done(download_id, deadline=deadline)
         if outcome == "completed":
             break
+        if outcome == "timed_out":
+            logger.info("Job budget exhausted for %s", display)
+            stale = _refresh_state(download_id)
+            if stale:
+                await _kill_download_and_clean(stale)
+            sms.send(phone, f"{display} was taking too long, so I stopped it.")
+            raise DownloadTimedOutError(display)
         if outcome == "stalled" or outcome == "failed":
             # R14: on a stall (not a hard failure), check whether the torrent
             # still has seeders. If it does it's just slow — give it one more
@@ -388,13 +416,23 @@ async def poll_and_finalise(
     sms.send(phone, f"✓ {display} is in your library.")
 
 
-async def _watch_until_done(download_id: str) -> str:
-    """Poll one download. Returns 'completed', 'failed', 'stalled', or 'unknown'."""
+async def _watch_until_done(download_id: str, *, deadline: float | None = None) -> str:
+    """Poll one download.
+
+    Returns 'completed', 'failed', 'stalled', 'timed_out', or 'unknown'.
+
+    With a `deadline` the job-level budget governs and 'timed_out' is
+    terminal for the whole job. Without one, POLL_TIMEOUT_S applies per
+    attempt — the legacy behaviour, where `elapsed` resets on every call.
+    """
     elapsed = 0
     last_progress = -1.0
     last_progress_at = time.monotonic()
 
-    while elapsed < POLL_TIMEOUT_S:
+    while deadline is not None or elapsed < POLL_TIMEOUT_S:
+        if deadline is not None and time.monotonic() >= deadline:
+            return "timed_out"
+
         await asyncio.sleep(POLL_INTERVAL_S)
         elapsed += POLL_INTERVAL_S
 

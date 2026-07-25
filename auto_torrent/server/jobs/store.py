@@ -16,6 +16,13 @@ from typing import Final
 
 from redis.asyncio import Redis
 
+from ..worker import JOB_BUDGET_S
+
+# How stale a non-terminal job may get before a read reaps it. Above the poll
+# layer's own budget plus the agent phase, so a healthy long job is never
+# reaped out from under a worker that is still making progress.
+REAP_AFTER_S = JOB_BUDGET_S + 30 * 60
+
 from .events import EventLog
 from .types import (
     TERMINAL_EVENT_TYPES,
@@ -67,11 +74,13 @@ class JobStore:
         *,
         state_ttl_s: int,
         dedup_ttl_s: int,
+        reap_after_s: int = REAP_AFTER_S,
     ) -> None:
         self._r: Final[Redis] = redis
         self._log: Final[EventLog] = log
         self._state_ttl = state_ttl_s
         self._dedup_ttl = dedup_ttl_s
+        self._reap_after = reap_after_s
 
     async def create(self, req: CreateJobRequest) -> tuple[Job, bool]:
         """Idempotent create. Returns (job, created)."""
@@ -107,11 +116,38 @@ class JobStore:
         # TTL must have flapped 3 times — Redis is under heavy churn or there is a bug.
         raise RuntimeError("jobs/store: dedup race did not converge in 3 attempts")
 
-    async def get(self, job_id: str) -> Job | None:
+    async def _fetch(self, job_id: str) -> Job | None:
+        """Raw read, no reaping. Used by writers so a reap can't recurse."""
         data = await self._r.hgetall(_job_key(job_id))
         if not data:
             return None
         return Job.from_redis_hash(data)
+
+    async def get(self, job_id: str) -> Job | None:
+        return await self._maybe_reap(await self._fetch(job_id))
+
+    async def _maybe_reap(self, job: Job | None) -> Job | None:
+        """Fail a job that no one is left to finish.
+
+        Every terminal write happens inside the arq worker's own code. If that
+        process is SIGKILLed, OOM-killed, or the host reboots, the job stays
+        `running` forever — and a client polling for a terminal status gets
+        `running` confirmed on every request, which is the permanent spinner
+        with battery cost attached. Nothing else in the system notices, so the
+        read path has to.
+        """
+        if job is None or job.status in TERMINAL_STATUSES:
+            return job
+        if time.time() - job.updated_at <= self._reap_after:
+            return job
+        # update_status publishes the terminal event and is terminal-guarded,
+        # so concurrent readers racing to reap the same job converge.
+        reaped = await self.update_status(
+            job.id,
+            JobStatus.failed,
+            error="This one was taking too long, so it was stopped.",
+        )
+        return reaped or job
 
     async def update_status(
         self,
@@ -122,7 +158,7 @@ class JobStore:
         picked_author: str | None = None,
         error: str | None = None,
     ) -> Job | None:
-        current = await self.get(job_id)
+        current = await self._fetch(job_id)
         if current is None:
             return None
         # Terminal status is final — refuse any further transitions (including
@@ -201,4 +237,11 @@ class JobStore:
             for jid in ids:
                 pipe.hgetall(_job_key(jid))
             rows = await pipe.execute()
-        return [Job.from_redis_hash(r) for r in rows if r]
+        out: list[Job] = []
+        for row in rows:
+            if not row:
+                continue
+            reaped = await self._maybe_reap(Job.from_redis_hash(row))
+            if reaped is not None:
+                out.append(reaped)
+        return out

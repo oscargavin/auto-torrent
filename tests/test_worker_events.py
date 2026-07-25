@@ -6,6 +6,7 @@ event-vocabulary parity hook.
 """
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -89,7 +90,7 @@ class _FakeABS:
 async def test_importing_emitted_once_before_success(tmp_path, monkeypatch):
     monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
 
-    async def fake_watch(_id):
+    async def fake_watch(_id, **_kw):
         return "completed"
 
     landing = tmp_path / "landing"
@@ -128,7 +129,7 @@ async def test_scan_failure_raises_import_incomplete(tmp_path, monkeypatch):
 
     monkeypatch.setattr(worker_module, "ABSClient", _FailingABS)
 
-    async def fake_watch(_id):
+    async def fake_watch(_id, **_kw):
         return "completed"
 
     landing = tmp_path / "landing"
@@ -165,7 +166,7 @@ async def test_stall_with_seeders_extends_grace_once(tmp_path, monkeypatch):
     monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
 
     outcomes = iter(["stalled", "completed"])
-    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id: _async(next(outcomes)))
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id, **_kw: _async(next(outcomes)))
     monkeypatch.setattr(
         worker_module, "_refresh_state",
         lambda _id: {"id": _id, "magnet": "magnet:seeded", "path": str(_mk(tmp_path)), "status": "completed"},
@@ -197,7 +198,7 @@ async def test_rediscovery_when_fallbacks_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
 
     outcomes = iter(["failed", "completed"])
-    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id: _async(next(outcomes)))
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id, **_kw: _async(next(outcomes)))
     monkeypatch.setattr(
         worker_module, "_refresh_state",
         lambda _id: {"id": _id, "magnet": "magnet:dead", "path": str(_mk(tmp_path)), "status": "failed"},
@@ -237,7 +238,7 @@ async def test_rediscovery_capped(tmp_path, monkeypatch):
     times across repeated stalls, then gives up rather than looping forever."""
     monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
     # Every download fails; never seeded.
-    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id: _async("failed"))
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id, **_kw: _async("failed"))
     monkeypatch.setattr(
         worker_module, "_refresh_state",
         lambda _id: {"id": _id, "magnet": "magnet:dead", "status": "failed"},
@@ -306,7 +307,7 @@ def test_organize_files_namespaces_on_collision(tmp_path):
 
 async def test_no_candidates_left_raises_with_no_seeders_class(tmp_path, monkeypatch):
     monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
-    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id: _async("failed"))
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id, **_kw: _async("failed"))
     monkeypatch.setattr(
         worker_module, "_refresh_state",
         lambda _id: {"id": _id, "magnet": "magnet:dead", "status": "failed"},
@@ -326,7 +327,7 @@ async def test_no_candidates_left_raises_with_no_seeders_class(tmp_path, monkeyp
 
 async def test_unknown_poll_outcome_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
-    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id: _async("unknown"))
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id, **_kw: _async("unknown"))
 
     settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
     with pytest.raises(worker_module.UnknownDownloadOutcomeError):
@@ -339,7 +340,7 @@ async def test_unknown_poll_outcome_raises(tmp_path, monkeypatch):
 
 async def test_lost_state_file_after_completion_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
-    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id: _async("completed"))
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id, **_kw: _async("completed"))
     monkeypatch.setattr(worker_module, "_refresh_state", lambda _id: None)
 
     settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
@@ -378,3 +379,49 @@ def test_download_result_from_unexpected_error_falls_back_to_infra():
     result = worker_module.DownloadResult.from_error(RuntimeError("boom"))
     assert result.ok is False
     assert result.failure_class == "infra_error"
+
+
+# --- U5: one budget for the whole job --------------------------------------
+
+
+async def test_expired_deadline_times_out_rather_than_polling(tmp_path, monkeypatch):
+    """With the budget already spent, the poll must not start another attempt."""
+    monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
+    monkeypatch.setattr(worker_module, "_refresh_state", lambda _id: None)
+    monkeypatch.setattr(worker_module, "_kill_download_and_clean", lambda _s: _async(None))
+
+    settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
+    sink = BusSink()
+    with pytest.raises(worker_module.DownloadTimedOutError) as exc:
+        await poll_and_finalise(
+            download={"id": "d1", "magnet": "m"}, fallbacks=[],
+            display="“Book”", author="A", title="Book", phone="s",
+            settings=settings, sms=sink,
+            deadline=time.monotonic() - 1,  # already expired
+        )
+    assert exc.value.failure_class == "download_timeout"
+    # The user is told their book was stopped, not that a "worker cancelled".
+    assert any("too long" in s for s in sink.sent)
+
+
+async def test_watch_returns_timed_out_on_expired_deadline():
+    assert await worker_module._watch_until_done(
+        "d1", deadline=time.monotonic() - 1
+    ) == "timed_out"
+
+
+async def test_watch_without_deadline_keeps_per_attempt_behaviour(monkeypatch):
+    """Legacy callers (SMS, /chat) pass no deadline and must be unaffected."""
+    monkeypatch.setattr(worker_module, "_refresh_state", lambda _id: None)
+    monkeypatch.setattr(worker_module.asyncio, "sleep", lambda _s: _async(None))
+    # No deadline → falls through to the state read, returns 'unknown', never
+    # 'timed_out'.
+    assert await worker_module._watch_until_done("d1") == "unknown"
+
+
+def test_arq_timeout_exceeds_the_poll_budget():
+    """If these are equal again, any job that swaps to a fallback gets killed
+    by arq mid-attempt and reported as 'worker cancelled'."""
+    from auto_torrent.server.jobs.worker import WorkerSettings
+
+    assert WorkerSettings.job_timeout > worker_module.JOB_BUDGET_S

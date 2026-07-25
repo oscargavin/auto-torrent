@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 
@@ -158,3 +159,93 @@ async def test_set_download_id_publishes_nothing(store, redis):
     await store.set_download_id(job.id, "abc12345")
 
     assert await _events(redis, job.id) == []
+
+
+# --- U5: reaping jobs whose worker died ------------------------------------
+#
+# Every terminal write happens inside the arq worker's own code. A SIGKILL,
+# an OOM, or a host reboot leaves the job at `running` forever — and the
+# client's poll faithfully confirms `running` on every request, which is the
+# permanent spinner again, now with battery cost.
+
+
+@pytest.fixture
+def reaping_store(redis, log):
+    """A store that reaps anything not touched in the last second."""
+    return JobStore(
+        redis, log, state_ttl_s=3600, dedup_ttl_s=600, reap_after_s=1
+    )
+
+
+async def _age(redis, job_id: str, seconds: float) -> None:
+    """Backdate updated_at to simulate a worker that stopped writing."""
+    await redis.hset(f"job:{job_id}", "updated_at", str(time.time() - seconds))
+
+
+async def test_stale_running_job_is_reaped_on_read(reaping_store, redis):
+    job, _ = await reaping_store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await reaping_store.update_status(job.id, JobStatus.running)
+    await _age(redis, job.id, 60)
+
+    reaped = await reaping_store.get(job.id)
+    assert reaped.status == JobStatus.failed
+    assert reaped.error
+
+
+async def test_reaping_publishes_a_terminal_event(reaping_store, redis):
+    """Otherwise the client has a terminal status it can only discover by
+    polling — the reaper has to close the stream too."""
+    job, _ = await reaping_store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await reaping_store.update_status(job.id, JobStatus.running)
+    await _age(redis, job.id, 60)
+
+    await reaping_store.get(job.id)
+
+    assert [t for t, _d in await _events(redis, job.id)] == ["error"]
+
+
+async def test_fresh_running_job_is_not_reaped(reaping_store, redis):
+    job, _ = await reaping_store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await reaping_store.update_status(job.id, JobStatus.running)
+
+    assert (await reaping_store.get(job.id)).status == JobStatus.running
+    assert await _events(redis, job.id) == []
+
+
+async def test_reaping_is_idempotent(reaping_store, redis):
+    job, _ = await reaping_store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await reaping_store.update_status(job.id, JobStatus.running)
+    await _age(redis, job.id, 60)
+
+    first = await reaping_store.get(job.id)
+    second = await reaping_store.get(job.id)
+
+    assert first.status == second.status == JobStatus.failed
+    assert len(await _events(redis, job.id)) == 1
+
+
+async def test_already_terminal_job_is_left_alone(reaping_store, redis):
+    job, _ = await reaping_store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await reaping_store.update_status(job.id, JobStatus.succeeded, picked_title="Dune")
+    await _age(redis, job.id, 60)
+
+    assert (await reaping_store.get(job.id)).status == JobStatus.succeeded
+    assert [t for t, _d in await _events(redis, job.id)] == ["completed"]
+
+
+async def test_list_reaps_stale_jobs_too(reaping_store, redis):
+    """The app's list endpoint is the other read path a stranded job reaches."""
+    job, _ = await reaping_store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await reaping_store.update_status(job.id, JobStatus.running)
+    await _age(redis, job.id, 60)
+
+    listed = await reaping_store.list_for_profile("p1", limit=10)
+    assert [j.status for j in listed] == [JobStatus.failed]
+
+
+async def test_default_store_does_not_reap_a_normal_running_job(store, redis):
+    """Guards the default budget: a job that just started must survive."""
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await store.update_status(job.id, JobStatus.running)
+
+    assert (await store.get(job.id)).status == JobStatus.running
