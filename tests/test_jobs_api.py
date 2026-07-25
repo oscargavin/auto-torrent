@@ -172,3 +172,53 @@ async def test_delete_marks_cancelled(client):
 
     g = await client.get(f"/chat/jobs/{job_id}")
     assert g.json()["status"] == "cancelled"
+
+
+# --- U1: cancel publishes exactly one frame --------------------------------
+
+
+async def test_delete_publishes_exactly_one_cancelled_event(client, redis):
+    """The handler used to publish `cancelled` itself right after
+    update_status. Now the store publishes on the transition — a second frame
+    from the handler would be dropped by the stream terminator anyway, but the
+    duplicate is the bug."""
+    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
+    job_id = create.json()["id"]
+
+    await client.delete(f"/chat/jobs/{job_id}")
+
+    entries = await redis.xrange(f"job:{job_id}:events")
+    assert [f["type"] for _id, f in entries] == ["cancelled"]
+
+
+async def test_second_delete_publishes_no_further_event(client, redis):
+    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
+    job_id = create.json()["id"]
+
+    await client.delete(f"/chat/jobs/{job_id}")
+    r2 = await client.delete(f"/chat/jobs/{job_id}")
+    assert r2.status_code == 200  # idempotent, not a 404
+
+    entries = await redis.xrange(f"job:{job_id}:events")
+    assert [f["type"] for _id, f in entries] == ["cancelled"]
+
+
+async def test_stream_terminates_on_the_store_published_event(app, client, redis):
+    """End-to-end on the contract U1 exists for: a failed job's terminal frame
+    reaches a subscriber and closes the stream."""
+    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
+    job_id = create.json()["id"]
+
+    from auto_torrent.server.jobs.types import JobStatus
+
+    await app.state.store.update_status(job_id, JobStatus.failed, error="no seeders")
+
+    frames = []
+    async with client.stream("GET", f"/chat/jobs/{job_id}/events") as r:
+        assert r.status_code == 200
+        async for line in r.aiter_lines():
+            frames.append(line)
+            if line.startswith("data:") and "no seeders" in line:
+                break
+
+    assert any(line == "event: error" for line in frames)

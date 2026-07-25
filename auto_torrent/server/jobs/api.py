@@ -14,7 +14,7 @@ from ..worker import _kill_download_and_clean
 from ...cli import _read_state
 from .events import EventLog
 from .store import JobStore
-from .types import TERMINAL_STATUSES, CreateJobRequest, Job, JobStatus
+from .types import TERMINAL_EVENT_TYPES, TERMINAL_STATUSES, CreateJobRequest, Job, JobStatus
 
 logger = logging.getLogger("atb.jobs.api")
 
@@ -71,10 +71,13 @@ def build_router(
         if (await store.get(job_id)) is None:
             raise HTTPException(status_code=404, detail="job not found")
 
-        # Derive terminal event types from the canonical status set. "error" and
-        # "completed" are event-type aliases for "failed"/"succeeded" respectively.
+        # Terminal event names come from the shared mapping in types.py — the
+        # same one JobStore.update_status publishes with, so the producer and
+        # this terminator cannot drift. The raw status values stay in the set
+        # for backwards compatibility with any frame published before U1.
         _TERMINAL_EVENT_TYPES = (
-            frozenset(s.value for s in TERMINAL_STATUSES) | {"error", "completed"}
+            frozenset(TERMINAL_EVENT_TYPES.values())
+            | frozenset(s.value for s in TERMINAL_STATUSES)
         )
 
         async def gen():
@@ -151,7 +154,10 @@ def build_router(
             download_id = latest.download_id if latest else pre.download_id
             if download_id:
                 await _kill_subprocess_and_clean(download_id)
-            await log.publish(job_id, "cancelled", {})
+            # The `cancelled` event is published by store.update_status above —
+            # publishing again here would double-fire and, because the stream
+            # closes on the first terminal frame, the second would be silently
+            # dropped for every connected subscriber.
         return {"ok": True, "status": updated.status.value}
 
     return router

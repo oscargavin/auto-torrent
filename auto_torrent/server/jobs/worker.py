@@ -97,6 +97,9 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                 session=job.id,
                 on_download_change=_track_download_change,
                 query=job.query,
+                # JobStore.update_status is the sole producer of terminal
+                # events on the jobs path — see U1 in the plan.
+                emit_terminal=False,
             )
             # If cancel fired during the poll, update_status here is a no-op
             # against the cancelled terminal state — and we skip the success
@@ -124,24 +127,24 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                     picked_author=outcome.author,
                 )
         else:
-            # asked / no_results / error — agent already published progress events.
+            # asked / no_results / error — the agent has already published its
+            # own progress narration. The terminal event comes from
+            # update_status, not from here: the old guard also required
+            # `not bus.messaged`, and bus.messaged is set by the mandatory
+            # opening "Searching…" frame, so in practice it suppressed the
+            # terminal event for *every* non-committed outcome and the client
+            # spun forever.
             msg = outcome.message or f"agent ended: {outcome.kind}"
             await store.update_status(job.id, JobStatus.failed, error=msg)
-            if outcome.kind not in ("asked", "no_results") and not bus.messaged:
-                await bus.emit_async("error", {"message": msg})
 
     except asyncio.CancelledError:
         logger.info("run_chat_job: cancelled (likely SIGTERM) for %s", job_id)
+        # update_status publishes the terminal event; no separate emit.
         await store.update_status(job.id, JobStatus.failed, error="worker cancelled")
-        try:
-            await bus.emit_async("error", {"message": "worker cancelled"})
-        except Exception:  # noqa: BLE001
-            pass  # bus publish may also fail mid-shutdown — best effort
         raise
     except Exception as e:  # noqa: BLE001
         logger.exception("run_chat_job crashed for %s", job_id)
         await store.update_status(job.id, JobStatus.failed, error=f"{type(e).__name__}: {e}")
-        await bus.emit_async("error", {"message": f"{type(e).__name__}: {e}"})
 
 
 class WorkerSettings:

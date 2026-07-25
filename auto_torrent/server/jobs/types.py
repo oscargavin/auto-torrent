@@ -21,6 +21,17 @@ class JobStatus(str, enum.Enum):
 
 TERMINAL_STATUSES = {JobStatus.succeeded, JobStatus.failed, JobStatus.cancelled}
 
+# The SSE event name each terminal status publishes as. One mapping, shared by
+# the producer (JobStore.update_status) and the stream terminator (jobs/api.py)
+# so the two cannot drift — a status the terminator doesn't recognise would
+# leave the stream open forever, which is the bug class this whole unit exists
+# to close.
+TERMINAL_EVENT_TYPES: dict[JobStatus, str] = {
+    JobStatus.succeeded: "completed",
+    JobStatus.failed: "error",
+    JobStatus.cancelled: "cancelled",
+}
+
 
 class CreateJobRequest(BaseModel):
     profile_id: str = Field(min_length=1, max_length=64)

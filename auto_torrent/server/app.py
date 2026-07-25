@@ -384,6 +384,7 @@ async def _emit_download_and_poll(
     session: str,
     on_download_change: Callable[[str], Awaitable[None]] | None = None,
     query: str | None = None,
+    emit_terminal: bool = True,
 ) -> bool:
     """Emit `committed`, run the poll with a progress pump, then `completed`.
 
@@ -392,6 +393,15 @@ async def _emit_download_and_poll(
     poll_and_finalise has already surfaced an `import_failed` stage and no
     `completed` event is emitted. The jobs worker reads this to avoid marking a
     job succeeded when the book never actually landed.
+
+    `emit_terminal` controls whether this function publishes the terminal
+    `completed`/`error` frames itself. The jobs path passes False: there,
+    JobStore.update_status is the sole producer of terminal events, and a
+    second frame from here would race it (bus.emit is fire-and-forget via
+    call_soon_threadsafe, so ordering is nondeterministic) — the SSE stream
+    closes on whichever lands first, which could be the one without the
+    job's error detail. The legacy /chat and SMS callers have no JobStore
+    and keep emitting as they always have.
 
     `on_download_change` forwards the per-fallback download_id update from
     poll_and_finalise to the caller — the jobs worker uses it to keep
@@ -416,7 +426,8 @@ async def _emit_download_and_poll(
             on_download_change=on_download_change,
             query=query,
         )
-        bus.emit("completed", {"title": title, "author": author})
+        if emit_terminal:
+            bus.emit("completed", {"title": title, "author": author})
         return True
     except ImportIncompleteError:
         # Downloaded but not imported — poll_and_finalise already emitted the
@@ -424,7 +435,8 @@ async def _emit_download_and_poll(
         return False
     except Exception as e:  # noqa: BLE001
         logger.exception("chat poll_and_finalise crashed")
-        bus.emit("error", {"message": f"download error: {e}"})
+        if emit_terminal:
+            bus.emit("error", {"message": f"download error: {e}"})
         return False
     finally:
         stop.set()

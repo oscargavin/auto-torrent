@@ -18,6 +18,7 @@ from redis.asyncio import Redis
 
 from .events import EventLog
 from .types import (
+    TERMINAL_EVENT_TYPES,
     TERMINAL_STATUSES,
     CreateJobRequest,
     Job,
@@ -36,6 +37,26 @@ def _hash_key(sha: str) -> str:
 
 def _profile_key(profile_id: str) -> str:
     return f"job:by_profile:{profile_id}"
+
+
+def _terminal_payload(
+    status: JobStatus,
+    *,
+    error: str | None,
+    picked_title: str | None,
+    picked_author: str | None,
+) -> dict:
+    """The `data` payload for each terminal event.
+
+    Shapes must match the app's JobEvent union (see the client's
+    features/get-book/types.ts) — `completed` carries the picked book,
+    `error` carries a message, `cancelled` carries nothing.
+    """
+    if status is JobStatus.succeeded:
+        return {"title": picked_title or "", "author": picked_author or ""}
+    if status is JobStatus.failed:
+        return {"message": error or "The download failed."}
+    return {}
 
 
 class JobStore:
@@ -124,8 +145,26 @@ class JobStore:
         await self._r.hset(_job_key(job_id), mapping=fields)
 
         if status in TERMINAL_STATUSES and current.status not in TERMINAL_STATUSES:
-            # First terminal write → release the dedup key so a re-request can
-            # start fresh, and expire the event stream alongside the job hash.
+            # First terminal write. This branch fires exactly once per job, which
+            # is what makes it the right home for the terminal event: publishing
+            # here means no code path can reach a terminal status silently, and
+            # none can publish twice.
+            #
+            # Publish BEFORE expire — XADD preserves an existing TTL, so an event
+            # appended after the stream is already expiring would inherit a TTL
+            # measured from the earlier call rather than getting a fresh window.
+            await self._log.publish(
+                job_id,
+                TERMINAL_EVENT_TYPES[status],
+                _terminal_payload(
+                    status,
+                    error=error,
+                    picked_title=picked_title if picked_title is not None else current.picked_title,
+                    picked_author=picked_author if picked_author is not None else current.picked_author,
+                ),
+            )
+            # Release the dedup key so a re-request can start fresh, and expire
+            # the event stream alongside the job hash.
             await self._r.delete(_hash_key(dedup_hash(current.profile_id, current.query)))
             await self._log.expire(job_id, self._state_ttl)
 
