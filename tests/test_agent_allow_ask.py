@@ -4,6 +4,7 @@ These deliberately assert the WIRING, not the model's behaviour. Asserting
 "the agent commits over an ambiguous fixture" would be asserting prompt
 compliance — non-deterministic, and it either flakes or needs a live call.
 """
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -236,7 +237,7 @@ async def test_search_narrates_from_inside_the_pipeline():
         return
         yield
 
-    def fake_pipeline(q, limit, on_step=None):
+    def fake_pipeline(q, limit, on_step=None, attempt=1):
         if on_step:
             on_step("Found 3 copies — checking each…")
         return {"book": {}, "results": []}
@@ -257,3 +258,51 @@ async def test_search_narrates_from_inside_the_pipeline():
     assert progress[0]["text"] == "Found 3 copies — checking each…"
     # The book was never named: it is already the card's headline.
     assert "dune" not in progress[0]["text"].lower()
+
+
+# --- repeated search rounds -------------------------------------------------
+#
+# Observed on a live run: the agent searched three times and the narration was
+# byte-identical each round ("Found 10 copies — checking each…" / "Ranking
+# them…"), which reads as a stuck loop rather than as three attempts.
+
+
+def _pipeline_steps(attempt: int, n_results: int = 10) -> list[str]:
+    """Run the real pipeline's narration with the network parts stubbed."""
+    steps: list[str] = []
+    results = [SimpleNamespace(magnet=f"magnet:{i}") for i in range(n_results)]
+    with (
+        patch.object(agent_module, "get_proxy", lambda: None),
+        patch.object(agent_module, "lookup_book", lambda q: None),
+        patch.object(agent_module, "_fan_out_search", lambda book, raw_query: results),
+        patch.object(agent_module, "_enrich_results", lambda r: r),
+        patch.object(agent_module, "score_and_sort", lambda *a, **k: []),
+        patch.object(agent_module, "_scored_to_payload", lambda s, i: {}),
+    ):
+        agent_module._search_pipeline_sync("dune", 5, steps.append, attempt)
+    return steps
+
+
+def test_first_search_round_narrates_count_and_ranking():
+    assert _pipeline_steps(1) == [
+        "Found 10 copies — checking each…",
+        "Ranking them…",
+    ]
+
+
+def test_repeat_round_says_it_is_a_repeat_and_drops_the_filler():
+    steps = _pipeline_steps(2)
+    assert steps == ["Searching again — 10 more to check…"]
+    # Must not read as the first round happening over again.
+    assert steps[0] != _pipeline_steps(1)[0]
+
+
+def test_two_identical_repeat_rounds_collapse_to_one_line_on_the_card():
+    """Rounds 2 and 3 narrate the same sentence, and _narrate drops the
+    consecutive duplicate — so a third fruitless round adds no new line and
+    the elapsed clock carries the time instead."""
+    bus = _RecordingBus()
+    for attempt in (2, 3):
+        for msg in _pipeline_steps(attempt):
+            agent_module._narrate(bus, "searching", msg)
+    assert len(bus.events) == 1

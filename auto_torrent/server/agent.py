@@ -151,6 +151,7 @@ def _search_pipeline_sync(
     raw_query: str,
     limit: int,
     on_step: Callable[[str], None] | None = None,
+    attempt: int = 1,
 ) -> dict:
     """Resolve a query to ranked candidates.
 
@@ -194,11 +195,21 @@ def _search_pipeline_sync(
 
     # The slow part: one page fetch per candidate. Announce the count first so
     # the wait has a visible shape instead of being dead air.
+    #
+    # On a repeat round the wording changes: identical text would read as a
+    # stutter, and saying "again" is the honest description of what is
+    # happening. Rounds past the first also skip the ranking line — on a repeat
+    # it is filler, and _narrate collapses a second identical round into a
+    # single line, leaving the elapsed clock to carry the time.
     n = len(raw_results)
-    step(f"Found {n} cop{'y' if n == 1 else 'ies'} — checking each…")
+    if attempt > 1:
+        step(f"Searching again — {n} more to check…")
+    else:
+        step(f"Found {n} cop{'y' if n == 1 else 'ies'} — checking each…")
     enriched = _enrich_results(raw_results)
 
-    step("Ranking them…")
+    if attempt == 1:
+        step("Ranking them…")
     scored = score_and_sort(enriched, book, prefer_narrator=None, min_score=MIN_SCORE)
 
     if not scored:
@@ -263,6 +274,11 @@ async def run_agent(
     would ever read and left the user a numbered list they could not answer.
     """
     state: dict = {"outcome": None}
+    # The agent searches more than once when the first pass doesn't satisfy it.
+    # Observed live: three rounds emitting "Found 10 copies — checking each…"
+    # / "Ranking them…" verbatim each time, which reads as a stuck loop rather
+    # than as three attempts. The round number lets the narration say which.
+    search_attempts = {"n": 0}
 
     # ---- Tools ----
 
@@ -276,12 +292,14 @@ async def run_agent(
         # and _search_pipeline_sync narrates the resolved title when it differs
         # from what was asked for, which is the only genuinely new information
         # at this point. Narrating the query again just repeated the headline.
+        search_attempts["n"] += 1
         try:
             data = await asyncio.to_thread(
                 _search_pipeline_sync,
                 args.get("query") or raw_query,
                 int(args.get("limit") or 5),
                 lambda msg: _narrate(sms, STAGE_SEARCHING, msg),
+                search_attempts["n"],
             )
             return {"content": [{"type": "text", "text": json.dumps(data)}]}
         except Exception as e:
