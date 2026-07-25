@@ -28,6 +28,7 @@ from .types import (
     TERMINAL_EVENT_TYPES,
     TERMINAL_STATUSES,
     CreateJobRequest,
+    FailureClass,
     Job,
     JobStatus,
     dedup_hash,
@@ -52,6 +53,7 @@ def _terminal_payload(
     error: str | None,
     picked_title: str | None,
     picked_author: str | None,
+    failure_class: FailureClass | None = None,
 ) -> dict:
     """The `data` payload for each terminal event.
 
@@ -62,8 +64,13 @@ def _terminal_payload(
     if status is JobStatus.succeeded:
         return {"title": picked_title or "", "author": picked_author or ""}
     if status is JobStatus.failed:
-        return {"message": error or "The download failed."}
-    return {}
+        return {
+            "message": error or "The download failed.",
+            # Carried on the event as well as the hash so a client watching the
+            # stream can render the right copy without a follow-up request.
+            "failure_class": (failure_class or FailureClass.infra_error).value,
+        }
+    return {"failure_class": FailureClass.cancelled_by_user.value}
 
 
 class JobStore:
@@ -146,6 +153,7 @@ class JobStore:
             job.id,
             JobStatus.failed,
             error="This one was taking too long, so it was stopped.",
+            failure_class=FailureClass.download_timeout,
         )
         return reaped or job
 
@@ -157,6 +165,7 @@ class JobStore:
         picked_title: str | None = None,
         picked_author: str | None = None,
         error: str | None = None,
+        failure_class: FailureClass | None = None,
     ) -> Job | None:
         current = await self._fetch(job_id)
         if current is None:
@@ -178,6 +187,13 @@ class JobStore:
             fields["picked_author"] = picked_author
         if error is not None:
             fields["error"] = error
+        # Cancellation is classified here rather than at the call site: the
+        # DELETE handler lives in the API process and shouldn't need to know
+        # the vocabulary.
+        if failure_class is None and status is JobStatus.cancelled:
+            failure_class = FailureClass.cancelled_by_user
+        if failure_class is not None:
+            fields["failure_class"] = failure_class.value
         await self._r.hset(_job_key(job_id), mapping=fields)
 
         if status in TERMINAL_STATUSES and current.status not in TERMINAL_STATUSES:
@@ -197,6 +213,7 @@ class JobStore:
                     error=error,
                     picked_title=picked_title if picked_title is not None else current.picked_title,
                     picked_author=picked_author if picked_author is not None else current.picked_author,
+                    failure_class=failure_class,
                 ),
             )
             # Release the dedup key so a re-request can start fresh, and expire
@@ -204,11 +221,14 @@ class JobStore:
             await self._r.delete(_hash_key(dedup_hash(current.profile_id, current.query)))
             await self._log.expire(job_id, self._state_ttl)
 
-        # Build the updated job locally — avoids a third Redis round-trip.
+        # Build the updated job locally — avoids a third Redis round-trip. Every
+        # field written to `fields` above must appear here too, or callers using
+        # the return value see a job that disagrees with Redis.
         updated = current.model_copy(
             update={
                 "status": status,
                 "updated_at": updated_at,
+                **({"failure_class": failure_class} if failure_class is not None else {}),
                 **({"picked_title": picked_title} if picked_title is not None else {}),
                 **({"picked_author": picked_author} if picked_author is not None else {}),
                 **({"error": error} if error is not None else {}),
@@ -216,18 +236,34 @@ class JobStore:
         )
         return updated
 
-    async def set_picked_edition(
-        self, job_id: str, *, narrator: str, file_format: str
+    async def set_picked_book(
+        self,
+        job_id: str,
+        *,
+        title: str = "",
+        author: str = "",
+        narrator: str = "",
+        file_format: str = "",
     ) -> None:
-        """Record which edition the agent chose.
+        """Record what the agent chose, at the moment it choosesit.
 
         Metadata like set_download_id, not a transition — it deliberately
         bypasses the terminal guard so a cancel racing the agent's commit
         still leaves an accurate record of what was started.
+
+        Title and author are written here as well as on the terminal
+        transition: a cancelled job returns early and never reaches that
+        transition, so without this the card falls back to the raw query and
+        the user has no idea which book was actually cancelled.
         """
         fields = {
             k: v
-            for k, v in (("picked_narrator", narrator), ("picked_format", file_format))
+            for k, v in (
+                ("picked_title", title),
+                ("picked_author", author),
+                ("picked_narrator", narrator),
+                ("picked_format", file_format),
+            )
             if v
         }
         if fields:

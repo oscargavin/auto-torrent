@@ -5,7 +5,7 @@ import pytest
 
 from auto_torrent.server.jobs.events import EventLog
 from auto_torrent.server.jobs.store import JobStore
-from auto_torrent.server.jobs.types import CreateJobRequest, JobStatus
+from auto_torrent.server.jobs.types import CreateJobRequest, FailureClass, JobStatus
 
 
 @pytest.fixture
@@ -87,7 +87,9 @@ async def test_failed_publishes_one_error_event(store, redis):
     job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
     await store.update_status(job.id, JobStatus.failed, error="no seeders")
 
-    assert await _events(redis, job.id) == [("error", {"message": "no seeders"})]
+    assert await _events(redis, job.id) == [
+        ("error", {"message": "no seeders", "failure_class": "infra_error"})
+    ]
 
 
 async def test_succeeded_publishes_one_completed_event(store, redis):
@@ -107,7 +109,11 @@ async def test_cancelled_publishes_one_cancelled_event(store, redis):
     await store.update_status(job.id, JobStatus.running)
     await store.update_status(job.id, JobStatus.cancelled)
 
-    assert await _events(redis, job.id) == [("cancelled", {})]
+    # The class rides on the event so a client watching SSE can render the
+    # right copy without a follow-up request.
+    assert await _events(redis, job.id) == [
+        ("cancelled", {"failure_class": "cancelled_by_user"})
+    ]
 
 
 async def test_non_terminal_transition_publishes_nothing(store, redis):
@@ -126,7 +132,9 @@ async def test_second_terminal_write_publishes_nothing(store, redis):
     assert unchanged is not None
     assert unchanged.status == JobStatus.failed
     assert unchanged.error == "first"
-    assert await _events(redis, job.id) == [("error", {"message": "first"})]
+    assert await _events(redis, job.id) == [
+        ("error", {"message": "first", "failure_class": "infra_error"})
+    ]
 
 
 async def test_failed_without_error_still_carries_a_message(store, redis):
@@ -254,32 +262,34 @@ async def test_default_store_does_not_reap_a_normal_running_job(store, redis):
 # --- U4: the chosen edition is visible -------------------------------------
 
 
-async def test_set_picked_edition_records_narrator_and_format(store):
+async def test_set_picked_book_records_narrator_and_format(store):
     job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
-    await store.set_picked_edition(job.id, narrator="Scott Brick", file_format="M4B")
+    await store.set_picked_book(
+        job.id, title="Dune", narrator="Scott Brick", file_format="M4B"
+    )
 
     refreshed = await store.get(job.id)
     assert refreshed.picked_narrator == "Scott Brick"
     assert refreshed.picked_format == "M4B"
 
 
-async def test_set_picked_edition_skips_empty_fields(store):
+async def test_set_picked_book_skips_empty_fields(store):
     """The agent often has no narrator. Writing "" would render an empty
     bullet on the card rather than nothing."""
     job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
-    await store.set_picked_edition(job.id, narrator="", file_format="")
+    await store.set_picked_book(job.id, narrator="", file_format="")
 
     refreshed = await store.get(job.id)
     assert refreshed.picked_narrator is None
     assert refreshed.picked_format is None
 
 
-async def test_set_picked_edition_works_on_a_cancelled_job(store):
+async def test_set_picked_book_works_on_a_cancelled_job(store):
     """Metadata, not a transition — a cancel racing the agent's commit should
     still leave an accurate record of what was actually started."""
     job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
     await store.update_status(job.id, JobStatus.cancelled)
-    await store.set_picked_edition(job.id, narrator="Scott Brick", file_format="M4B")
+    await store.set_picked_book(job.id, narrator="Scott Brick", file_format="M4B")
 
     assert (await store.get(job.id)).picked_narrator == "Scott Brick"
 
@@ -290,3 +300,65 @@ async def test_job_without_edition_fields_deserialises(store):
     refreshed = await store.get(job.id)
     assert refreshed.picked_narrator is None
     assert refreshed.picked_format is None
+
+
+# --- U10: failure_class ----------------------------------------------------
+
+
+async def test_cancelled_job_remembers_the_book_it_had_picked(store):
+    """A cancel returns early and never reaches the terminal transition that
+    writes picked_title, so without set_picked_book the card falls back to the
+    raw query and the user can't tell which book was cancelled."""
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await store.set_picked_book(job.id, title="Dune", author="Frank Herbert")
+    await store.update_status(job.id, JobStatus.cancelled)
+
+    d = await store.get(job.id)
+    assert d.picked_title == "Dune"
+    assert d.picked_author == "Frank Herbert"
+
+
+async def test_cancel_is_classified_without_the_caller_knowing_the_vocabulary(store):
+    """The DELETE handler lives in the API process; it shouldn't have to."""
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await store.update_status(job.id, JobStatus.cancelled)
+    assert (await store.get(job.id)).failure_class is FailureClass.cancelled_by_user
+
+
+async def test_failure_class_round_trips_through_redis(store):
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await store.update_status(
+        job.id, JobStatus.failed, error="nope",
+        failure_class=FailureClass.no_seeders,
+    )
+    assert (await store.get(job.id)).failure_class is FailureClass.no_seeders
+
+
+async def test_absent_failure_class_deserialises(store):
+    """Rows written before this field must still load."""
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    assert (await store.get(job.id)).failure_class is None
+
+
+async def test_reaped_job_is_classified_as_a_timeout(reaping_store, redis):
+    job, _ = await reaping_store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await reaping_store.update_status(job.id, JobStatus.running)
+    await _age(redis, job.id, 60)
+
+    assert (await reaping_store.get(job.id)).failure_class is FailureClass.download_timeout
+
+
+async def test_update_status_return_value_matches_redis(store):
+    """The returned object is built locally to save a round-trip, so every
+    field written must be mirrored onto it — a caller acting on the return
+    value must not see a job that disagrees with what was stored."""
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    returned = await store.update_status(
+        job.id, JobStatus.failed, error="nope",
+        failure_class=FailureClass.no_seeders,
+    )
+    stored = await store.get(job.id)
+
+    assert returned.failure_class == stored.failure_class == FailureClass.no_seeders
+    assert returned.status == stored.status
+    assert returned.error == stored.error

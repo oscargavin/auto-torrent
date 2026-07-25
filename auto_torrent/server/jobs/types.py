@@ -21,6 +21,26 @@ class JobStatus(str, enum.Enum):
 
 TERMINAL_STATUSES = {JobStatus.succeeded, JobStatus.failed, JobStatus.cancelled}
 
+
+class FailureClass(str, enum.Enum):
+    """Why a job failed, in terms the app can render copy and an action from.
+
+    Deliberately coarse: each member exists because it implies a *different*
+    thing for the user to do. `error` stays alongside it as the human sentence
+    and the detail worth putting in a bug report.
+
+    `infra_error` is the explicit catch-all. Its rate is the signal that this
+    list needs another member — resist adding one before the rate says so.
+    """
+
+    not_found = "not_found"
+    no_seeders = "no_seeders"
+    search_unavailable = "search_unavailable"
+    download_timeout = "download_timeout"
+    import_failed = "import_failed"
+    cancelled_by_user = "cancelled_by_user"
+    infra_error = "infra_error"
+
 # The SSE event name each terminal status publishes as. One mapping, shared by
 # the producer (JobStore.update_status) and the stream terminator (jobs/api.py)
 # so the two cannot drift — a status the terminator doesn't recognise would
@@ -76,6 +96,9 @@ class Job(BaseModel):
     picked_narrator: str | None = None
     picked_format: str | None = None
     error: str | None = None
+    # Machine-readable companion to `error`. Optional on the wire so an older
+    # app is unaffected, and so rows written before this field deserialise.
+    failure_class: FailureClass | None = None
     # 8-char hex assigned by _execute_download_bg; the worker registers it as
     # soon as the agent commits, so the DELETE handler can look up the running
     # subprocess via STATE_DIR/{download_id}.json and kill it on cancel.

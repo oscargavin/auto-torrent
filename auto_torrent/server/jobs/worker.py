@@ -19,10 +19,25 @@ from ...cli import _read_state
 from .bus import StreamEventBus
 from .events import EventLog
 from .store import JobStore
-from .types import TERMINAL_STATUSES, JobStatus
+from .types import TERMINAL_STATUSES, FailureClass, JobStatus
 
 logger = logging.getLogger("atb.jobs.worker")
 settings = Settings()
+
+
+def _as_failure_class(raw: str | None) -> FailureClass:
+    """Map the download layer's string onto the wire enum.
+
+    The download layer carries plain strings on its exception classes so it
+    doesn't have to import the jobs vocabulary. Anything unrecognised becomes
+    infra_error rather than raising — a classification bug must not turn into
+    a second failure while we're already handling the first.
+    """
+    try:
+        return FailureClass(raw or "")
+    except ValueError:
+        logger.warning("unmapped failure_class %r, recording as infra_error", raw)
+        return FailureClass.infra_error
 
 
 async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
@@ -55,8 +70,12 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
 
         if outcome.kind == "committed":
             clear_conversation(job.id)
-            await store.set_picked_edition(
-                job.id, narrator=outcome.narrator, file_format=outcome.file_format
+            await store.set_picked_book(
+                job.id,
+                title=outcome.title,
+                author=outcome.author,
+                narrator=outcome.narrator,
+                file_format=outcome.file_format,
             )
             # The agent has already spawned the download subprocess; register
             # its state-file id against the job so a subsequent DELETE can find
@@ -139,6 +158,7 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                     error=result.message or "the download didn't finish",
                     picked_title=outcome.title,
                     picked_author=outcome.author,
+                    failure_class=_as_failure_class(result.failure_class),
                 )
         else:
             # asked / no_results / error — the agent has already published its
@@ -149,19 +169,32 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
             # terminal event for *every* non-committed outcome and the client
             # spun forever.
             msg = outcome.message or f"agent ended: {outcome.kind}"
-            await store.update_status(job.id, JobStatus.failed, error=msg)
+            await store.update_status(
+                job.id,
+                JobStatus.failed,
+                error=msg,
+                failure_class=FailureClass.not_found,
+            )
 
     except asyncio.CancelledError:
         logger.info("run_chat_job: cancelled (likely SIGTERM) for %s", job_id)
         # update_status publishes the terminal event; no separate emit.
-        await store.update_status(job.id, JobStatus.failed, error="worker cancelled")
+        await store.update_status(
+            job.id,
+            JobStatus.failed,
+            error="This one was stopped before it finished.",
+            failure_class=FailureClass.infra_error,
+        )
         raise
     except Exception:  # noqa: BLE001
         # The traceback goes to the log, where it's useful. What reaches the
         # card is what a family member can act on — "RuntimeError: ..." is not.
         logger.exception("run_chat_job crashed for %s", job_id)
         await store.update_status(
-            job.id, JobStatus.failed, error="Something went wrong on the server."
+            job.id,
+            JobStatus.failed,
+            error="Something went wrong on the server.",
+            failure_class=FailureClass.infra_error,
         )
 
 
