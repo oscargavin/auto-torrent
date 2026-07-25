@@ -380,9 +380,16 @@ async def run_agent(
             if state["outcome"] is not None:
                 # Tool already terminated the agent's job.
                 continue
-    except Exception as e:
+    except Exception:
+        # Typically the claude CLI subprocess dying — an expired subscription
+        # token surfaces here as a bare "Command failed with exit code 1".
+        # The traceback goes to the log for us; the card gets a sentence that
+        # tells the user what to do, since there is nothing they can fix.
         logger.exception("agent loop crashed")
-        return AgentOutcome(kind="error", message=f"{type(e).__name__}: {e}")
+        return AgentOutcome(
+            kind="error",
+            message="Couldn't reach the book finder just now. Try again shortly.",
+        )
 
     if state["outcome"] is not None:
         return state["outcome"]

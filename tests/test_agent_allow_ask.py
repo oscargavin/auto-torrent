@@ -83,3 +83,25 @@ def test_outcome_edition_defaults_to_empty_not_none():
     outcome = agent_module.AgentOutcome(kind="committed")
     assert outcome.narrator == ""
     assert outcome.file_format == ""
+
+
+async def test_agent_crash_message_is_human_not_a_python_exception():
+    """A dead claude CLI (expired subscription token, most often) raised out of
+    query() and the raw "Exception: Command failed with exit code 1" landed on
+    the card. Verified live on basil, where the token had been expired a month."""
+    async def boom(prompt, options):
+        raise RuntimeError("Command failed with exit code 1")
+        yield
+
+    with (
+        patch.object(agent_module, "create_sdk_mcp_server", lambda name, tools: object()),
+        patch.object(agent_module, "query", boom),
+    ):
+        outcome = await agent_module.run_agent(
+            "dune", "s1", object(), AsyncMock(), allow_ask=False
+        )
+
+    assert outcome.kind == "error"
+    assert "Exception" not in outcome.message
+    assert "exit code" not in outcome.message
+    assert outcome.message.endswith(".")
