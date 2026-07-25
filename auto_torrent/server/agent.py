@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Callable, Literal
 
 from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, query, tool
 
@@ -147,7 +147,26 @@ def _scored_to_payload(s: ScoredResult, idx: int) -> dict:
     }
 
 
-def _search_pipeline_sync(raw_query: str, limit: int) -> dict:
+def _search_pipeline_sync(
+    raw_query: str,
+    limit: int,
+    on_step: Callable[[str], None] | None = None,
+) -> dict:
+    """Resolve a query to ranked candidates.
+
+    `on_step` narrates the sub-steps. This runs inside asyncio.to_thread and
+    the callback reaches the event loop via call_soon_threadsafe, so it is
+    safe to call from here. Without it this whole function is one opaque
+    ~35s block — measured as the longest remaining silence in the lifecycle.
+    """
+    def step(msg: str) -> None:
+        if on_step is not None:
+            try:
+                on_step(msg)
+            except Exception:  # noqa: BLE001
+                # Narration must never be able to fail a search.
+                logger.exception("search narration failed")
+
     proxy = get_proxy()
     if proxy:
         abb.configure(proxy=proxy)
@@ -161,6 +180,9 @@ def _search_pipeline_sync(raw_query: str, limit: int) -> dict:
     if book is None:
         book = BookMetadata(title=raw_query, author="")
 
+    if book.title and book.title.lower() != raw_query.lower():
+        step(f"Looks like “{book.title}”" + (f" by {book.author}" if book.author else "") + "…")
+
     raw_results = _fan_out_search(book, raw_query=raw_query)
     if not raw_results:
         return {"book": _book_to_dict(book), "results": []}
@@ -170,7 +192,13 @@ def _search_pipeline_sync(raw_query: str, limit: int) -> dict:
         raw_results.sort(key=lambda r: quick_score(r, book), reverse=True)
         raw_results = raw_results[:max_enrich]
 
+    # The slow part: one page fetch per candidate. Announce the count first so
+    # the wait has a visible shape instead of being dead air.
+    n = len(raw_results)
+    step(f"Found {n} cop{'y' if n == 1 else 'ies'} — checking each…")
     enriched = _enrich_results(raw_results)
+
+    step("Ranking them…")
     scored = score_and_sort(enriched, book, prefer_narrator=None, min_score=MIN_SCORE)
 
     if not scored:
@@ -239,6 +267,7 @@ async def run_agent(
                 _search_pipeline_sync,
                 args.get("query") or raw_query,
                 int(args.get("limit") or 5),
+                lambda msg: _narrate(sms, STAGE_SEARCHING, msg),
             )
             return {"content": [{"type": "text", "text": json.dumps(data)}]}
         except Exception as e:
