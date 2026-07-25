@@ -92,9 +92,13 @@ class DownloadNotFinishedError(Exception):
     book was in their library when nothing had been downloaded at all.
 
     `failure_class` is the machine-readable reason the app renders copy from.
+    `user_message` is what a person reads until Phase C's per-class copy lands —
+    these are constructed with the book's display title, so `str(exc)` alone
+    would surface a bare book name where an explanation belongs.
     """
 
     failure_class = "infra_error"
+    user_message = "The download didn't finish."
 
 
 class ImportIncompleteError(DownloadNotFinishedError):
@@ -103,6 +107,7 @@ class ImportIncompleteError(DownloadNotFinishedError):
     caller must NOT report success."""
 
     failure_class = "import_failed"
+    user_message = "Downloaded, but it couldn't be added to your library."
 
 
 class NoCandidatesLeftError(DownloadNotFinishedError):
@@ -110,16 +115,21 @@ class NoCandidatesLeftError(DownloadNotFinishedError):
     has been tried and none of them downloaded."""
 
     failure_class = "no_seeders"
+    user_message = "Found it, but no one's sharing it right now."
 
 
 class DownloadStateLostError(DownloadNotFinishedError):
     """The download reported completion but its state file could not be read
     back, so there is no path to organise from."""
 
+    user_message = "The download finished but its details were lost."
+
 
 class UnknownDownloadOutcomeError(DownloadNotFinishedError):
     """The poll returned a status we have no branch for. Distinct from the
     others because it means a bug here, not a bad torrent."""
+
+    user_message = "Something went wrong with the download."
 
 
 class DownloadTimedOutError(DownloadNotFinishedError):
@@ -131,6 +141,7 @@ class DownloadTimedOutError(DownloadNotFinishedError):
     """
 
     failure_class = "download_timeout"
+    user_message = "This one was taking too long, so it was stopped."
 
 
 @dataclass(frozen=True)
@@ -152,10 +163,13 @@ class DownloadResult:
 
     @classmethod
     def from_error(cls, exc: Exception) -> "DownloadResult":
+        # Prefer the class's human sentence over str(exc): these exceptions are
+        # raised with the book's display title, so str(exc) would put a bare
+        # book name where the user expects to read what went wrong.
         return cls(
             ok=False,
             failure_class=getattr(exc, "failure_class", "infra_error"),
-            message=str(exc) or type(exc).__name__,
+            message=getattr(exc, "user_message", None) or "Something went wrong.",
         )
 
 

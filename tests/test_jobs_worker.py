@@ -80,7 +80,9 @@ async def test_run_chat_job_marks_failed_on_exception(redis, store, log, monkeyp
 
     refreshed = await store.get(job.id)
     assert refreshed.status == JobStatus.failed
-    assert "boom" in refreshed.error
+    # The traceback belongs in the log; the card gets something actionable.
+    assert "RuntimeError" not in refreshed.error
+    assert refreshed.error
 
 
 async def test_run_chat_job_skips_already_terminal(redis, store, log, monkeypatch):
@@ -144,7 +146,8 @@ async def test_crash_publishes_exactly_one_terminal_event(redis, store, log, mon
 
     terminal = [e for e in await _events(redis, job.id) if e[0] == "error"]
     assert len(terminal) == 1
-    assert "boom" in terminal[0][1]["message"]
+    assert "RuntimeError" not in terminal[0][1]["message"]
+    assert terminal[0][1]["message"]
 
 
 async def test_success_publishes_exactly_one_completed_event(

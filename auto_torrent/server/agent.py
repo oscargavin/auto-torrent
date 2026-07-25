@@ -387,7 +387,13 @@ async def run_agent(
     if state["outcome"] is not None:
         return state["outcome"]
 
-    return AgentOutcome(kind="error", message="agent ended without committing or asking")
+    # Reached when the agent stops without committing — overwhelmingly "no
+    # match found". The message is user-visible on the card, so it reads as an
+    # explanation rather than as a description of our control flow.
+    return AgentOutcome(
+        kind="error",
+        message="Couldn't find that one — try the full title and author.",
+    )
 
 
 __all__ = ["run_agent", "AgentOutcome"]

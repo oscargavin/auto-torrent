@@ -156,9 +156,13 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
         # update_status publishes the terminal event; no separate emit.
         await store.update_status(job.id, JobStatus.failed, error="worker cancelled")
         raise
-    except Exception as e:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
+        # The traceback goes to the log, where it's useful. What reaches the
+        # card is what a family member can act on — "RuntimeError: ..." is not.
         logger.exception("run_chat_job crashed for %s", job_id)
-        await store.update_status(job.id, JobStatus.failed, error=f"{type(e).__name__}: {e}")
+        await store.update_status(
+            job.id, JobStatus.failed, error="Something went wrong on the server."
+        )
 
 
 class WorkerSettings:

@@ -515,3 +515,26 @@ async def test_stalled_frame_carries_percent_and_peers(tmp_path, monkeypatch):
     stalled = next(d for _e, d in sink.emitted if d.get("stage") == "stalled")
     assert stalled["percent"] == 37
     assert stalled["peers"] == 0
+
+
+def test_failure_messages_are_human_not_the_book_title():
+    """These exceptions are raised with the display title, so a naive str(exc)
+    puts a bare book name where the user expects to read what went wrong."""
+    for exc_cls in (
+        worker_module.NoCandidatesLeftError,
+        worker_module.ImportIncompleteError,
+        worker_module.DownloadStateLostError,
+        worker_module.UnknownDownloadOutcomeError,
+        worker_module.DownloadTimedOutError,
+    ):
+        result = worker_module.DownloadResult.from_error(exc_cls("“Dune”"))
+        assert result.message != "“Dune”", f"{exc_cls.__name__} leaks the title"
+        assert len(result.message.split()) >= 4, f"{exc_cls.__name__} message too terse"
+
+
+def test_no_seeders_message_explains_the_problem():
+    result = worker_module.DownloadResult.from_error(
+        worker_module.NoCandidatesLeftError("“Dune”")
+    )
+    assert "sharing" in result.message
+    assert result.failure_class == "no_seeders"
