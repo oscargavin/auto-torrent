@@ -73,6 +73,18 @@ Pending options:
 
 End the conversation as soon as you have committed or asked. Don't keep tool-calling after."""
 
+# Appended when the caller has no way to deliver an answer back to the agent.
+# Without it the model still tries to ask, and the "question" lands as a
+# progress line nobody can reply to.
+NO_ASK_CLAUSE = """
+
+IMPORTANT — this channel has no reply path. You cannot ask the user anything;
+there is no ask_user_to_pick tool and no message you send will be answered.
+Rule 5 does not apply. When results are ambiguous, resolve it yourself by
+ranking (correct book/series number > unabridged > standard over dramatized >
+M4B over MP3 > higher score > more peers) and commit to the best one. Only
+skip committing when NOTHING plausibly matches."""
+
 
 @dataclass
 class AgentOutcome:
@@ -84,6 +96,11 @@ class AgentOutcome:
     title: str = ""
     author: str = ""
     message: str = ""
+    # Which edition the agent actually picked. Surfaced on the card so a wrong
+    # call — an abridged copy, the wrong narrator — is visible and reportable
+    # rather than silently landing in a shared family library.
+    narrator: str = ""
+    file_format: str = ""
 
 
 def _truncate(text: str, n: int = 220) -> str:
@@ -161,7 +178,17 @@ async def run_agent(
     settings: Settings,
     sms: SMSClient,
     pending_options: list[dict] | None = None,
+    allow_ask: bool = True,
 ) -> AgentOutcome:
+    """Run the concierge agent for one request.
+
+    `allow_ask` is about the CALLER's ability to deliver an answer, not about
+    which channel it is — SMS keys pending options by a stable phone number and
+    the legacy /chat route by a client-supplied session_id, so both can resolve
+    a pick. The jobs worker passes a fresh uuid per job into a process-local
+    store in the wrong process, so `ask_user_to_pick` there wrote state nothing
+    would ever read and left the user a numbered list they could not answer.
+    """
     state: dict = {"outcome": None}
 
     # ---- Tools ----
@@ -260,7 +287,7 @@ async def run_agent(
 
     @tool(
         name="commit_download",
-        description="Start the BG download. `primary` and each `fallbacks` entry: {magnet, title, author}. ALWAYS include 1-2 fallbacks when you have viable alternates — the polling layer uses them if the primary stalls.",
+        description="Start the BG download. `primary` and each `fallbacks` entry: {magnet, title, author, narrator, format}. Include narrator and format on `primary` whenever the search result or analyze_cover gave them — they're shown to the user so they can see which edition was chosen. ALWAYS include 1-2 fallbacks when you have viable alternates — the polling layer uses them if the primary stalls.",
         input_schema={"primary": dict, "fallbacks": list},
     )
     async def commit_download(args: dict) -> dict:
@@ -270,6 +297,8 @@ async def run_agent(
         magnet = primary.get("magnet")
         title = primary.get("title") or "Unknown"
         author = primary.get("author") or ""
+        narrator = primary.get("narrator") or ""
+        file_format = primary.get("format") or ""
         if not magnet:
             return {"content": [{"type": "text", "text": "error: primary.magnet required"}]}
 
@@ -298,20 +327,22 @@ async def run_agent(
             display=display,
             title=title,
             author=author,
+            narrator=narrator,
+            file_format=file_format,
         )
         return {"content": [{"type": "text", "text": json.dumps({"id": download.get("id"), "started": True})}]}
 
-    server = create_sdk_mcp_server(
-        name="atb",
-        tools=[
-            search_audiobookbay,
-            analyze_cover,
-            probe_peers,
-            send_sms,
-            ask_user_to_pick,
-            commit_download,
-        ],
-    )
+    tools = [
+        search_audiobookbay,
+        analyze_cover,
+        probe_peers,
+        send_sms,
+        commit_download,
+    ]
+    if allow_ask:
+        tools.insert(4, ask_user_to_pick)
+
+    server = create_sdk_mcp_server(name="atb", tools=tools)
 
     user_prompt_parts = [f"User texted: {raw_query!r}"]
     if pending_options:
@@ -325,22 +356,25 @@ async def run_agent(
     )
     user_prompt = "\n".join(user_prompt_parts)
 
+    allowed_tools = [
+        "mcp__atb__search_audiobookbay",
+        "mcp__atb__analyze_cover",
+        "mcp__atb__probe_peers",
+        "mcp__atb__send_sms",
+        "mcp__atb__commit_download",
+    ]
+    if allow_ask:
+        allowed_tools.append("mcp__atb__ask_user_to_pick")
+
     try:
         async for _ in query(
             prompt=user_prompt,
             options=ClaudeAgentOptions(
                 model=AGENT_MODEL,
                 max_turns=AGENT_MAX_TURNS,
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=SYSTEM_PROMPT if allow_ask else SYSTEM_PROMPT + NO_ASK_CLAUSE,
                 mcp_servers={"atb": server},
-                allowed_tools=[
-                    "mcp__atb__search_audiobookbay",
-                    "mcp__atb__analyze_cover",
-                    "mcp__atb__probe_peers",
-                    "mcp__atb__send_sms",
-                    "mcp__atb__ask_user_to_pick",
-                    "mcp__atb__commit_download",
-                ],
+                allowed_tools=allowed_tools,
             ),
         ):
             if state["outcome"] is not None:

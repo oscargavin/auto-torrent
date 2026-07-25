@@ -70,6 +70,11 @@ class Job(BaseModel):
     updated_at: float
     picked_title: str | None = None
     picked_author: str | None = None
+    # The edition the agent settled on. The jobs path can't ask "which one?",
+    # so it shows what it chose instead — a wrong narrator or an abridged copy
+    # is then visible rather than silently in the shared library.
+    picked_narrator: str | None = None
+    picked_format: str | None = None
     error: str | None = None
     # 8-char hex assigned by _execute_download_bg; the worker registers it as
     # soon as the agent commits, so the DELETE handler can look up the running

@@ -249,3 +249,44 @@ async def test_default_store_does_not_reap_a_normal_running_job(store, redis):
     await store.update_status(job.id, JobStatus.running)
 
     assert (await store.get(job.id)).status == JobStatus.running
+
+
+# --- U4: the chosen edition is visible -------------------------------------
+
+
+async def test_set_picked_edition_records_narrator_and_format(store):
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await store.set_picked_edition(job.id, narrator="Scott Brick", file_format="M4B")
+
+    refreshed = await store.get(job.id)
+    assert refreshed.picked_narrator == "Scott Brick"
+    assert refreshed.picked_format == "M4B"
+
+
+async def test_set_picked_edition_skips_empty_fields(store):
+    """The agent often has no narrator. Writing "" would render an empty
+    bullet on the card rather than nothing."""
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await store.set_picked_edition(job.id, narrator="", file_format="")
+
+    refreshed = await store.get(job.id)
+    assert refreshed.picked_narrator is None
+    assert refreshed.picked_format is None
+
+
+async def test_set_picked_edition_works_on_a_cancelled_job(store):
+    """Metadata, not a transition — a cancel racing the agent's commit should
+    still leave an accurate record of what was actually started."""
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    await store.update_status(job.id, JobStatus.cancelled)
+    await store.set_picked_edition(job.id, narrator="Scott Brick", file_format="M4B")
+
+    assert (await store.get(job.id)).picked_narrator == "Scott Brick"
+
+
+async def test_job_without_edition_fields_deserialises(store):
+    """Rows written before U4 have no such keys."""
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    refreshed = await store.get(job.id)
+    assert refreshed.picked_narrator is None
+    assert refreshed.picked_format is None

@@ -26,6 +26,8 @@ def _outcome(**kwargs):
         "title": "",
         "author": "",
         "message": "agent ended without committing or asking",
+        "narrator": "",
+        "file_format": "",
         **kwargs,
     }
     return type("O", (), fields)()
@@ -45,15 +47,14 @@ async def test_run_chat_job_marks_running_then_succeeded(redis, store, log, monk
     job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
 
     # Stub out the heavy bits: agent loop + download poll.
-    fake_agent = AsyncMock(return_value=type("O", (), {
-        "kind": "committed",
-        "download": {"id": "dl1"},
-        "fallbacks": [],
-        "display": "“Dune”",
-        "title": "Dune",
-        "author": "Frank Herbert",
-        "message": None,
-    })())
+    fake_agent = AsyncMock(return_value=_outcome(
+        kind="committed",
+        download={"id": "dl1"},
+        display="“Dune”",
+        title="Dune",
+        author="Frank Herbert",
+        message=None,
+    ))
     monkeypatch.setattr("auto_torrent.server.jobs.worker.run_agent", fake_agent)
     monkeypatch.setattr(
         "auto_torrent.server.jobs.worker._emit_download_and_poll",

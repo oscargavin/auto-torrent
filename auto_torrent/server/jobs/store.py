@@ -216,6 +216,23 @@ class JobStore:
         )
         return updated
 
+    async def set_picked_edition(
+        self, job_id: str, *, narrator: str, file_format: str
+    ) -> None:
+        """Record which edition the agent chose.
+
+        Metadata like set_download_id, not a transition — it deliberately
+        bypasses the terminal guard so a cancel racing the agent's commit
+        still leaves an accurate record of what was started.
+        """
+        fields = {
+            k: v
+            for k, v in (("picked_narrator", narrator), ("picked_format", file_format))
+            if v
+        }
+        if fields:
+            await self._r.hset(_job_key(job_id), mapping=fields)
+
     async def set_download_id(self, job_id: str, download_id: str) -> None:
         """Register the running download's state-file id against the job.
 

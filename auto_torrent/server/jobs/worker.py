@@ -12,7 +12,7 @@ from arq.connections import RedisSettings
 from ..agent import run_agent
 from ..event_types import STAGE_SEARCHING
 from ..app import _emit_download_and_poll  # re-uses the existing pump
-from ..llm import clear_conversation, get_pending_options
+from ..llm import clear_conversation
 from ..settings import Settings
 from ..worker import JOB_BUDGET_S, _kill_download_and_clean
 from ...cli import _read_state
@@ -47,13 +47,17 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
             "text": f"Searching for “{job.query}”…",
         })
 
-        pending = get_pending_options(job.id)
-        outcome = await run_agent(
-            job.query, job.id, settings, bus, pending_options=pending
-        )
+        # No pending-options lookup here: it read a process-local dict keyed by
+        # job.id — a fresh uuid every job, in the API process rather than this
+        # one — so it never once returned anything. allow_ask=False stops the
+        # agent generating a question this channel cannot carry an answer to.
+        outcome = await run_agent(job.query, job.id, settings, bus, allow_ask=False)
 
         if outcome.kind == "committed":
             clear_conversation(job.id)
+            await store.set_picked_edition(
+                job.id, narrator=outcome.narrator, file_format=outcome.file_format
+            )
             # The agent has already spawned the download subprocess; register
             # its state-file id against the job so a subsequent DELETE can find
             # the running PID + landing path and tear them down.
