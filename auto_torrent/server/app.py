@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .agent import AgentOutcome, run_agent
-from .event_types import EVENT_PROGRESS, STAGE_DOWNLOADING
+from .event_types import EVENT_PROGRESS, STAGE_DOWNLOADING, STAGE_FOUND
 from .llm import clear_conversation, get_pending_options, get_pending_result
 from .profiles import ALLOWED_AVATAR_STYLES, ProfileStore, public_view
 from .recommend import DEFAULT_N, RecCache, build_recommendations
@@ -418,6 +418,11 @@ async def _emit_download_and_poll(
         "committed",
         {"id": download_id, "title": title, "author": author, "display": display},
     )
+    # `committed` carries the book; this carries the lifecycle position, so the
+    # card can move off "searching" before the first byte-progress frame lands
+    # (which only fires on a percent change, and can be a while on a slow start).
+    bus.emit(EVENT_PROGRESS, {"stage": STAGE_FOUND, "percent": 0,
+                              "text": f"Found {display} — starting download…"})
     stop = asyncio.Event()
     pump = asyncio.create_task(_chat_progress_pump(download_id, bus, stop))
     try:

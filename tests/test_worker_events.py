@@ -425,3 +425,93 @@ def test_arq_timeout_exceeds_the_poll_budget():
     from auto_torrent.server.jobs.worker import WorkerSettings
 
     assert WorkerSettings.job_timeout > worker_module.JOB_BUDGET_S
+
+
+# --- U3: every stage in the vocabulary has a producer ----------------------
+
+
+def test_all_stages_have_an_emit_site():
+    """STAGE_SEARCHING and STAGE_FOUND were defined and emitted by nothing, so
+    the app would have rendered states the server never sends. Any stage added
+    without a producer fails here."""
+    import pathlib
+
+    from auto_torrent.server import event_types
+
+    server_dir = pathlib.Path(event_types.__file__).parent
+    sources = "\n".join(
+        p.read_text()
+        for p in server_dir.rglob("*.py")
+        if p.name != "event_types.py"
+    )
+
+    names = {
+        value: name
+        for name, value in vars(event_types).items()
+        if name.startswith("STAGE_")
+    }
+    missing = [names[v] for v in event_types.ALL_STAGES if names[v] not in sources]
+    assert not missing, f"stages defined but never emitted: {missing}"
+
+
+async def test_stall_emits_stalled_before_any_fallback_swap(tmp_path, monkeypatch):
+    """The signal must land when the bytes stop, not when we give up — that
+    gap is minutes long, and until now a frozen download looked healthy."""
+    monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
+    outcomes = iter(["stalled", "completed"])
+    monkeypatch.setattr(
+        worker_module, "_watch_until_done", lambda _id, **_kw: _async(next(outcomes))
+    )
+    monkeypatch.setattr(
+        worker_module, "_refresh_state",
+        lambda _id: {
+            "id": _id, "magnet": "magnet:seeded", "path": str(_mk(tmp_path)),
+            "status": "completed", "progress": 0.37, "peers": 0,
+        },
+    )
+    monkeypatch.setattr(worker_module, "_organize_files", lambda *a, **k: tmp_path / "dest")
+    monkeypatch.setattr(worker_module, "_reprobe_seeders", lambda _m: _async(5))
+
+    sink = BusSink()
+    settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
+    await poll_and_finalise(
+        download={"id": "d1", "magnet": "magnet:seeded"}, fallbacks=[],
+        display="“Book”", author="A", title="Book", phone="s",
+        settings=settings, sms=sink,
+    )
+
+    stages = [d.get("stage") for _e, d in sink.emitted]
+    assert "stalled" in stages
+    # And it precedes the retry narration rather than replacing it.
+    assert stages.index("stalled") < stages.index(STAGE_RETRYING)
+
+
+async def test_stalled_frame_carries_percent_and_peers(tmp_path, monkeypatch):
+    """Zero peers at 37% is the difference between 'slow' and 'dead' — the
+    card can't distinguish them without these."""
+    monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
+    outcomes = iter(["stalled", "completed"])
+    monkeypatch.setattr(
+        worker_module, "_watch_until_done", lambda _id, **_kw: _async(next(outcomes))
+    )
+    monkeypatch.setattr(
+        worker_module, "_refresh_state",
+        lambda _id: {
+            "id": _id, "magnet": "m", "path": str(_mk(tmp_path)),
+            "status": "completed", "progress": 0.37, "peers": 0,
+        },
+    )
+    monkeypatch.setattr(worker_module, "_organize_files", lambda *a, **k: tmp_path / "dest")
+    monkeypatch.setattr(worker_module, "_reprobe_seeders", lambda _m: _async(3))
+
+    sink = BusSink()
+    settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
+    await poll_and_finalise(
+        download={"id": "d1", "magnet": "m"}, fallbacks=[],
+        display="“Book”", author="A", title="Book", phone="s",
+        settings=settings, sms=sink,
+    )
+
+    stalled = next(d for _e, d in sink.emitted if d.get("stage") == "stalled")
+    assert stalled["percent"] == 37
+    assert stalled["peers"] == 0

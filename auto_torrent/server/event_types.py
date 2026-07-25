@@ -18,15 +18,18 @@ EVENT_ERROR = "error"
 STAGE_SEARCHING = "searching"
 STAGE_FOUND = "found"
 STAGE_DOWNLOADING = "downloading"
+STAGE_STALLED = "stalled"
 STAGE_IMPORTING = "importing"
 STAGE_RETRYING = "retrying"
 STAGE_IMPORT_FAILED = "import_failed"
 
-# The full set the app mirrors — a parity test asserts the app decoder knows
-# exactly these stages.
+# The full set the app mirrors. Every member must have a producer — a stage
+# defined here but never emitted is a stage the client builds rendering for
+# and never sees (searching and found were exactly that until U3), and one
+# emitted but not listed here breaks the app's parity check.
 ALL_STAGES = frozenset(
     {
-        STAGE_SEARCHING, STAGE_FOUND, STAGE_DOWNLOADING,
+        STAGE_SEARCHING, STAGE_FOUND, STAGE_DOWNLOADING, STAGE_STALLED,
         STAGE_IMPORTING, STAGE_RETRYING, STAGE_IMPORT_FAILED,
     }
 )

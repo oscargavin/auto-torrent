@@ -18,7 +18,13 @@ from typing import Awaitable, Callable
 from ..cli import _execute_download_bg, _read_state, _resolve_status
 from ..config import STATE_DIR
 from .audiobookshelf import ABSClient
-from .event_types import EVENT_PROGRESS, STAGE_IMPORT_FAILED, STAGE_IMPORTING, STAGE_RETRYING
+from .event_types import (
+    EVENT_PROGRESS,
+    STAGE_IMPORT_FAILED,
+    STAGE_IMPORTING,
+    STAGE_RETRYING,
+    STAGE_STALLED,
+)
 from .settings import Settings
 from .sms import SMSClient
 
@@ -314,6 +320,15 @@ async def poll_and_finalise(
             if outcome == "stalled":
                 cur_state = _refresh_state(download_id) or {}
                 cur_magnet = cur_state.get("magnet")
+                # Say so as soon as the bytes stop, not when we eventually give
+                # up and swap magnets — that can be tens of minutes later, and
+                # until then a frozen download renders exactly like a slow one.
+                _emit_event(sms, EVENT_PROGRESS, {
+                    "stage": STAGE_STALLED,
+                    "percent": int(float(cur_state.get("progress") or 0) * 100),
+                    "peers": cur_state.get("peers"),
+                    "text": f"{display} has stopped moving — checking for other sources…",
+                })
                 if cur_magnet and cur_magnet not in grace_extended:
                     if await _reprobe_seeders(cur_magnet) > 0:
                         grace_extended.add(cur_magnet)

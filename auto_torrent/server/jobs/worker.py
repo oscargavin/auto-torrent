@@ -10,6 +10,7 @@ from typing import Any
 from arq.connections import RedisSettings
 
 from ..agent import run_agent
+from ..event_types import STAGE_SEARCHING
 from ..app import _emit_download_and_poll  # re-uses the existing pump
 from ..llm import clear_conversation, get_pending_options
 from ..settings import Settings
@@ -41,7 +42,10 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
     bus = StreamEventBus(job.id, log)
 
     try:
-        await bus.emit_async("progress", {"text": f"Searching for “{job.query}”…"})
+        await bus.emit_async("progress", {
+            "stage": STAGE_SEARCHING,
+            "text": f"Searching for “{job.query}”…",
+        })
 
         pending = get_pending_options(job.id)
         outcome = await run_agent(
