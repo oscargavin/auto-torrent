@@ -10,7 +10,9 @@ from typing import Any
 from arq.connections import RedisSettings
 
 from ..agent import run_agent
+from ..audiobookshelf import ABSClient
 from ..event_types import STAGE_SEARCHING
+from ..library_match import find_existing
 from ..app import _emit_download_and_poll  # re-uses the existing pump
 from ..llm import clear_conversation
 from ..settings import Settings
@@ -38,6 +40,23 @@ def _as_failure_class(raw: str | None) -> FailureClass:
     except ValueError:
         logger.warning("unmapped failure_class %r, recording as infra_error", raw)
         return FailureClass.infra_error
+
+
+async def _already_in_library(title: str, author: str) -> bool:
+    """Is this book already on the shelf?
+
+    Never raises: a library that can't be reached must not fail an otherwise
+    good download. The cost of the check being unavailable is a duplicate, and
+    the cost of it throwing is losing the book entirely.
+    """
+    if not title:
+        return False
+    try:
+        items = await ABSClient(settings).list_items(settings.abs_library_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("duplicate check skipped: library list failed", exc_info=True)
+        return False
+    return find_existing(items, title, author) is not None
 
 
 async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
@@ -85,6 +104,33 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
             download_id = (outcome.download or {}).get("id")
             if download_id:
                 await store.set_download_id(job.id, download_id)
+
+            # Only now do we know which book this actually is: the agent
+            # resolves "something like Project Hail Mary" into a title, and the
+            # user's own words may match nothing in the library while the
+            # resolved book is already sitting on the shelf. Checking here also
+            # covers requests that never went through the app at all.
+            if await _already_in_library(outcome.title, outcome.author):
+                logger.info(
+                    "run_chat_job: %s resolved to %r, already in library — not downloading",
+                    job.id,
+                    outcome.title,
+                )
+                # The agent has already spawned the download; stop it and clean
+                # the partial, exactly as a user cancel would.
+                if download_id:
+                    state = _read_state(download_id)
+                    if state:
+                        await _kill_download_and_clean(state)
+                await store.update_status(
+                    job.id,
+                    JobStatus.succeeded,
+                    picked_title=outcome.title,
+                    picked_author=outcome.author,
+                    already_had=True,
+                )
+                return
+
             # Re-check status: cancel may have fired during the agent's search
             # (which can take 10–30s). If so, skip the poll — _emit_download
             # would otherwise loop on the subprocess that cancel_job is about

@@ -54,6 +54,7 @@ def _terminal_payload(
     picked_title: str | None,
     picked_author: str | None,
     failure_class: FailureClass | None = None,
+    already_had: bool = False,
 ) -> dict:
     """The `data` payload for each terminal event.
 
@@ -62,7 +63,14 @@ def _terminal_payload(
     `error` carries a message, `cancelled` carries nothing.
     """
     if status is JobStatus.succeeded:
-        return {"title": picked_title or "", "author": picked_author or ""}
+        return {
+            "title": picked_title or "",
+            "author": picked_author or "",
+            # So the card can say "already in your library" straight off the
+            # stream, without waiting for a snapshot refetch to tell it that
+            # nothing was actually downloaded.
+            "already_had": already_had,
+        }
     if status is JobStatus.failed:
         return {
             "message": error or "The download failed.",
@@ -166,6 +174,7 @@ class JobStore:
         picked_author: str | None = None,
         error: str | None = None,
         failure_class: FailureClass | None = None,
+        already_had: bool = False,
     ) -> Job | None:
         current = await self._fetch(job_id)
         if current is None:
@@ -187,6 +196,8 @@ class JobStore:
             fields["picked_author"] = picked_author
         if error is not None:
             fields["error"] = error
+        if already_had:
+            fields["already_had"] = "True"
         # Cancellation is classified here rather than at the call site: the
         # DELETE handler lives in the API process and shouldn't need to know
         # the vocabulary.
@@ -214,6 +225,7 @@ class JobStore:
                     picked_title=picked_title if picked_title is not None else current.picked_title,
                     picked_author=picked_author if picked_author is not None else current.picked_author,
                     failure_class=failure_class,
+                    already_had=already_had,
                 ),
             )
             # Release the dedup key so a re-request can start fresh, and expire
@@ -232,6 +244,7 @@ class JobStore:
                 **({"picked_title": picked_title} if picked_title is not None else {}),
                 **({"picked_author": picked_author} if picked_author is not None else {}),
                 **({"error": error} if error is not None else {}),
+                **({"already_had": True} if already_had else {}),
             }
         )
         return updated

@@ -95,6 +95,10 @@ class Job(BaseModel):
     # is then visible rather than silently in the shared library.
     picked_narrator: str | None = None
     picked_format: str | None = None
+    # The book was already on the shelf, so nothing was downloaded. Not a
+    # failure — the user's goal is satisfied — but the card must not claim
+    # credit for fetching something it didn't.
+    already_had: bool = False
     error: str | None = None
     # Machine-readable companion to `error`. Optional on the wire so an older
     # app is unaffected, and so rows written before this field deserialise.

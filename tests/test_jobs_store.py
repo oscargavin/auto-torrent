@@ -100,7 +100,7 @@ async def test_succeeded_publishes_one_completed_event(store, redis):
     )
 
     assert await _events(redis, job.id) == [
-        ("completed", {"title": "Dune", "author": "Frank Herbert"})
+        ("completed", {"title": "Dune", "author": "Frank Herbert", "already_had": False})
     ]
 
 
@@ -157,7 +157,7 @@ async def test_completed_falls_back_to_already_stored_picked_fields(store, redis
     await store.update_status(job.id, JobStatus.succeeded)
 
     assert await _events(redis, job.id) == [
-        ("completed", {"title": "Dune", "author": "Frank Herbert"})
+        ("completed", {"title": "Dune", "author": "Frank Herbert", "already_had": False})
     ]
 
 

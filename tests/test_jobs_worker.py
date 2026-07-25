@@ -176,7 +176,7 @@ async def test_success_publishes_exactly_one_completed_event(
 
     completed = [e for e in await _events(redis, job.id) if e[0] == "completed"]
     assert len(completed) == 1
-    assert completed[0][1] == {"title": "Dune", "author": "Frank Herbert"}
+    assert completed[0][1] == {"title": "Dune", "author": "Frank Herbert", "already_had": False}
 
 
 async def test_jobs_path_defers_terminal_emit_to_the_store(redis, store, log, monkeypatch):
