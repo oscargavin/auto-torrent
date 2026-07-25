@@ -247,6 +247,11 @@ def _narrate(sink: object, stage: str, text: str) -> None:
     # sharing it…" three times, byte-identical, which reads as a stuck card.
     # Suppress the repeat; the client's elapsed clock carries the passage of
     # time without us having to say anything new.
+    #
+    # The cursor is stashed on the sink, which is safe only because a sink is
+    # built per job (jobs/worker.py constructs a fresh StreamEventBus). A
+    # shared or pooled sink would leak one job's last line into the next and
+    # silently swallow its first frame.
     if getattr(sink, "_last_narration", None) == text:
         return
     try:
