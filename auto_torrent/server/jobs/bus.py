@@ -60,7 +60,14 @@ class StreamEventBus:
     async def send_async(self, _phone: str, text: str) -> None:
         # The agent calls bus.send(phone, text) — phone is the SMS API surface;
         # for chat we surface the text as a "progress" event.
-        await self.emit_async("progress", {"text": text})
+        #
+        # `source: agent` marks this as free-form LLM prose rather than a
+        # lifecycle frame. It is written for SMS, so it re-states the book by
+        # name and runs to any length — which is why the card truncated it
+        # mid-word while showing the same title directly above. Card clients
+        # keep these out of the status line; the event stays in the log, and
+        # SMS (which has no card) is unaffected.
+        await self.emit_async("progress", {"text": text, "source": "agent"})
 
     async def system_progress_async(self, text: str) -> None:
         # Does NOT set messaged — mirrors ChatEventBus.system_progress behaviour.

@@ -229,8 +229,20 @@ def _narrate(sink: object, stage: str, text: str) -> None:
     real run. These are no-ops for the SMS sink, which has no `emit`.
     """
     emit = getattr(sink, "emit", None)
-    if callable(emit):
-        emit(EVENT_PROGRESS, {"stage": stage, "text": text})
+    if not callable(emit):
+        return
+    # The narration strings are fixed per tool, and the agent calls a tool as
+    # many times as it likes — probing three magnets emitted "Checking who's
+    # sharing it…" three times, byte-identical, which reads as a stuck card.
+    # Suppress the repeat; the client's elapsed clock carries the passage of
+    # time without us having to say anything new.
+    if getattr(sink, "_last_narration", None) == text:
+        return
+    try:
+        sink._last_narration = text  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    emit(EVENT_PROGRESS, {"stage": stage, "text": text})
 
 
 async def run_agent(
@@ -260,8 +272,10 @@ async def run_agent(
         input_schema={"query": str, "limit": int},
     )
     async def search_audiobookbay(args: dict) -> dict:
-        q = (args.get("query") or raw_query).strip()
-        _narrate(sms, STAGE_SEARCHING, f"Looking for “{q}”…")
+        # Deliberately silent here: the job already opened with "Searching…"
+        # and _search_pipeline_sync narrates the resolved title when it differs
+        # from what was asked for, which is the only genuinely new information
+        # at this point. Narrating the query again just repeated the headline.
         try:
             data = await asyncio.to_thread(
                 _search_pipeline_sync,

@@ -59,7 +59,9 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
     try:
         await bus.emit_async("progress", {
             "stage": STAGE_SEARCHING,
-            "text": f"Searching for “{job.query}”…",
+            # No query echo: the card renders job.query as its headline, so
+            # naming it here printed the same words twice, one line apart.
+            "text": "Searching…",
         })
 
         # No pending-options lookup here: it read a process-local dict keyed by

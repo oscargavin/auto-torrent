@@ -424,7 +424,7 @@ async def _emit_download_and_poll(
     # card can move off "searching" before the first byte-progress frame lands
     # (which only fires on a percent change, and can be a while on a slow start).
     bus.emit(EVENT_PROGRESS, {"stage": STAGE_FOUND, "percent": 0,
-                              "text": f"Found {display} — starting download…"})
+                              "text": "Found it — starting the download…"})
     stop = asyncio.Event()
     pump = asyncio.create_task(_chat_progress_pump(download_id, bus, stop))
     try:

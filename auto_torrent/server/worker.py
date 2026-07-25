@@ -341,7 +341,9 @@ async def poll_and_finalise(
                     "stage": STAGE_STALLED,
                     "percent": int(float(cur_state.get("progress") or 0) * 100),
                     "peers": cur_state.get("peers"),
-                    "text": f"{display} has stopped moving — checking for other sources…",
+                    # Card frames never name the book — it is already the
+                    # headline. The SMS sends below still do; SMS has no card.
+                    "text": "Stopped moving — looking for another source…",
                 })
                 if cur_magnet and cur_magnet not in grace_extended:
                     if await _reprobe_seeders(cur_magnet) > 0:
@@ -349,7 +351,7 @@ async def poll_and_finalise(
                         logger.info("Stall but %s still seeded — extending grace", display)
                         _emit_event(sms, EVENT_PROGRESS, {
                             "stage": STAGE_RETRYING,
-                            "text": f"{display} is slow but still seeded — giving it longer…",
+                            "text": "Slow, but still seeded — giving it longer…",
                         })
                         continue
 
@@ -382,7 +384,7 @@ async def poll_and_finalise(
             tried_magnets.add(next_fb["magnet"])
             _emit_event(sms, EVENT_PROGRESS, {
                 "stage": STAGE_RETRYING,
-                "text": f"Trying another copy of {display}…",
+                "text": "Trying another copy…",
             })
             bg_title = f"{title} - {author}" if author else title
             try:
@@ -409,7 +411,7 @@ async def poll_and_finalise(
     # Surface that as a distinct stage so the chat/jobs UI shows "importing"
     # rather than sitting at 100% "downloading". No-op for the SMS sink.
     _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
-                                      "text": f"Adding {display} to your library…"})
+                                      "text": "Adding to your library…"})
 
     final = _refresh_state(download.get("id"))
     if not final:
@@ -427,7 +429,7 @@ async def poll_and_finalise(
         logger.exception("organise failed")
         sms.send(phone, f"{display} downloaded but I couldn't move it into the library. Try again?")
         _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORT_FAILED, "percent": 100,
-                                          "text": f"{display} downloaded but couldn't be imported."})
+                                          "text": "Downloaded, but couldn't be imported."})
         raise ImportIncompleteError(display) from e
 
     try:
@@ -439,7 +441,7 @@ async def poll_and_finalise(
         logger.exception("ABS scan failed; files are in place, will be picked up on next scan")
         sms.send(phone, f"{display} downloaded — it'll appear after the next library scan.")
         _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORT_FAILED, "percent": 100,
-                                          "text": f"{display} downloaded, not yet imported."})
+                                          "text": "Downloaded — waiting for the next library scan."})
         raise ImportIncompleteError(display) from e
 
     sms.send(phone, f"✓ {display} is in your library.")

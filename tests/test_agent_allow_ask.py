@@ -185,6 +185,30 @@ def test_narrate_emits_a_progress_frame_on_a_chat_sink():
     assert bus.events == [("progress", {"stage": "searching", "text": "Looking for x…"})]
 
 
+def test_narrate_suppresses_an_identical_consecutive_frame():
+    """The narration strings are fixed per tool and the agent may call a tool
+    any number of times — probing three magnets emitted the same sentence
+    three times, which on the card is indistinguishable from being stuck."""
+    bus = _RecordingBus()
+    for _ in range(3):
+        agent_module._narrate(bus, "searching", "Checking who's sharing it…")
+    assert len(bus.events) == 1
+
+
+def test_narrate_lets_a_changed_frame_through_and_allows_a_later_repeat():
+    bus = _RecordingBus()
+    agent_module._narrate(bus, "searching", "Checking who's sharing it…")
+    agent_module._narrate(bus, "searching", "Ranking them…")
+    # Only *consecutive* duplicates are dropped — coming back to a step after
+    # doing something else is real news.
+    agent_module._narrate(bus, "searching", "Checking who's sharing it…")
+    assert [d["text"] for _, d in bus.events] == [
+        "Checking who's sharing it…",
+        "Ranking them…",
+        "Checking who's sharing it…",
+    ]
+
+
 def test_narrate_is_a_noop_for_the_sms_sink():
     """The SMS client has no emit(); pushing a dict at it would be a crash or
     a nonsense text message."""
@@ -193,8 +217,15 @@ def test_narrate_is_a_noop_for_the_sms_sink():
     assert sink.sent == []
 
 
-async def test_search_narrates_before_doing_the_slow_work():
-    """The search tool is the single longest step in the agent phase."""
+async def test_search_narrates_from_inside_the_pipeline():
+    """The search tool is the single longest step in the agent phase.
+
+    The narration now comes from inside _search_pipeline_sync rather than from
+    the tool wrapper — the wrapper could only say "looking for <query>", which
+    is the card's own headline read back. The pipeline's steps (resolved title,
+    candidate count, ranking) are the ones that carry new information, so this
+    pins the wiring that gets them out of the worker thread and onto the bus.
+    """
     captured = {}
 
     def fake_server(name, tools):
@@ -205,17 +236,24 @@ async def test_search_narrates_before_doing_the_slow_work():
         return
         yield
 
+    def fake_pipeline(q, limit, on_step=None):
+        if on_step:
+            on_step("Found 3 copies — checking each…")
+        return {"book": {}, "results": []}
+
     bus = _RecordingBus()
     with (
         patch.object(agent_module, "create_sdk_mcp_server", fake_server),
         patch.object(agent_module, "query", fake_query),
-        patch.object(agent_module, "_search_pipeline_sync",
-                     lambda q, limit: {"book": {}, "results": []}),
+        patch.object(agent_module, "_search_pipeline_sync", fake_pipeline),
     ):
         await agent_module.run_agent("dune", "s1", object(), bus, allow_ask=False)
         tool = captured["tools"]["search_audiobookbay"]
         handler = getattr(tool, "handler", None) or tool
         await handler({"query": "dune", "limit": 5})
 
-    stages = [d.get("stage") for e, d in bus.events if e == "progress"]
-    assert "searching" in stages
+    progress = [d for e, d in bus.events if e == "progress"]
+    assert [d.get("stage") for d in progress] == ["searching"]
+    assert progress[0]["text"] == "Found 3 copies — checking each…"
+    # The book was never named: it is already the card's headline.
+    assert "dune" not in progress[0]["text"].lower()
