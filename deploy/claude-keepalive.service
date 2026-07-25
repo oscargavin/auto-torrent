@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep the Claude Code credential refreshed (and warn early if it lapses)
+Documentation=https://code.claude.com/docs/en/authentication
+
+[Service]
+Type=oneshot
+ExecStart=/home/oscar/auto-torrent/deploy/claude-keepalive.sh
+# Long enough for a cold CLI start plus one round trip; the script's own
+# timeout(1) is the real bound.
+TimeoutStartSec=180

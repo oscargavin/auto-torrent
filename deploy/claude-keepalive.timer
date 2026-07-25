@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily Claude credential keepalive
+
+[Timer]
+# Daily is comfortably inside the refresh window while costing one trivial
+# prompt a day. The failure this prevents took five weeks to notice.
+OnCalendar=daily
+# Randomise so it isn't hammering at exactly midnight alongside everything else.
+RandomizedDelaySec=1h
+# If the box was off when it was due, run on next boot rather than skipping —
+# an unattended server that sleeps through its own keepalive is the bug.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

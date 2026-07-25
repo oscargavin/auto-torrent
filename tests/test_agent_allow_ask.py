@@ -50,9 +50,10 @@ async def test_reply_capable_callers_keep_the_ask_tool():
 
 async def test_no_ask_prompt_tells_the_model_to_resolve_by_ranking():
     captured = await _run(allow_ask=False)
-    prompt = captured["options"].system_prompt
+    prompt = " ".join(captured["options"].system_prompt.split())
     assert "no reply path" in prompt
-    assert "ranking" in prompt
+    # It must tell the model to decide for itself rather than ask.
+    assert "commit to the best candidate" in prompt
 
 
 async def test_ask_capable_prompt_is_unchanged():
@@ -105,3 +106,44 @@ async def test_agent_crash_message_is_human_not_a_python_exception():
     assert "Exception" not in outcome.message
     assert "exit code" not in outcome.message
     assert outcome.message.endswith(".")
+
+
+# --- prompt capability guards -----------------------------------------------
+#
+# These assert the prompt still instructs the behaviours we care about. They
+# can't prove the model complies (that's prompt compliance — non-deterministic),
+# but they stop a future edit quietly dropping a rule we added for a reason.
+
+
+def test_prompt_prefers_the_single_book_over_a_collection():
+    """Live run: asked for Project Hail Mary, got a 2.8GB three-book box set."""
+    p = agent_module.SYSTEM_PROMPT.lower()
+    assert "collection" in p and "omnibus" in p
+    assert "standalone" in p
+
+
+def test_prompt_handles_requests_that_are_not_exact_titles():
+    p = agent_module.SYSTEM_PROMPT.lower()
+    for capability in ("series position", "author only", "typos"):
+        assert capability.split()[0] in p, f"prompt lost: {capability}"
+    # Descriptive and vibe-based requests.
+    assert "surprise me" in p
+    assert "vague" in p
+
+
+def test_prompt_asks_for_narrator_and_format_on_commit():
+    """They're rendered on the card — that's how a wrong pick gets noticed."""
+    assert "narrator, format" in agent_module.SYSTEM_PROMPT or (
+        "narrator" in agent_module.SYSTEM_PROMPT
+        and "format" in agent_module.SYSTEM_PROMPT
+    )
+
+
+def test_prompt_forbids_inventing_runtime_or_eta():
+    assert "Never invent" in agent_module.SYSTEM_PROMPT
+
+
+def test_no_ask_clause_forbids_ending_on_a_question():
+    # Normalise: the clause is hard-wrapped, so the phrase spans a newline.
+    clause = " ".join(agent_module.NO_ASK_CLAUSE.split())
+    assert "Never end your turn with a question" in clause
