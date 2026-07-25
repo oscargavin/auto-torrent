@@ -22,6 +22,8 @@ from .profiles import ALLOWED_AVATAR_STYLES, ProfileStore, public_view
 from .recommend import DEFAULT_N, RecCache, build_recommendations
 from .settings import Settings
 from .sms import SMSClient
+from .audiobookshelf import ABSClient
+from .covers import backfill_covers
 from .worker import (
     DownloadNotFinishedError,
     DownloadResult,
@@ -461,6 +463,22 @@ async def _emit_download_and_poll(
             await pump
         except Exception:  # noqa: BLE001
             pass
+
+
+@app.post("/covers/backfill")
+async def covers_backfill(
+    dry_run: bool = False,
+    _: None = Depends(_require_bearer),
+) -> dict:
+    """Find artwork for library items that have none.
+
+    The import path covers new books; this fixes what is already on the shelf,
+    and anything a lookup misses today that a re-run catches later. Idempotent
+    — an item that gained a cover simply isn't in the list any more.
+    """
+    return await backfill_covers(
+        ABSClient(settings), settings.abs_library_id, dry_run=dry_run
+    )
 
 
 @app.post("/chat")

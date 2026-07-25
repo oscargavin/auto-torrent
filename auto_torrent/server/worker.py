@@ -18,6 +18,7 @@ from typing import Awaitable, Callable
 from ..cli import _execute_download_bg, _read_state, _resolve_status
 from ..config import STATE_DIR
 from .audiobookshelf import ABSClient
+from .covers import ensure_local_cover
 from .event_types import (
     EVENT_PROGRESS,
     STAGE_IMPORT_FAILED,
@@ -431,6 +432,15 @@ async def poll_and_finalise(
         _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORT_FAILED, "percent": 100,
                                           "text": "Downloaded, but couldn't be imported."})
         raise ImportIncompleteError(display) from e
+
+    # Before the scan, so the book appears with its artwork instead of showing
+    # up blank and changing under the user a moment later. Plenty of releases
+    # ship no cover, and ABS only derives one from what the download contained.
+    # Never fatal: a missing cover is cosmetic, a failed import is not.
+    try:
+        await asyncio.to_thread(ensure_local_cover, dest, title, author)
+    except Exception:  # noqa: BLE001
+        logger.exception("cover fetch failed for %s", display)
 
     try:
         await abs_client.scan_library(settings.abs_library_id)

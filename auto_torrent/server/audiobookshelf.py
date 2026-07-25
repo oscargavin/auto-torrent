@@ -84,6 +84,28 @@ class ABSClient:
             )
             resp.raise_for_status()
 
+    async def list_items(self, library_id: str, limit: int = 500) -> list[dict]:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{self._base}/api/libraries/{library_id}/items",
+                headers=self._headers,
+                params={"limit": limit},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json().get("results", [])
+
+    async def set_cover(self, item_id: str, url: str) -> None:
+        """Point an item at a cover URL; ABS downloads and stores it itself."""
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self._base}/api/items/{item_id}/cover",
+                headers=self._headers,
+                json={"url": url},
+                timeout=30,
+            )
+            resp.raise_for_status()
+
     async def get_libraries(self) -> list[dict]:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
