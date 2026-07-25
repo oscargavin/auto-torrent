@@ -22,7 +22,13 @@ from .profiles import ALLOWED_AVATAR_STYLES, ProfileStore, public_view
 from .recommend import DEFAULT_N, RecCache, build_recommendations
 from .settings import Settings
 from .sms import SMSClient
-from .worker import ImportIncompleteError, _refresh_state, get_active_downloads, poll_and_finalise
+from .worker import (
+    DownloadNotFinishedError,
+    DownloadResult,
+    _refresh_state,
+    get_active_downloads,
+    poll_and_finalise,
+)
 
 logger = logging.getLogger("atb.server")
 
@@ -385,14 +391,14 @@ async def _emit_download_and_poll(
     on_download_change: Callable[[str], Awaitable[None]] | None = None,
     query: str | None = None,
     emit_terminal: bool = True,
-) -> bool:
+) -> DownloadResult:
     """Emit `committed`, run the poll with a progress pump, then `completed`.
 
-    Returns True when the book reached the library, False when it downloaded
-    but couldn't be imported (organise/scan failed) — in which case
-    poll_and_finalise has already surfaced an `import_failed` stage and no
-    `completed` event is emitted. The jobs worker reads this to avoid marking a
-    job succeeded when the book never actually landed.
+    Returns a DownloadResult. `ok` is true only when the book actually reached
+    the library; otherwise `failure_class` says why, which is what the jobs
+    layer renders user-facing copy from. This used to be a bool, and every
+    path that abandoned a download returned normally — so `completed` fired
+    and the user was told a book they never received was in their library.
 
     `emit_terminal` controls whether this function publishes the terminal
     `completed`/`error` frames itself. The jobs path passes False: there,
@@ -428,16 +434,18 @@ async def _emit_download_and_poll(
         )
         if emit_terminal:
             bus.emit("completed", {"title": title, "author": author})
-        return True
-    except ImportIncompleteError:
-        # Downloaded but not imported — poll_and_finalise already emitted the
-        # import_failed stage and messaged the user. Don't claim success.
-        return False
+        return DownloadResult.success()
+    except DownloadNotFinishedError as e:
+        # An abandoned or half-finished download. poll_and_finalise has already
+        # messaged the user and emitted the relevant stage; we only translate
+        # the reason for the caller. Never `completed`.
+        logger.info("download did not finish for %s: %s", display, type(e).__name__)
+        return DownloadResult.from_error(e)
     except Exception as e:  # noqa: BLE001
         logger.exception("chat poll_and_finalise crashed")
         if emit_terminal:
             bus.emit("error", {"message": f"download error: {e}"})
-        return False
+        return DownloadResult.from_error(e)
     finally:
         stop.set()
         try:

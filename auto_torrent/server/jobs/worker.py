@@ -83,11 +83,12 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
             async def _track_download_change(new_id: str) -> None:
                 await store.set_download_id(job.id, new_id)
 
-            # Returns True only if the book actually landed in the library.
-            # False = downloaded-but-not-imported (organise/scan failed); the
-            # `completed` event is emitted inside _emit_download_and_poll on
-            # success, so we do not re-emit it here.
-            imported = await _emit_download_and_poll(
+            # `ok` is true only if the book actually landed in the library;
+            # otherwise `failure_class` says why. Every abandon path — no
+            # candidates left, unknown poll outcome, lost state file, failed
+            # import — comes back here as a failure rather than sliding
+            # through as success.
+            result = await _emit_download_and_poll(
                 bus,
                 download=outcome.download or {},
                 fallbacks=outcome.fallbacks,
@@ -111,7 +112,7 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                     job.id,
                 )
                 return
-            if imported:
+            if result.ok:
                 await store.update_status(
                     job.id,
                     JobStatus.succeeded,
@@ -122,7 +123,7 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                 await store.update_status(
                     job.id,
                     JobStatus.failed,
-                    error="downloaded but not imported into the library",
+                    error=result.message or "the download didn't finish",
                     picked_title=outcome.title,
                     picked_author=outcome.author,
                 )

@@ -226,3 +226,73 @@ async def test_downloaded_but_not_imported_publishes_a_terminal_event(
     terminal = [e for e in await _events(redis, job.id) if e[0] == "error"]
     assert len(terminal) == 1
     assert [e for e in await _events(redis, job.id) if e[0] == "completed"] == []
+
+
+# --- U12: a book that never downloaded must not report success -------------
+
+
+@pytest.mark.parametrize(
+    "failure_class,message",
+    [
+        ("no_seeders", "“Dune”"),
+        ("import_failed", "“Dune”"),
+        ("infra_error", "boom"),
+    ],
+)
+async def test_unfinished_download_never_reports_success(
+    redis, store, log, monkeypatch, failure_class, message
+):
+    from auto_torrent.server.worker import DownloadResult
+
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    monkeypatch.setattr(
+        "auto_torrent.server.jobs.worker.run_agent",
+        AsyncMock(return_value=_outcome(
+            kind="committed",
+            download={"id": "dl1"},
+            display="“Dune”",
+            title="Dune",
+            author="Frank Herbert",
+            message=None,
+        )),
+    )
+    monkeypatch.setattr(
+        "auto_torrent.server.jobs.worker._emit_download_and_poll",
+        AsyncMock(return_value=DownloadResult(
+            ok=False, failure_class=failure_class, message=message
+        )),
+    )
+
+    await run_chat_job({"redis": redis, "store": store, "log": log}, job.id)
+
+    assert (await store.get(job.id)).status == JobStatus.failed
+    events = await _events(redis, job.id)
+    assert [e for e in events if e[0] == "completed"] == []
+    assert len([e for e in events if e[0] == "error"]) == 1
+
+
+async def test_finished_download_still_reports_success(redis, store, log, monkeypatch):
+    """The other side of the guard — a real success must not get caught by it."""
+    from auto_torrent.server.worker import DownloadResult
+
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    monkeypatch.setattr(
+        "auto_torrent.server.jobs.worker.run_agent",
+        AsyncMock(return_value=_outcome(
+            kind="committed",
+            download={"id": "dl1"},
+            display="“Dune”",
+            title="Dune",
+            author="Frank Herbert",
+            message=None,
+        )),
+    )
+    monkeypatch.setattr(
+        "auto_torrent.server.jobs.worker._emit_download_and_poll",
+        AsyncMock(return_value=DownloadResult.success()),
+    )
+
+    await run_chat_job({"redis": redis, "store": store, "log": log}, job.id)
+
+    assert (await store.get(job.id)).status == JobStatus.succeeded
+    assert len([e for e in await _events(redis, job.id) if e[0] == "completed"]) == 1

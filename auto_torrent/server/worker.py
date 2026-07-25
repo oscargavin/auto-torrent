@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from typing import Awaitable, Callable
@@ -75,10 +76,69 @@ def _sanitize(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', "", name).strip()
 
 
-class ImportIncompleteError(Exception):
+class DownloadNotFinishedError(Exception):
+    """The download did not end with a book in the library.
+
+    Every path that abandons a download raises one of these. Before, they
+    returned normally and the caller could not tell them apart from success —
+    so `_emit_download_and_poll` emitted `completed` and the user was told a
+    book was in their library when nothing had been downloaded at all.
+
+    `failure_class` is the machine-readable reason the app renders copy from.
+    """
+
+    failure_class = "infra_error"
+
+
+class ImportIncompleteError(DownloadNotFinishedError):
     """The bytes are down but the book did not make it into the library
     (organise or ABS scan failed). Files remain on disk for a later scan; the
     caller must NOT report success."""
+
+    failure_class = "import_failed"
+
+
+class NoCandidatesLeftError(DownloadNotFinishedError):
+    """Every candidate — the agent's fallbacks and anything rediscovery found —
+    has been tried and none of them downloaded."""
+
+    failure_class = "no_seeders"
+
+
+class DownloadStateLostError(DownloadNotFinishedError):
+    """The download reported completion but its state file could not be read
+    back, so there is no path to organise from."""
+
+
+class UnknownDownloadOutcomeError(DownloadNotFinishedError):
+    """The poll returned a status we have no branch for. Distinct from the
+    others because it means a bug here, not a bad torrent."""
+
+
+@dataclass(frozen=True)
+class DownloadResult:
+    """What a download+import run actually achieved.
+
+    Replaces the old boolean, which conflated "reached the library" with
+    "didn't" and had no room for *why* — leaving the jobs layer nothing to
+    classify a failure from.
+    """
+
+    ok: bool
+    failure_class: str | None = None
+    message: str | None = None
+
+    @classmethod
+    def success(cls) -> "DownloadResult":
+        return cls(ok=True)
+
+    @classmethod
+    def from_error(cls, exc: Exception) -> "DownloadResult":
+        return cls(
+            ok=False,
+            failure_class=getattr(exc, "failure_class", "infra_error"),
+            message=str(exc) or type(exc).__name__,
+        )
 
 
 def _organize_files(
@@ -248,7 +308,7 @@ async def poll_and_finalise(
                 if not fallbacks:
                     logger.info("No fallbacks left for %s", display)
                     sms.send(phone, f"Couldn't get {display} tonight, sorry — try in the morning?")
-                    return
+                    raise NoCandidatesLeftError(display)
             if not fallback_announced:
                 sms.send(phone, f"That one stalled — trying another version…")
                 fallback_announced = True
@@ -286,7 +346,7 @@ async def poll_and_finalise(
             continue
         # Unknown outcome → bail.
         sms.send(phone, f"Something odd happened with {display}. Try again?")
-        return
+        raise UnknownDownloadOutcomeError(display)
 
     # The bytes are down; the user-visible work now is organise + ABS scan.
     # Surface that as a distinct stage so the chat/jobs UI shows "importing"
@@ -297,7 +357,7 @@ async def poll_and_finalise(
     final = _refresh_state(download.get("id"))
     if not final:
         sms.send(phone, f"Couldn't read the final state for {display}. The file may still be there.")
-        return
+        raise DownloadStateLostError(display)
 
     download_path = final.get("path", "")
     try:

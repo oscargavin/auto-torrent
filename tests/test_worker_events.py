@@ -260,11 +260,15 @@ async def test_rediscovery_capped(tmp_path, monkeypatch):
 
     sink = BusSink()
     settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
-    await poll_and_finalise(
-        download={"id": "d1", "magnet": "magnet:dead"}, fallbacks=[],
-        display="“Book”", author="A", title="Book", phone="s", settings=settings,
-        sms=sink, query="the book",
-    )
+    # Giving up raises rather than returning — a normal return here is
+    # indistinguishable from success to the caller, which is what made a
+    # never-downloaded book report "saved to your library".
+    with pytest.raises(worker_module.NoCandidatesLeftError):
+        await poll_and_finalise(
+            download={"id": "d1", "magnet": "magnet:dead"}, fallbacks=[],
+            display="“Book”", author="A", title="Book", phone="s", settings=settings,
+            sms=sink, query="the book",
+        )
 
     assert calls["n"] == worker_module.MAX_REDISCOVERY_ROUNDS
     assert any("Couldn't get" in s for s in sink.sent)
@@ -291,3 +295,86 @@ def test_organize_files_namespaces_on_collision(tmp_path):
     assert (dest2 / "b.m4b").exists()
     # First download's file was not clobbered.
     assert (dest1 / "a.m4b").read_text() == "audio"
+
+
+# --- U12: abandoned downloads must not look like success -------------------
+#
+# Before U12 each of these paths did a bare `return`, which the caller could
+# not distinguish from "the book is in the library" — so it emitted
+# `completed` and the user was told a book they never received had been saved.
+
+
+async def test_no_candidates_left_raises_with_no_seeders_class(tmp_path, monkeypatch):
+    monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id: _async("failed"))
+    monkeypatch.setattr(
+        worker_module, "_refresh_state",
+        lambda _id: {"id": _id, "magnet": "magnet:dead", "status": "failed"},
+    )
+    monkeypatch.setattr(worker_module, "_kill_download_and_clean", lambda _s: _async(None))
+    monkeypatch.setattr(worker_module, "_rediscover_candidates", lambda q, t: _async([]))
+
+    settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
+    with pytest.raises(worker_module.NoCandidatesLeftError) as exc:
+        await poll_and_finalise(
+            download={"id": "d1", "magnet": "magnet:dead"}, fallbacks=[],
+            display="“Book”", author="A", title="Book", phone="s",
+            settings=settings, sms=BusSink(), query="the book",
+        )
+    assert exc.value.failure_class == "no_seeders"
+
+
+async def test_unknown_poll_outcome_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id: _async("unknown"))
+
+    settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
+    with pytest.raises(worker_module.UnknownDownloadOutcomeError):
+        await poll_and_finalise(
+            download={"id": "d1", "magnet": "m"}, fallbacks=[],
+            display="“Book”", author="A", title="Book", phone="s",
+            settings=settings, sms=BusSink(),
+        )
+
+
+async def test_lost_state_file_after_completion_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id: _async("completed"))
+    monkeypatch.setattr(worker_module, "_refresh_state", lambda _id: None)
+
+    settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
+    with pytest.raises(worker_module.DownloadStateLostError):
+        await poll_and_finalise(
+            download={"id": "d1", "magnet": "m"}, fallbacks=[],
+            display="“Book”", author="A", title="Book", phone="s",
+            settings=settings, sms=BusSink(),
+        )
+
+
+def test_every_abandon_path_carries_a_failure_class():
+    """Each reason maps to a distinct, non-empty class so the app can render
+    different copy per failure rather than one generic message."""
+    classes = {
+        worker_module.NoCandidatesLeftError.failure_class,
+        worker_module.ImportIncompleteError.failure_class,
+        worker_module.DownloadStateLostError.failure_class,
+        worker_module.UnknownDownloadOutcomeError.failure_class,
+    }
+    assert all(c for c in classes)
+    assert worker_module.NoCandidatesLeftError.failure_class == "no_seeders"
+    assert worker_module.ImportIncompleteError.failure_class == "import_failed"
+
+
+def test_download_result_from_error_reads_the_class():
+    result = worker_module.DownloadResult.from_error(
+        worker_module.NoCandidatesLeftError("“Book”")
+    )
+    assert result.ok is False
+    assert result.failure_class == "no_seeders"
+    assert result.message
+
+
+def test_download_result_from_unexpected_error_falls_back_to_infra():
+    result = worker_module.DownloadResult.from_error(RuntimeError("boom"))
+    assert result.ok is False
+    assert result.failure_class == "infra_error"
