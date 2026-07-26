@@ -52,4 +52,9 @@ class BookCard:
     genres: tuple[str, ...] = ()
     runtime_min: int | None = None
     year: int | None = None
+    # Audible's own rating, which is what people actually judge an
+    # audiobook on — Goodreads rates the book, and has had no public API
+    # since 2020 anyway. Free and key-less, same call as the cover.
+    rating: float | None = None
+    rating_count: int | None = None
     source: str = "audible"

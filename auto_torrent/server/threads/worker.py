@@ -14,9 +14,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from urllib.parse import quote_plus
 
+from ...audnex import hydrate
 from ..agent import run_agent
-from ..covers import find_cover_url
 from ..jobs.store import JobStore
 from ..settings import Settings
 from .bus import ThreadSink
@@ -33,41 +34,76 @@ settings = Settings()
 CHOICE_ECHO = "That one: {title}"
 
 
-async def _with_covers(options: list[ChoiceOption]) -> list[ChoiceOption]:
-    """Fill in artwork for options that arrived without any.
+def goodreads_search_url(title: str, author: str) -> str:
+    """Where to send someone who wants the reviews.
 
-    "Which edition?" options come from a search, so they carry the scraper's
-    cover. "Which book?" options don't exist anywhere yet — the agent named
-    them from what it knows rather than from a result — so four rows of
-    placeholder glyphs is what a suggestion list would otherwise be, next to an
-    edition list that has real covers.
-
-    Uses the same Audible-then-OpenLibrary lookup as the recommendations shelf.
-    Concurrent because this runs while the user waits on the question: four
-    sequential lookups would be four times the delay for something decorative.
-    `find_cover_url` swallows its own failures and returns None, and the gather
-    is guarded anyway — a missing cover must never cost the question.
+    A search link, not a book link: Goodreads retired its public API in 2020
+    and issues no new keys, so there is no way to resolve a title to its work
+    id. The search page lands on the right book for anything well known, which
+    is every book that reaches this list.
     """
-    missing = [o for o in options if not o.cover_url]
-    if not missing:
+    query = quote_plus(" ".join(p for p in (title, author) if p).strip())
+    return f"https://www.goodreads.com/search?q={query}" if query else ""
+
+
+async def _hydrate(options: list[ChoiceOption]) -> list[ChoiceOption]:
+    """Fill in everything the expanded view needs, from one lookup per option.
+
+    A row can only show a line or two before it stops being scannable, so the
+    description, rating and runtime that someone actually decides on live
+    behind a disclosure — and none of that exists on a "which book?" option,
+    which the agent named from what it knows rather than from a search result.
+
+    Uses the same Audible-then-OpenLibrary pipeline as the recommendations
+    shelf. Concurrent because this runs while the user waits on the question:
+    four sequential lookups would be four times the delay. Guarded throughout —
+    a lookup that fails costs that row its extra detail, never the question.
+    """
+    if not options:
         return options
     try:
-        found = await asyncio.gather(
-            *(asyncio.to_thread(find_cover_url, o.title, o.author) for o in missing),
+        cards = await asyncio.gather(
+            *(asyncio.to_thread(_lookup, o.title, o.author) for o in options),
             return_exceptions=True,
         )
     except Exception:  # noqa: BLE001
-        logger.exception("cover hydration failed")
+        logger.exception("option hydration failed")
         return options
-    urls = {
-        o.index: url
-        for o, url in zip(missing, found)
-        if isinstance(url, str) and url
-    }
-    return [
-        o.model_copy(update={"cover_url": urls[o.index]}) if o.index in urls else o
-        for o in options
-    ]
+
+    out: list[ChoiceOption] = []
+    for option, card in zip(options, cards):
+        patch: dict = {"goodreads_url": goodreads_search_url(option.title, option.author)}
+        if card is not None and not isinstance(card, BaseException):
+            # Never overwrite what the search already knew: an edition's own
+            # cover is of the actual release, and its author came off the
+            # result. Audible fills the gaps, it doesn't correct them.
+            if not option.cover_url and card.cover_url:
+                patch["cover_url"] = card.cover_url
+            if not option.author and card.author:
+                patch["author"] = card.author
+            patch.update(
+                description=card.description or "",
+                rating=card.rating,
+                rating_count=card.rating_count,
+                runtime_min=card.runtime_min,
+                year=card.year,
+            )
+        out.append(option.model_copy(update=patch))
+    return out
+
+
+def _cover_for(title: str, author: str) -> str:
+    card = _lookup(title, author)
+    return (card.cover_url or "") if card else ""
+
+
+def _lookup(title: str, author: str):
+    """Audible/Audnexus card for a title, or None. Never raises."""
+    try:
+        return hydrate(title, author)
+    except Exception:  # noqa: BLE001
+        logger.warning("hydrate failed for %r", title, exc_info=True)
+        return None
 
 
 async def run_thread_turn(
@@ -103,6 +139,15 @@ async def run_thread_turn(
         message and the pending list — both are written here, together, so they
         cannot drift.
         """
+        hydrated = await _hydrate(
+            [option_from_payload(i, o) for i, o in enumerate(options)]
+        )
+        # Carry the artwork back into the pending payload, so choosing a
+        # suggested book doesn't need a second identical lookup just to put a
+        # cover on its download card.
+        for raw, option in zip(options, hydrated):
+            if option.cover_url and not raw.get("cover_url"):
+                raw["cover_url"] = option.cover_url
         await threads.set_pending(thread_id, options)
         # The run of tool calls that produced these options belongs above them.
         await sink.drain()
@@ -110,14 +155,16 @@ async def run_thread_turn(
         await threads.append(
             thread_id,
             Message.new(
-                thread_id,
-                MessageKind.choice,
-                text=question,
-                options=await _with_covers(
-                    [option_from_payload(i, o) for i, o in enumerate(options)]
-                ),
+                thread_id, MessageKind.choice, text=question, options=hydrated
             ),
         )
+
+    # The option the user tapped, if this turn is answering a question.
+    pending_cover = (
+        str((pending_options or [{}])[0].get("cover_url") or "").strip()
+        if pending_options
+        else ""
+    )
 
     try:
         history = render_history(
@@ -154,6 +201,15 @@ async def run_thread_turn(
             await sink.drain()
             await sink.flush_steps()
             job = await jobs.create_direct(thread.profile_id, outcome.title or text)
+            # The cover is already known in the common case — the user tapped a
+            # row that had one — so the download card shows the same book they
+            # chose rather than a generic glyph. Falling back to a lookup keeps
+            # it true for a request that never went through a choice.
+            cover = pending_cover or await asyncio.to_thread(
+                _cover_for, outcome.title, outcome.author
+            )
+            if cover:
+                await jobs.set_cover(job.id, cover)
             await threads.append(
                 thread_id,
                 Message.new(thread_id, MessageKind.job, job_id=job.id),

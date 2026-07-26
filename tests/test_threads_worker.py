@@ -11,6 +11,7 @@ import asyncio
 import pytest
 
 from auto_torrent.server.agent import AgentOutcome
+from auto_torrent.types import BookCard
 from auto_torrent.server.jobs.events import EventLog
 from auto_torrent.server.jobs.store import JobStore
 from auto_torrent.server.threads import worker as worker_mod
@@ -170,7 +171,12 @@ async def test_suggested_books_get_cover_art(ctx, monkeypatch):
     arrives with no artwork — four placeholder glyphs next to an edition list
     that has real covers."""
     monkeypatch.setattr(
-        worker_mod, "find_cover_url", lambda title, author: f"https://img/{title}.jpg"
+        worker_mod,
+        "hydrate",
+        lambda title, author: BookCard(
+            title=title, author=author, cover_url=f"https://img/{title}.jpg",
+            description="blurb", rating=4.6, rating_count=1200, runtime_min=610,
+        ),
     )
     monkeypatch.setattr(
         worker_mod,
@@ -201,9 +207,9 @@ async def test_search_results_keep_their_own_cover(ctx, monkeypatch):
 
     def _spy(title, author):
         calls.append(title)
-        return "https://img/other.jpg"
+        return BookCard(title=title, author=author, cover_url="https://img/other.jpg")
 
-    monkeypatch.setattr(worker_mod, "find_cover_url", _spy)
+    monkeypatch.setattr(worker_mod, "hydrate", _spy)
     monkeypatch.setattr(
         worker_mod,
         "run_agent",
@@ -221,14 +227,13 @@ async def test_search_results_keep_their_own_cover(ctx, monkeypatch):
 
     opts = (await ctx["threads"].messages(thread.id))[0].options
     assert opts[0].cover_url == "https://abb/dune.jpg"
-    assert calls == []
 
 
 async def test_a_failed_cover_lookup_never_costs_the_question(ctx, monkeypatch):
     def _boom(title, author):
         raise RuntimeError("audible down")
 
-    monkeypatch.setattr(worker_mod, "find_cover_url", _boom)
+    monkeypatch.setattr(worker_mod, "hydrate", _boom)
     monkeypatch.setattr(
         worker_mod,
         "run_agent",
@@ -337,7 +342,7 @@ async def test_steps_land_above_the_options_they_produced(ctx, monkeypatch):
         await kw["on_ask"]("Which?", [{"title": "A"}, {"title": "B"}])
         return AgentOutcome(kind="asked", message="Which?", options=[{"title": "A"}])
 
-    monkeypatch.setattr(worker_mod, "find_cover_url", lambda t, a: "")
+    monkeypatch.setattr(worker_mod, "hydrate", lambda t, a: None)
     monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
     thread = await ctx["threads"].create("p1")
 
@@ -360,3 +365,83 @@ async def test_a_crash_still_shows_how_far_it_got(ctx, monkeypatch):
     msgs = await ctx["threads"].messages(thread.id)
     assert msgs[0].kind is MessageKind.steps
     assert [s.text for s in msgs[0].steps] == ["Searching…"]
+
+
+async def test_options_carry_what_the_expanded_view_needs(ctx, monkeypatch):
+    """A row shows a line or two; the rating, blurb and runtime someone
+    actually decides on live behind the disclosure."""
+    monkeypatch.setattr(
+        worker_mod,
+        "hydrate",
+        lambda title, author: BookCard(
+            title=title, author="Susanna Clarke", cover_url="https://img/p.jpg",
+            description="A man in an endless house.", rating=4.4,
+            rating_count=9100, runtime_min=395, year=2020,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "run_agent",
+        _agent_returning(
+            AgentOutcome(kind="asked", message="Which?", options=[{"title": "Piranesi"}])
+        ),
+    )
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "something strange")
+
+    opt = (await ctx["threads"].messages(thread.id))[0].options[0]
+    assert opt.rating == 4.4 and opt.rating_count == 9100
+    assert opt.description == "A man in an endless house."
+    assert opt.runtime_min == 395 and opt.year == 2020
+    # Goodreads retired its API, so this is a search link — no id to resolve.
+    assert opt.goodreads_url.startswith("https://www.goodreads.com/search?q=Piranesi")
+
+
+async def test_the_download_card_gets_the_cover_they_chose(ctx, monkeypatch):
+    """Previously the download showed a generic stage glyph even though the row
+    the user tapped had artwork right there."""
+    async def fake_finish(*, store, bus, job, outcome):
+        pass
+
+    from auto_torrent.server.jobs import worker as jobs_worker
+
+    monkeypatch.setattr(jobs_worker, "finish_agent_outcome", fake_finish)
+    monkeypatch.setattr(
+        worker_mod,
+        "run_agent",
+        _agent_returning(AgentOutcome(kind="committed", title="Dune", author="Frank Herbert")),
+    )
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(
+        ctx, thread.id, "Download Dune", pending_options=[{"cover_url": "https://img/dune.jpg"}]
+    )
+
+    job_id = (await ctx["threads"].messages(thread.id))[0].job_id
+    assert (await ctx["store"].get(job_id)).cover_url == "https://img/dune.jpg"
+
+
+async def test_a_download_with_no_chosen_row_still_finds_a_cover(ctx, monkeypatch):
+    async def fake_finish(*, store, bus, job, outcome):
+        pass
+
+    from auto_torrent.server.jobs import worker as jobs_worker
+
+    monkeypatch.setattr(jobs_worker, "finish_agent_outcome", fake_finish)
+    monkeypatch.setattr(
+        worker_mod,
+        "hydrate",
+        lambda title, author: BookCard(title=title, author=author, cover_url="https://img/looked-up.jpg"),
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "run_agent",
+        _agent_returning(AgentOutcome(kind="committed", title="Dune", author="Frank Herbert")),
+    )
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "dune")
+
+    job_id = (await ctx["threads"].messages(thread.id))[0].job_id
+    assert (await ctx["store"].get(job_id)).cover_url == "https://img/looked-up.jpg"

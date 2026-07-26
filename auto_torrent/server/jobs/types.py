@@ -95,6 +95,11 @@ class Job(BaseModel):
     # is then visible rather than silently in the shared library.
     picked_narrator: str | None = None
     picked_format: str | None = None
+    # Artwork for the card. Known at commit — either from the option the user
+    # tapped or from an Audible lookup on the resolved title — so the download
+    # shows the book rather than a generic stage glyph, and the row matches the
+    # one they chose it from.
+    cover_url: str | None = None
     # The book was already on the shelf, so nothing was downloaded. Not a
     # failure — the user's goal is satisfied — but the card must not claim
     # credit for fetching something it didn't.

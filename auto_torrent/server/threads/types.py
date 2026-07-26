@@ -74,6 +74,22 @@ class ChoiceOption(BaseModel):
     #: choosable rather than a coin toss.
     note: str = ""
 
+    # --- hydrated from Audible, for the expanded view -----------------------
+    # The row can only show a line or two before it stops being scannable, so
+    # everything someone needs to actually decide lives behind a disclosure
+    # rather than being cut off.
+    description: str = ""
+    #: Audible's overall listener rating. Goodreads has had no public API since
+    #: 2020, and this rates the audiobook rather than the book, which is the
+    #: thing being chosen.
+    rating: float | None = None
+    rating_count: int | None = None
+    runtime_min: int | None = None
+    year: int | None = None
+    #: A Goodreads *search* link — no API needed, and it lands on the reviews,
+    #: which is what "check Goodreads" actually means.
+    goodreads_url: str = ""
+
 
 class Step(BaseModel):
     """One thing the agent did, in its own words.

@@ -12,6 +12,8 @@ the recommendation builder; this module stays a pure pipeline.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import html
 import re
 
@@ -155,6 +157,23 @@ def parse_book(data: dict, cover_px: int = 500) -> BookCard:
     )
 
 
+def _rating_of(product: dict) -> tuple[float | None, int | None]:
+    """Audible's overall rating, or (None, None).
+
+    `overall_distribution` is the listener rating for the whole title;
+    `performance_distribution` rates the narration alone. The overall one is
+    what a star next to a title means to someone choosing.
+    """
+    dist = ((product.get("rating") or {}).get("overall_distribution")) or {}
+    average = dist.get("average_rating")
+    count = dist.get("num_ratings")
+    try:
+        return (round(float(average), 1) if average is not None else None,
+                int(count) if count is not None else None)
+    except (TypeError, ValueError):
+        return (None, None)
+
+
 def parse_audible_product(product: dict, cover_px: int = 500) -> BookCard:
     """Audible catalog-search product → BookCard (fallback when Audnexus 404s)."""
     images = product.get("product_images") or {}
@@ -165,6 +184,7 @@ def parse_audible_product(product: dict, cover_px: int = 500) -> BookCard:
     series_list = product.get("series") or []
     series = series_list[0] if series_list else None
     summary = product.get("merchandising_summary") or product.get("short_description") or ""
+    rating, rating_count = _rating_of(product)
     return BookCard(
         title=product.get("title", ""),
         author=_author_of(product),
@@ -177,6 +197,8 @@ def parse_audible_product(product: dict, cover_px: int = 500) -> BookCard:
         series_position=str(series["sequence"]) if series and series.get("sequence") else None,
         runtime_min=product.get("runtime_length_min"),
         year=_year(product.get("release_date")),
+        rating=rating,
+        rating_count=rating_count,
         source="audible",
     )
 
@@ -190,7 +212,7 @@ def search_audible(
         "title": title,
         "num_results": str(limit),
         "products_sort_by": "Relevance",
-        "response_groups": "contributors,product_desc,media,series",
+        "response_groups": "contributors,product_desc,media,series,rating",
         "image_sizes": "500,1024",
     }
     if author:
@@ -252,6 +274,13 @@ def hydrate(title: str, author: str = "", region: str = "uk") -> BookCard | None
                 data = fetch_audnex(asin, region)
             except requests.RequestException:
                 data = None
-        return parse_book(data) if data else parse_audible_product(match)
+        # Audnexus has the better description and genres but carries no
+        # rating, so the search product's rating is grafted on rather than
+        # lost — one call already made, no extra round trip.
+        rating, rating_count = _rating_of(match)
+        card = parse_book(data) if data else parse_audible_product(match)
+        if card.rating is None and rating is not None:
+            card = replace(card, rating=rating, rating_count=rating_count)
+        return card
 
     return _openlibrary_fallback(title, author)

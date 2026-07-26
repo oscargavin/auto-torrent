@@ -131,6 +131,13 @@ class JobStore:
         # TTL must have flapped 3 times — Redis is under heavy churn or there is a bug.
         raise RuntimeError("jobs/store: dedup race did not converge in 3 attempts")
 
+    async def set_cover(self, job_id: str, cover_url: str) -> None:
+        """Artwork for the card. Metadata like set_download_id, so it bypasses
+        the terminal guard — a cancelled job should still show which book it
+        was."""
+        if cover_url:
+            await self._r.hset(_job_key(job_id), "cover_url", cover_url)
+
     async def create_direct(self, profile_id: str, query: str) -> Job:
         """Create a job with no dedup key.
 
