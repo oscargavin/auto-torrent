@@ -18,7 +18,9 @@ from typing import Awaitable, Callable
 from ..cli import _execute_download_bg, _read_state, _resolve_status
 from ..config import STATE_DIR
 from .audiobookshelf import ABSClient
+from .chapters import apply_to_item as name_chapters_for_item
 from .covers import ensure_local_cover
+from .library_match import find_existing
 from .event_types import (
     EVENT_PROGRESS,
     STAGE_IMPORT_FAILED,
@@ -454,7 +456,43 @@ async def poll_and_finalise(
                                           "text": "Downloaded — waiting for the next library scan."})
         raise ImportIncompleteError(display) from e
 
+    # Real chapter names, if the release didn't carry any. Strictly after the
+    # scan, because the item has to exist before it can be given chapters, and
+    # strictly non-fatal: the book is already in the library and a scrub bar
+    # labelled 001–094 is a disappointment, not a failure.
+    await _name_chapters(abs_client, title, author, display)
+
     sms.send(phone, f"✓ {display} is in your library.")
+
+
+# How long to wait for a scan to surface the item we just imported. The scan is
+# asynchronous server-side, so the item is not there the instant it returns.
+_SCAN_SETTLE_ATTEMPTS = 6
+_SCAN_SETTLE_DELAY_S = 5
+
+
+async def _name_chapters(abs_client, title: str, author: str, display: str) -> None:
+    """Give the freshly-imported book Audible's chapter names.
+
+    Swallows everything. This runs after a successful import, so the only
+    outcomes available to it are "the book has better chapters" and "the book
+    has the chapters it already had".
+    """
+    try:
+        item = None
+        for _ in range(_SCAN_SETTLE_ATTEMPTS):
+            items = await abs_client.list_items(settings.abs_library_id)
+            item = find_existing(items, title, author)
+            if item:
+                break
+            await asyncio.sleep(_SCAN_SETTLE_DELAY_S)
+        if not item:
+            logger.info("chapters: %s not visible after scan; skipping", display)
+            return
+        verdict = await name_chapters_for_item(abs_client, item["id"])
+        logger.info("chapters: %s → %s", display, verdict)
+    except Exception:  # noqa: BLE001
+        logger.exception("chapters: failed for %s", display)
 
 
 async def _watch_until_done(download_id: str, *, deadline: float | None = None) -> str:

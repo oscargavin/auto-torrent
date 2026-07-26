@@ -106,6 +106,34 @@ class ABSClient:
             )
             resp.raise_for_status()
 
+    async def get_item(self, item_id: str) -> dict:
+        """One item, expanded — the only shape that carries chapters and the
+        per-file durations the chapter writer checks against."""
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{self._base}/api/items/{item_id}",
+                headers=self._headers,
+                params={"expanded": 1},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def update_chapters(self, item_id: str, chapters: list[dict]) -> None:
+        """Replace an item's chapter list.
+
+        ABS treats this as the whole list, not a patch, so callers must send
+        every chapter they want the item to end up with.
+        """
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self._base}/api/items/{item_id}/chapters",
+                headers=self._headers,
+                json={"chapters": chapters},
+                timeout=30,
+            )
+            resp.raise_for_status()
+
     async def get_libraries(self) -> list[dict]:
         async with httpx.AsyncClient() as client:
             resp = await client.get(

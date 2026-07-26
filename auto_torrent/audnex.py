@@ -236,6 +236,35 @@ def fetch_audnex(asin: str, region: str = "uk") -> dict | None:
     return None if "error" in data else data
 
 
+def fetch_chapters(asin: str, region: str = "uk") -> dict | None:
+    """Audnexus chapter list for an ASIN, or None.
+
+    Shape: {"runtimeLengthMs": int, "chapters": [{"startOffsetSec", "lengthMs",
+    "title"}]}. Offsets are timed against the Audible edition, so a caller must
+    check the runtime matches before trusting them — see server/chapters.py.
+    """
+    resp = requests.get(
+        f"https://api.audnex.us/books/{asin}/chapters",
+        params={"region": region},
+        timeout=_TIMEOUT,
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    data = resp.json()
+    return None if "error" in data else data
+
+
+def find_asin(title: str, author: str = "", region: str = "uk") -> str | None:
+    """The Audible ASIN for a title, or None. Same match rules as `hydrate`."""
+    try:
+        products = search_audible(title, author, region)
+    except requests.RequestException:
+        return None
+    match = best_match(products, title, author) if products else None
+    return match.get("asin") if match else None
+
+
 def _openlibrary_fallback(title: str, author: str) -> BookCard | None:
     try:
         meta = lookup_book(f"{title} {author}".strip())
