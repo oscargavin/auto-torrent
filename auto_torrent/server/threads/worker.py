@@ -11,15 +11,17 @@ the progress rail used to carry.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 from ..agent import run_agent
+from ..covers import find_cover_url
 from ..jobs.store import JobStore
 from ..settings import Settings
 from .bus import ThreadSink
 from .store import ThreadStore, option_from_payload
-from .types import EVENT_ERROR, Message, MessageKind, ThreadStatus
+from .types import EVENT_ERROR, ChoiceOption, Message, MessageKind, ThreadStatus
 
 logger = logging.getLogger("atb.threads.worker")
 settings = Settings()
@@ -28,6 +30,43 @@ settings = Settings()
 # text they never typed. Phrased as the user so the transcript reads as a
 # conversation rather than as a protocol.
 CHOICE_ECHO = "That one: {title}"
+
+
+async def _with_covers(options: list[ChoiceOption]) -> list[ChoiceOption]:
+    """Fill in artwork for options that arrived without any.
+
+    "Which edition?" options come from a search, so they carry the scraper's
+    cover. "Which book?" options don't exist anywhere yet — the agent named
+    them from what it knows rather than from a result — so four rows of
+    placeholder glyphs is what a suggestion list would otherwise be, next to an
+    edition list that has real covers.
+
+    Uses the same Audible-then-OpenLibrary lookup as the recommendations shelf.
+    Concurrent because this runs while the user waits on the question: four
+    sequential lookups would be four times the delay for something decorative.
+    `find_cover_url` swallows its own failures and returns None, and the gather
+    is guarded anyway — a missing cover must never cost the question.
+    """
+    missing = [o for o in options if not o.cover_url]
+    if not missing:
+        return options
+    try:
+        found = await asyncio.gather(
+            *(asyncio.to_thread(find_cover_url, o.title, o.author) for o in missing),
+            return_exceptions=True,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("cover hydration failed")
+        return options
+    urls = {
+        o.index: url
+        for o, url in zip(missing, found)
+        if isinstance(url, str) and url
+    }
+    return [
+        o.model_copy(update={"cover_url": urls[o.index]}) if o.index in urls else o
+        for o in options
+    ]
 
 
 async def run_thread_turn(
@@ -70,7 +109,9 @@ async def run_thread_turn(
                 thread_id,
                 MessageKind.choice,
                 text=question,
-                options=[option_from_payload(i, o) for i, o in enumerate(options)],
+                options=await _with_covers(
+                    [option_from_payload(i, o) for i, o in enumerate(options)]
+                ),
             ),
         )
 

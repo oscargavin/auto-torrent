@@ -161,3 +161,84 @@ async def test_crash_unlocks_the_thread_and_says_so(ctx, monkeypatch):
     msgs = await ctx["threads"].messages(thread.id)
     assert msgs and msgs[-1].kind is MessageKind.assistant
     assert (await ctx["threads"].get(thread.id)).status is ThreadStatus.idle
+
+
+async def test_suggested_books_get_cover_art(ctx, monkeypatch):
+    """A "which book?" list is named from knowledge, not from a search, so it
+    arrives with no artwork — four placeholder glyphs next to an edition list
+    that has real covers."""
+    monkeypatch.setattr(
+        worker_mod, "find_cover_url", lambda title, author: f"https://img/{title}.jpg"
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "run_agent",
+        _agent_returning(
+            AgentOutcome(
+                kind="asked",
+                message="Which?",
+                options=[{"title": "Elantris"}, {"title": "Mistborn"}],
+            )
+        ),
+    )
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "something like sanderson")
+
+    opts = (await ctx["threads"].messages(thread.id))[0].options
+    assert [o.cover_url for o in opts] == [
+        "https://img/Elantris.jpg",
+        "https://img/Mistborn.jpg",
+    ]
+
+
+async def test_search_results_keep_their_own_cover(ctx, monkeypatch):
+    """Editions already carry the scraper's art; re-looking it up would be a
+    wasted round trip and could replace the right cover with a near-miss."""
+    calls: list = []
+
+    def _spy(title, author):
+        calls.append(title)
+        return "https://img/other.jpg"
+
+    monkeypatch.setattr(worker_mod, "find_cover_url", _spy)
+    monkeypatch.setattr(
+        worker_mod,
+        "run_agent",
+        _agent_returning(
+            AgentOutcome(
+                kind="asked",
+                message="Which?",
+                options=[{"title": "Dune", "cover_url": "https://abb/dune.jpg"}],
+            )
+        ),
+    )
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "dune")
+
+    opts = (await ctx["threads"].messages(thread.id))[0].options
+    assert opts[0].cover_url == "https://abb/dune.jpg"
+    assert calls == []
+
+
+async def test_a_failed_cover_lookup_never_costs_the_question(ctx, monkeypatch):
+    def _boom(title, author):
+        raise RuntimeError("audible down")
+
+    monkeypatch.setattr(worker_mod, "find_cover_url", _boom)
+    monkeypatch.setattr(
+        worker_mod,
+        "run_agent",
+        _agent_returning(
+            AgentOutcome(kind="asked", message="Which?", options=[{"title": "Elantris"}])
+        ),
+    )
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "sanderson")
+
+    msgs = await ctx["threads"].messages(thread.id)
+    assert msgs[0].kind is MessageKind.choice
+    assert msgs[0].options[0].cover_url == ""
+    assert (await ctx["threads"].get(thread.id)).status is ThreadStatus.awaiting_choice
