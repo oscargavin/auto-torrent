@@ -432,6 +432,26 @@ async def run_agent(
 
     # ---- Tools ----
 
+    def _already_ended() -> dict | None:
+        """Refuse a second terminal tool call in one turn.
+
+        The SDK loop `continue`s once an outcome is set rather than stopping, so
+        nothing prevented the agent from calling `ask_user_to_pick` and then
+        `commit_download` — observed live: it asked which edition, then started
+        one anyway, and the user was shown a question that had already been
+        answered for them by a download they never chose.
+        """
+        if state["outcome"] is None:
+            return None
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "this turn has already ended; stop calling tools",
+                }
+            ]
+        }
+
     @tool(
         name="search_audiobookbay",
         description="Search AudiobookBay for an audiobook. Returns up to `limit` ranked results. Each result has index, title, author, narrator, format, size, score, magnet, cover_url, description excerpt.",
@@ -515,6 +535,8 @@ async def run_agent(
         input_schema={"kind": str, "question": str, "options": list},
     )
     async def ask_user_to_pick(args: dict) -> dict:
+        if (ended := _already_ended()) is not None:
+            return ended
         options = args.get("options") or []
         if not options:
             return {"content": [{"type": "text", "text": "error: no options"}]}
@@ -572,6 +594,8 @@ async def run_agent(
         input_schema={"text": str},
     )
     async def reply(args: dict) -> dict:
+        if (ended := _already_ended()) is not None:
+            return ended
         text = (args.get("text") or "").strip()
         if not text:
             return {"content": [{"type": "text", "text": "error: empty reply"}]}
@@ -616,6 +640,8 @@ async def run_agent(
         input_schema={"primary": dict, "fallbacks": list},
     )
     async def commit_download(args: dict) -> dict:
+        if (ended := _already_ended()) is not None:
+            return ended
         primary = args.get("primary") or {}
         fallbacks = args.get("fallbacks") or []
 
