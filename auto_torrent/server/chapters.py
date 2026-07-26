@@ -138,6 +138,24 @@ def runtimes_agree(item_s: float, audible_s: float) -> bool:
     return abs(item_s - audible_s) <= allowed
 
 
+def search_titles(title: str) -> list[str]:
+    """Progressively simpler titles to search Audible with, most specific first.
+
+    `title_variants` handles the subtitle case but leaves bracketed editions
+    alone, and library titles are full of them: "Dune (Unabridged)", "The Girl
+    Who Kicked the Hornet's Nest (Millenium 3)". Audible's catalogue does not
+    carry those suffixes, so the search returned nothing and the book was
+    written off as not being on Audible at all.
+    """
+    seen: list[str] = []
+    for base in title_variants(title):
+        for candidate in (base, _EDITION.sub(" ", base)):
+            cleaned = re.sub(r"\s{2,}", " ", candidate).strip(" -–—:")
+            if cleaned and cleaned not in seen:
+                seen.append(cleaned)
+    return seen
+
+
 def lookup(title: str, author: str, region: str = "uk") -> AudibleChapters | None:
     """Audible's chapter list for a book, or None.
 
@@ -145,7 +163,7 @@ def lookup(title: str, author: str, region: str = "uk") -> AudibleChapters | Non
     subtitles that match nothing.
     """
     who = clean_author(author)
-    for variant in title_variants(title):
+    for variant in search_titles(title):
         try:
             asin = find_asin(variant, who, region)
             if not asin:
