@@ -14,21 +14,30 @@ from typing import AsyncIterator, Final
 from redis.asyncio import Redis
 
 
-def _stream_key(job_id: str) -> str:
-    return f"job:{job_id}:events"
-
-
 class EventLog:
-    def __init__(self, redis: Redis, *, stream_max_len: int = 1000) -> None:
+    """Append-only event stream, addressed by an opaque id.
+
+    `prefix` namespaces the Redis key so the same implementation backs both the
+    per-job stream (`job:{id}:events`) and the per-thread one
+    (`thread:{id}:events`). The two must not share a key: a thread outlives the
+    jobs inside it, so a shared stream would expire on the first job's terminal
+    event and take the conversation with it.
+    """
+
+    def __init__(self, redis: Redis, *, prefix: str = "job", stream_max_len: int = 1000) -> None:
         self._r: Final[Redis] = redis
+        self._prefix = prefix
         self._max_len = stream_max_len
+
+    def _stream_key(self, job_id: str) -> str:
+        return f"{self._prefix}:{job_id}:events"
 
     async def publish(self, job_id: str, type: str, data: dict | None = None) -> str:
         """Append an event; returns the stream-assigned ID."""
         fields = {"type": type, "data": json.dumps(data or {})}
         # MAXLEN ~ N: approximate trim, cheaper than exact.
         event_id = await self._r.xadd(
-            _stream_key(job_id),
+            self._stream_key(job_id),
             fields,
             maxlen=self._max_len,
             approximate=True,
@@ -38,7 +47,7 @@ class EventLog:
     async def expire(self, job_id: str, ttl_s: int) -> None:
         """Set a TTL on the stream key — call after a terminal event so the
         stream GC's alongside the job hash."""
-        await self._r.expire(_stream_key(job_id), ttl_s)
+        await self._r.expire(self._stream_key(job_id), ttl_s)
 
     async def subscribe(
         self,
@@ -54,7 +63,7 @@ class EventLog:
         block_ms = int(idle_timeout_s * 1000)
         while True:
             result = await self._r.xread(
-                {_stream_key(job_id): cursor},
+                {self._stream_key(job_id): cursor},
                 block=block_ms,
                 count=100,
             )

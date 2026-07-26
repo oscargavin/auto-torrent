@@ -53,6 +53,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     from .jobs.api import build_router
     from .jobs.events import EventLog
     from .jobs.store import JobStore
+    from .threads.api import build_router as build_threads_router
+    from .threads.store import ThreadStore
 
     logging.basicConfig(
         level=logging.INFO,
@@ -70,10 +72,24 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         dedup_ttl_s=settings.job_dedup_ttl_s,
     )
 
+    # Separate key prefix, not a shared stream: a thread outlives the jobs
+    # inside it, so sharing would expire the conversation on the first job's
+    # terminal event.
+    thread_log = EventLog(redis, prefix="thread")
+    threads = ThreadStore(redis, thread_log, state_ttl_s=settings.job_state_ttl_s)
+
     async def enqueue(job_id: str) -> None:
         await arq_pool.enqueue_job("run_chat_job", job_id)
 
+    async def enqueue_turn(
+        thread_id: str, text: str, pending: list[dict] | None
+    ) -> None:
+        await arq_pool.enqueue_job("run_thread_turn", thread_id, text, pending)
+
     _app.include_router(build_router(store=store, log=log, enqueue=enqueue))
+    _app.include_router(
+        build_threads_router(threads=threads, log=thread_log, enqueue_turn=enqueue_turn)
+    )
 
     try:
         yield

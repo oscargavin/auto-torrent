@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import Awaitable, Callable, Literal
 
 from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, query, tool
 
@@ -104,6 +104,52 @@ When the request is loose or the results are ambiguous, decide yourself using
 the CHOOSING rules and commit to the best candidate. Say in the announce what
 you picked and why, so they can see the call you made. Only skip committing
 when nothing plausibly matches."""
+
+# Appended for the in-app conversation, where the answer comes back as a tap on
+# a card rather than as a text message. Asking is cheap here, so the SMS-era
+# "only when truly ambiguous" is too conservative — but a question the user has
+# no basis to answer is worse than a decision, so the bar is "the options differ
+# in a way they can see", not "more than one result exists".
+APP_ASK_CLAUSE = """
+
+THIS IS THE APP, NOT SMS.
+The user sees your options as tappable cards with cover art, and answers with
+one tap. That makes asking cheap — but only worth doing when the choice is real.
+
+Ask (ask_user_to_pick) when:
+- The request maps to more than one plausible BOOK ("the Dune one", an author
+  with several famous works, a title used by two different books).
+- The editions differ in a way the user would care about and can see: a
+  different narrator, unabridged vs abridged, a single book vs a collection.
+
+Do NOT ask when:
+- They said "surprise me" or gave a vibe. Choose, and say why.
+- The results differ only in file size, bitrate or release group. Pick the best
+  one; they cannot meaningfully answer that.
+- There is one obvious right answer.
+
+When you ask, give 2-4 options, and put a SHORT `note` on each saying what
+makes it different — "unabridged, Stephen Fry" or "the whole trilogy". The note
+is the only thing distinguishing two rows with the same title, so never leave it
+empty and never repeat the title inside it.
+
+Say one short line before asking, so the cards have context.
+
+FOLLOW-UPS. The conversation continues. They may reply to what you just did:
+"something shorter", "anything else by her", "no, the other one". Earlier
+messages are above — read them, and treat a follow-up as referring to what was
+just discussed rather than as a fresh request."""
+
+
+def _system_prompt(allow_ask: bool, is_app: bool) -> str:
+    """One place that decides what the agent is allowed to do this turn.
+
+    Three channels, three shapes: the app can ask and gets the follow-up rules,
+    SMS can ask but only in text, and the bare jobs path cannot ask at all.
+    """
+    if is_app:
+        return SYSTEM_PROMPT + APP_ASK_CLAUSE
+    return SYSTEM_PROMPT if allow_ask else SYSTEM_PROMPT + NO_ASK_CLAUSE
 
 
 @dataclass
@@ -268,16 +314,27 @@ async def run_agent(
     sms: SMSClient,
     pending_options: list[dict] | None = None,
     allow_ask: bool = True,
+    on_ask: Callable[[list[dict]], Awaitable[None]] | None = None,
+    history: list[tuple[str, str]] | None = None,
 ) -> AgentOutcome:
     """Run the concierge agent for one request.
 
     `allow_ask` is about the CALLER's ability to deliver an answer, not about
     which channel it is — SMS keys pending options by a stable phone number and
     the legacy /chat route by a client-supplied session_id, so both can resolve
-    a pick. The jobs worker passes a fresh uuid per job into a process-local
+    a pick. The bare jobs worker passes a fresh uuid per job into a process-local
     store in the wrong process, so `ask_user_to_pick` there wrote state nothing
     would ever read and left the user a numbered list they could not answer.
+
+    `on_ask` is the modern answer to that: the thread worker passes a callback
+    that persists the options in Redis and appends a choice message, which the
+    app renders as tappable cards. Supplying it implies allow_ask.
+
+    `history` is (role, text) for the earlier turns of a conversation, oldest
+    first. Only the thread channel has any; SMS and the bare jobs path pass
+    None and behave exactly as before.
     """
+    allow_ask = allow_ask or on_ask is not None
     state: dict = {"outcome": None}
     # The agent searches more than once when the first pass doesn't satisfy it.
     # Observed live: three rounds emitting "Found 10 copies — checking each…"
@@ -355,13 +412,27 @@ async def run_agent(
 
     @tool(
         name="ask_user_to_pick",
-        description="Present a numbered list to the user and end this turn. Each option: {label, magnet, title, author, narrator}. Only call when results are genuinely ambiguous after analysis.",
+        description=(
+            "Ask the user to choose, and end this turn. Each option: "
+            "{label, magnet, title, author, narrator, format, size, cover_url, note}. "
+            "`note` is a SHORT phrase saying what makes this option different from "
+            "the others ('unabridged, Stephen Fry'); it is what the user actually "
+            "chooses on. Give 2-4 options."
+        ),
         input_schema={"options": list},
     )
     async def ask_user_to_pick(args: dict) -> dict:
         options = args.get("options") or []
         if not options:
             return {"content": [{"type": "text", "text": "error: no options"}]}
+
+        # The app channel delivers the question as tappable cards and persists
+        # the magnets server-side, so it takes the whole payload. SMS can only
+        # send text, so it falls through to the numbered list below.
+        if on_ask is not None:
+            await on_ask(options)
+            state["outcome"] = AgentOutcome(kind="asked", options=options)
+            return {"content": [{"type": "text", "text": "asked user; conversation ended"}]}
 
         # Store as 'pending_results' so digit replies in app.py resolve them.
         store_pending_results(phone, [
@@ -448,7 +519,13 @@ async def run_agent(
 
     server = create_sdk_mcp_server(name="atb", tools=tools)
 
-    user_prompt_parts = [f"User texted: {raw_query!r}"]
+    user_prompt_parts: list[str] = []
+    if history:
+        # Oldest first, so the last line before the new request is the most
+        # recent thing that happened — which is what a follow-up refers to.
+        rendered = "\n".join(f"{role}: {text}" for role, text in history)
+        user_prompt_parts.append(f"Earlier in this conversation:\n{rendered}\n")
+    user_prompt_parts.append(f"User said: {raw_query!r}")
     if pending_options:
         formatted = "\n".join(
             f"{i+1}. {o.get('title','?')} (narrator: {o.get('narrator','?')}, author: {o.get('author','?')})"
@@ -476,7 +553,7 @@ async def run_agent(
             options=ClaudeAgentOptions(
                 model=AGENT_MODEL,
                 max_turns=AGENT_MAX_TURNS,
-                system_prompt=SYSTEM_PROMPT if allow_ask else SYSTEM_PROMPT + NO_ASK_CLAUSE,
+                system_prompt=_system_prompt(allow_ask, on_ask is not None),
                 mcp_servers={"atb": server},
                 allowed_tools=allowed_tools,
             ),

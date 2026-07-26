@@ -131,6 +131,25 @@ class JobStore:
         # TTL must have flapped 3 times — Redis is under heavy churn or there is a bug.
         raise RuntimeError("jobs/store: dedup race did not converge in 3 attempts")
 
+    async def create_direct(self, profile_id: str, query: str) -> Job:
+        """Create a job with no dedup key.
+
+        For a conversation, where the agent has already decided what to fetch
+        and the job record exists to track that specific download. Dedup is
+        wrong here in both directions: two turns can legitimately resolve to
+        the same title (the user changed their mind back), and a dedup hit
+        would silently attach the new turn to an older job whose card is
+        already terminal.
+        """
+        job = Job.new(profile_id, query)
+        job.status = JobStatus.running
+        async with self._r.pipeline(transaction=True) as pipe:
+            pipe.hset(_job_key(job.id), mapping=job.to_redis_hash())
+            pipe.expire(_job_key(job.id), self._state_ttl)
+            pipe.zadd(_profile_key(profile_id), {job.id: job.created_at})
+            await pipe.execute()
+        return job
+
     async def _fetch(self, job_id: str) -> Job | None:
         """Raw read, no reaping. Used by writers so a reap can't recurse."""
         data = await self._r.hgetall(_job_key(job_id))

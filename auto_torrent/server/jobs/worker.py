@@ -9,7 +9,7 @@ from typing import Any
 
 from arq.connections import RedisSettings
 
-from ..agent import run_agent
+from ..agent import AgentOutcome, run_agent
 from ..audiobookshelf import ABSClient
 from ..event_types import STAGE_SEARCHING
 from ..library_match import find_existing
@@ -21,7 +21,7 @@ from ...cli import _read_state
 from .bus import StreamEventBus
 from .events import EventLog
 from .store import JobStore
-from .types import TERMINAL_STATUSES, FailureClass, JobStatus
+from .types import TERMINAL_STATUSES, FailureClass, Job, JobStatus
 
 logger = logging.getLogger("atb.jobs.worker")
 settings = Settings()
@@ -88,8 +88,44 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
         # one — so it never once returned anything. allow_ask=False stops the
         # agent generating a question this channel cannot carry an answer to.
         outcome = await run_agent(job.query, job.id, settings, bus, allow_ask=False)
+        await finish_agent_outcome(store=store, bus=bus, job=job, outcome=outcome)
 
-        if outcome.kind == "committed":
+    except asyncio.CancelledError:
+        logger.info("run_chat_job: cancelled (likely SIGTERM) for %s", job_id)
+        # update_status publishes the terminal event; no separate emit.
+        await store.update_status(
+            job.id,
+            JobStatus.failed,
+            error="This one was stopped before it finished.",
+            failure_class=FailureClass.infra_error,
+        )
+        raise
+    except Exception:  # noqa: BLE001
+        # The traceback goes to the log, where it's useful. What reaches the
+        # card is what a family member can act on — "RuntimeError: ..." is not.
+        logger.exception("run_chat_job crashed for %s", job_id)
+        await store.update_status(
+            job.id,
+            JobStatus.failed,
+            error="Something went wrong on the server.",
+            failure_class=FailureClass.infra_error,
+        )
+
+
+async def finish_agent_outcome(
+    *, store: JobStore, bus: Any, job: Job, outcome: AgentOutcome
+) -> None:
+    """Everything that happens after the agent stops talking.
+
+    Extracted so the conversational path can reuse it verbatim. That path
+    creates its job only once the agent commits (a turn that ends in a question
+    downloads nothing, so inventing a job for it would put a card on screen
+    with no honest status to show), which means it arrives here with a job the
+    bare path already had. From this point the two are identical, and this is
+    the half holding the cancel races, the library check and the poll budget —
+    exactly the code that must not be forked.
+    """
+    if outcome.kind == "committed":
             clear_conversation(job.id)
             await store.set_picked_book(
                 job.id,
@@ -208,7 +244,7 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                     picked_author=outcome.author,
                     failure_class=_as_failure_class(result.failure_class),
                 )
-        else:
+    else:
             # asked / no_results / error — the agent has already published its
             # own progress narration. The terminal event comes from
             # update_status, not from here: the old guard also required
@@ -224,32 +260,16 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
                 failure_class=FailureClass.not_found,
             )
 
-    except asyncio.CancelledError:
-        logger.info("run_chat_job: cancelled (likely SIGTERM) for %s", job_id)
-        # update_status publishes the terminal event; no separate emit.
-        await store.update_status(
-            job.id,
-            JobStatus.failed,
-            error="This one was stopped before it finished.",
-            failure_class=FailureClass.infra_error,
-        )
-        raise
-    except Exception:  # noqa: BLE001
-        # The traceback goes to the log, where it's useful. What reaches the
-        # card is what a family member can act on — "RuntimeError: ..." is not.
-        logger.exception("run_chat_job crashed for %s", job_id)
-        await store.update_status(
-            job.id,
-            JobStatus.failed,
-            error="Something went wrong on the server.",
-            failure_class=FailureClass.infra_error,
-        )
+
+# Imported here rather than at module top: threads.worker imports
+# finish_agent_outcome from this module, so a top-level import would be circular.
+from ..threads.worker import run_thread_turn  # noqa: E402
 
 
 class WorkerSettings:
     """arq config — `arq auto_torrent.server.jobs.worker.WorkerSettings`."""
 
-    functions = [run_chat_job]
+    functions = [run_chat_job, run_thread_turn]
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     max_jobs = 4  # modest concurrency; downloads are I/O-bound but ABS scans are heavy
     # Deliberately ABOVE the poll layer's own JOB_BUDGET_S so arq is a backstop
@@ -265,15 +285,22 @@ class WorkerSettings:
     async def on_startup(ctx: dict[str, Any]) -> None:
         from redis.asyncio import Redis
 
+        from ..threads.store import ThreadStore
+
         redis = Redis.from_url(settings.redis_url, decode_responses=True)
         log = EventLog(redis)
+        thread_log = EventLog(redis, prefix="thread")
         ctx["redis"] = redis
         ctx["log"] = log
+        ctx["thread_log"] = thread_log
         ctx["store"] = JobStore(
             redis,
             log,
             state_ttl_s=settings.job_state_ttl_s,
             dedup_ttl_s=settings.job_dedup_ttl_s,
+        )
+        ctx["threads"] = ThreadStore(
+            redis, thread_log, state_ttl_s=settings.job_state_ttl_s
         )
 
     @staticmethod
