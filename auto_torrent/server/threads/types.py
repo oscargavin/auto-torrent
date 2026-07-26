@@ -27,6 +27,12 @@ class MessageKind(str, enum.Enum):
 
     user = "user"
     assistant = "assistant"
+    #: What the agent did before it spoke — a run of tool calls, grouped and
+    #: collapsed. Persisted rather than ephemeral so the conversation still
+    #: reads as a history tomorrow: "why did it pick that?" is answered by the
+    #: steps, and throwing them away on the next turn is what made the old
+    #: single-line activity row feel like a status bar rather than a chat.
+    steps = "steps"
     #: A question with tappable answers. `options` is populated; `chosen_index`
     #: fills in once answered, so the card can render its resolved state rather
     #: than vanishing.
@@ -69,6 +75,19 @@ class ChoiceOption(BaseModel):
     note: str = ""
 
 
+class Step(BaseModel):
+    """One thing the agent did, in its own words.
+
+    `at` is when the step started, so the client can show how long a group took
+    without the server having to compute it — the last step's duration is
+    open-ended until the group closes.
+    """
+
+    text: str
+    stage: str = ""
+    at: float
+
+
 class Message(BaseModel):
     id: str
     thread_id: str
@@ -78,6 +97,7 @@ class Message(BaseModel):
     options: list[ChoiceOption] = Field(default_factory=list)
     chosen_index: int | None = None
     job_id: str | None = None
+    steps: list[Step] = Field(default_factory=list)
 
     @classmethod
     def new(cls, thread_id: str, kind: MessageKind, **kw) -> Self:

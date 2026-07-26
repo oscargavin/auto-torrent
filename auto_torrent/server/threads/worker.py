@@ -104,6 +104,9 @@ async def run_thread_turn(
         cannot drift.
         """
         await threads.set_pending(thread_id, options)
+        # The run of tool calls that produced these options belongs above them.
+        await sink.drain()
+        await sink.flush_steps()
         await threads.append(
             thread_id,
             Message.new(
@@ -148,6 +151,8 @@ async def run_thread_turn(
 
         if outcome.kind == "committed":
             await threads.clear_pending(thread_id)
+            await sink.drain()
+            await sink.flush_steps()
             job = await jobs.create_direct(thread.profile_id, outcome.title or text)
             await threads.append(
                 thread_id,
@@ -164,6 +169,8 @@ async def run_thread_turn(
         # no_results / error. The agent usually said its piece through `send`
         # already; this is the backstop for when it didn't, so a turn can never
         # end in silence.
+        await sink.drain()
+        await sink.flush_steps()
         if not sink.messaged:
             await threads.append(
                 thread_id,
@@ -177,6 +184,10 @@ async def run_thread_turn(
 
     except Exception:  # noqa: BLE001
         logger.exception("run_thread_turn crashed for %s", thread_id)
+        # Whatever it managed before dying is still worth showing — it is often
+        # the only clue about where it got to.
+        await sink.drain()
+        await sink.flush_steps()
         # Two separate obligations: tell the user (a message they can read and
         # reply to) and unlock the composer (status). Doing only the first
         # leaves them typing into a thread that will never answer.

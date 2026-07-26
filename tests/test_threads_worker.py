@@ -266,3 +266,97 @@ async def test_a_question_is_answered_not_searched_for(ctx, monkeypatch):
     # No download, no question, composer handed straight back.
     assert await ctx["store"].list_for_profile("p1") == []
     assert (await ctx["threads"].get(thread.id)).status is ThreadStatus.idle
+
+
+async def test_tool_calls_persist_as_a_group_above_the_reply(ctx, monkeypatch):
+    """The old activity row replaced each line with the next, so by the time
+    the agent spoke the whole chain was gone. A conversation has to still show
+    what it did tomorrow."""
+    async def fake_run_agent(raw_query, phone, settings, sms, **kw):
+        await sms.emit_async("progress", {"stage": "searching", "text": "Searching…"})
+        await sms.emit_async("progress", {"stage": "searching", "text": "Found 8 copies…"})
+        await asyncio.to_thread(sms.send, phone, "Found it. Downloading now.")
+        return AgentOutcome(kind="replied", message="Found it. Downloading now.")
+
+    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "dune")
+
+    msgs = await ctx["threads"].messages(thread.id)
+    assert [m.kind for m in msgs] == [MessageKind.steps, MessageKind.assistant]
+    assert [s.text for s in msgs[0].steps] == ["Searching…", "Found 8 copies…"]
+
+
+async def test_a_repeated_narration_is_one_step(ctx, monkeypatch):
+    """The agent calls a tool as many times as it likes — probing three magnets
+    emitted the same line three times, which reads as a stuck list."""
+    async def fake_run_agent(raw_query, phone, settings, sms, **kw):
+        for _ in range(3):
+            await sms.emit_async("progress", {"text": "Checking who's sharing it…"})
+        await asyncio.to_thread(sms.send, phone, "Done.")
+        return AgentOutcome(kind="replied", message="Done.")
+
+    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "dune")
+
+    steps = (await ctx["threads"].messages(thread.id))[0].steps
+    assert [s.text for s in steps] == ["Checking who's sharing it…"]
+
+
+async def test_text_between_tool_calls_starts_a_new_group(ctx, monkeypatch):
+    """The chain-of-thought boundary rule: assistant text breaks the run."""
+    async def fake_run_agent(raw_query, phone, settings, sms, **kw):
+        await sms.emit_async("progress", {"text": "Searching…"})
+        await asyncio.to_thread(sms.send, phone, "Two versions of this one.")
+        await sms.emit_async("progress", {"text": "Checking the covers…"})
+        await asyncio.to_thread(sms.send, phone, "Got it.")
+        return AgentOutcome(kind="replied", message="Got it.")
+
+    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "dune")
+
+    msgs = await ctx["threads"].messages(thread.id)
+    assert [m.kind for m in msgs] == [
+        MessageKind.steps,
+        MessageKind.assistant,
+        MessageKind.steps,
+        MessageKind.assistant,
+    ]
+    assert [s.text for s in msgs[0].steps] == ["Searching…"]
+    assert [s.text for s in msgs[2].steps] == ["Checking the covers…"]
+
+
+async def test_steps_land_above_the_options_they_produced(ctx, monkeypatch):
+    async def fake_run_agent(raw_query, phone, settings, sms, **kw):
+        await sms.emit_async("progress", {"text": "Searching…"})
+        await kw["on_ask"]("Which?", [{"title": "A"}, {"title": "B"}])
+        return AgentOutcome(kind="asked", message="Which?", options=[{"title": "A"}])
+
+    monkeypatch.setattr(worker_mod, "find_cover_url", lambda t, a: "")
+    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "dune")
+
+    msgs = await ctx["threads"].messages(thread.id)
+    assert [m.kind for m in msgs] == [MessageKind.steps, MessageKind.choice]
+
+
+async def test_a_crash_still_shows_how_far_it_got(ctx, monkeypatch):
+    async def fake_run_agent(raw_query, phone, settings, sms, **kw):
+        await sms.emit_async("progress", {"text": "Searching…"})
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "dune")
+
+    msgs = await ctx["threads"].messages(thread.id)
+    assert msgs[0].kind is MessageKind.steps
+    assert [s.text for s in msgs[0].steps] == ["Searching…"]
