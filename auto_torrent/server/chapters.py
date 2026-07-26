@@ -20,12 +20,13 @@ writes it onto the item, under two rules that keep it from doing harm:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
 
 from ..audnex import fetch_chapters, find_asin
-from .covers import clean_author, title_variants
+from .covers import clean_author, item_title_author, title_variants
 
 logger = logging.getLogger("atb.chapters")
 
@@ -138,24 +139,6 @@ def runtimes_agree(item_s: float, audible_s: float) -> bool:
     return abs(item_s - audible_s) <= allowed
 
 
-def search_titles(title: str) -> list[str]:
-    """Progressively simpler titles to search Audible with, most specific first.
-
-    `title_variants` handles the subtitle case but leaves bracketed editions
-    alone, and library titles are full of them: "Dune (Unabridged)", "The Girl
-    Who Kicked the Hornet's Nest (Millenium 3)". Audible's catalogue does not
-    carry those suffixes, so the search returned nothing and the book was
-    written off as not being on Audible at all.
-    """
-    seen: list[str] = []
-    for base in title_variants(title):
-        for candidate in (base, _EDITION.sub(" ", base)):
-            cleaned = re.sub(r"\s{2,}", " ", candidate).strip(" -–—:")
-            if cleaned and cleaned not in seen:
-                seen.append(cleaned)
-    return seen
-
-
 def lookup(title: str, author: str, region: str = "uk") -> AudibleChapters | None:
     """Audible's chapter list for a book, or None.
 
@@ -163,7 +146,7 @@ def lookup(title: str, author: str, region: str = "uk") -> AudibleChapters | Non
     subtitles that match nothing.
     """
     who = clean_author(author)
-    for variant in search_titles(title):
+    for variant in title_variants(title):
         try:
             asin = find_asin(variant, who, region)
             if not asin:
@@ -224,8 +207,6 @@ async def apply_to_item(abs_client, item_id: str, *, dry_run: bool = False) -> d
     that has already succeeded, and a chapter list is never worth failing a
     download over.
     """
-    import asyncio
-
     try:
         item = await abs_client.get_item(item_id)
     except Exception:  # noqa: BLE001
@@ -233,9 +214,7 @@ async def apply_to_item(abs_client, item_id: str, *, dry_run: bool = False) -> d
         return {"applied": False, "reason": "item_unreadable"}
 
     media = item.get("media") or {}
-    meta = media.get("metadata") or {}
-    title = meta.get("title") or ""
-    author = meta.get("authorName") or ""
+    title, author = item_title_author(item)
 
     if not worth_replacing(media.get("chapters") or [], title):
         return {"applied": False, "reason": "already_named", "title": title}

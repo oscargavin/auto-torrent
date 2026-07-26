@@ -4,59 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from typing import Any
 
 from arq.connections import RedisSettings
 
-from ..agent import AgentOutcome, run_agent
-from ..audiobookshelf import ABSClient
+from ..agent import run_agent
 from ..event_types import STAGE_SEARCHING
-from ..library_match import find_existing
-from ..app import _emit_download_and_poll  # re-uses the existing pump
-from ..llm import clear_conversation
 from ..settings import Settings
-from ..worker import JOB_BUDGET_S, _kill_download_and_clean
-from ...cli import _read_state
+from ..threads.worker import run_thread_turn
+from ..worker import JOB_BUDGET_S
 from .bus import StreamEventBus
 from .events import EventLog
+from .finish import finish_agent_outcome
 from .store import JobStore
-from .types import TERMINAL_STATUSES, FailureClass, Job, JobStatus
+from .types import TERMINAL_STATUSES, FailureClass, JobStatus
 
 logger = logging.getLogger("atb.jobs.worker")
 settings = Settings()
-
-
-def _as_failure_class(raw: str | None) -> FailureClass:
-    """Map the download layer's string onto the wire enum.
-
-    The download layer carries plain strings on its exception classes so it
-    doesn't have to import the jobs vocabulary. Anything unrecognised becomes
-    infra_error rather than raising — a classification bug must not turn into
-    a second failure while we're already handling the first.
-    """
-    try:
-        return FailureClass(raw or "")
-    except ValueError:
-        logger.warning("unmapped failure_class %r, recording as infra_error", raw)
-        return FailureClass.infra_error
-
-
-async def _already_in_library(title: str, author: str) -> bool:
-    """Is this book already on the shelf?
-
-    Never raises: a library that can't be reached must not fail an otherwise
-    good download. The cost of the check being unavailable is a duplicate, and
-    the cost of it throwing is losing the book entirely.
-    """
-    if not title:
-        return False
-    try:
-        items = await ABSClient(settings).list_items(settings.abs_library_id)
-    except Exception:  # noqa: BLE001
-        logger.warning("duplicate check skipped: library list failed", exc_info=True)
-        return False
-    return find_existing(items, title, author) is not None
 
 
 async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
@@ -111,159 +75,6 @@ async def run_chat_job(ctx: dict[str, Any], job_id: str) -> None:
             failure_class=FailureClass.infra_error,
         )
 
-
-async def finish_agent_outcome(
-    *, store: JobStore, bus: Any, job: Job, outcome: AgentOutcome
-) -> None:
-    """Everything that happens after the agent stops talking.
-
-    Extracted so the conversational path can reuse it verbatim. That path
-    creates its job only once the agent commits (a turn that ends in a question
-    downloads nothing, so inventing a job for it would put a card on screen
-    with no honest status to show), which means it arrives here with a job the
-    bare path already had. From this point the two are identical, and this is
-    the half holding the cancel races, the library check and the poll budget —
-    exactly the code that must not be forked.
-    """
-    if outcome.kind == "committed":
-            clear_conversation(job.id)
-            await store.set_picked_book(
-                job.id,
-                title=outcome.title,
-                author=outcome.author,
-                narrator=outcome.narrator,
-                file_format=outcome.file_format,
-            )
-            # The agent has already spawned the download subprocess; register
-            # its state-file id against the job so a subsequent DELETE can find
-            # the running PID + landing path and tear them down.
-            download_id = (outcome.download or {}).get("id")
-            if download_id:
-                await store.set_download_id(job.id, download_id)
-
-            # Only now do we know which book this actually is: the agent
-            # resolves "something like Project Hail Mary" into a title, and the
-            # user's own words may match nothing in the library while the
-            # resolved book is already sitting on the shelf. Checking here also
-            # covers requests that never went through the app at all.
-            if await _already_in_library(outcome.title, outcome.author):
-                logger.info(
-                    "run_chat_job: %s resolved to %r, already in library — not downloading",
-                    job.id,
-                    outcome.title,
-                )
-                # The agent has already spawned the download; stop it and clean
-                # the partial, exactly as a user cancel would.
-                if download_id:
-                    state = _read_state(download_id)
-                    if state:
-                        await _kill_download_and_clean(state)
-                await store.update_status(
-                    job.id,
-                    JobStatus.succeeded,
-                    picked_title=outcome.title,
-                    picked_author=outcome.author,
-                    already_had=True,
-                )
-                return
-
-            # Re-check status: cancel may have fired during the agent's search
-            # (which can take 10–30s). If so, skip the poll — _emit_download
-            # would otherwise loop on the subprocess that cancel_job is about
-            # to kill (or already killed), producing a confusing extra error
-            # event after the user already saw cancelled.
-            current = await store.get(job.id)
-            if current and current.status == JobStatus.cancelled:
-                logger.info(
-                    "run_chat_job: %s cancelled during agent run; not entering poll",
-                    job.id,
-                )
-                # Race close-out: cancel_job's DELETE handler may have read
-                # download_id as None (set_download_id above hadn't landed yet)
-                # and skipped the kill. We just registered the download_id, so
-                # we own the responsibility to kill the orphan subprocess.
-                if download_id:
-                    state = _read_state(download_id)
-                    if state:
-                        await _kill_download_and_clean(state)
-                return
-            # Keep the store's download_id current as poll_and_finalise swaps
-            # to fallback magnets on stall — otherwise cancel would kill (or
-            # try to kill) the dead original instead of the running fallback,
-            # and the fallback would land in the library against the user's
-            # cancel intent.
-            async def _track_download_change(new_id: str) -> None:
-                await store.set_download_id(job.id, new_id)
-
-            # `ok` is true only if the book actually landed in the library;
-            # otherwise `failure_class` says why. Every abandon path — no
-            # candidates left, unknown poll outcome, lost state file, failed
-            # import — comes back here as a failure rather than sliding
-            # through as success.
-            result = await _emit_download_and_poll(
-                bus,
-                download=outcome.download or {},
-                fallbacks=outcome.fallbacks,
-                display=outcome.display,
-                title=outcome.title,
-                author=outcome.author,
-                session=job.id,
-                on_download_change=_track_download_change,
-                query=job.query,
-                # JobStore.update_status is the sole producer of terminal
-                # events on the jobs path — see U1 in the plan.
-                emit_terminal=False,
-                # One budget for the whole job: attempts, grace extensions and
-                # fallback swaps all draw from it, so arq's timeout stays a
-                # backstop instead of the thing that actually ends the job.
-                deadline=time.monotonic() + JOB_BUDGET_S,
-            )
-            # If cancel fired during the poll, update_status here is a no-op
-            # against the cancelled terminal state — and we skip the success
-            # status so the SSE consumer doesn't see a cancelled job succeed.
-            post = await store.get(job.id)
-            if post and post.status == JobStatus.cancelled:
-                logger.info(
-                    "run_chat_job: %s cancelled mid-poll; skipping success emit",
-                    job.id,
-                )
-                return
-            if result.ok:
-                await store.update_status(
-                    job.id,
-                    JobStatus.succeeded,
-                    picked_title=outcome.title,
-                    picked_author=outcome.author,
-                )
-            else:
-                await store.update_status(
-                    job.id,
-                    JobStatus.failed,
-                    error=result.message or "the download didn't finish",
-                    picked_title=outcome.title,
-                    picked_author=outcome.author,
-                    failure_class=_as_failure_class(result.failure_class),
-                )
-    else:
-            # asked / no_results / error — the agent has already published its
-            # own progress narration. The terminal event comes from
-            # update_status, not from here: the old guard also required
-            # `not bus.messaged`, and bus.messaged is set by the mandatory
-            # opening "Searching…" frame, so in practice it suppressed the
-            # terminal event for *every* non-committed outcome and the client
-            # spun forever.
-            msg = outcome.message or f"agent ended: {outcome.kind}"
-            await store.update_status(
-                job.id,
-                JobStatus.failed,
-                error=msg,
-                failure_class=FailureClass.not_found,
-            )
-
-
-# Imported here rather than at module top: threads.worker imports
-# finish_agent_outcome from this module, so a top-level import would be circular.
-from ..threads.worker import run_thread_turn  # noqa: E402
 
 
 class WorkerSettings:

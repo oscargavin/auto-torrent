@@ -21,12 +21,16 @@ from pathlib import Path
 import requests
 
 from ..audnex import hydrate
+from ..types import BookCard
 
 logger = logging.getLogger("atb.covers")
 
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 # " - Subtitle", " : Subtitle" — an audiobook's shelf title, not its real one.
 _SUBTITLE = re.compile(r"\s+[-–—:]\s+.*$")
+# Bracketed editions on a library title, which Audible's catalogue never
+# carries: "Dune (Unabridged)", "…[Headphones]", "… (Millenium 3)".
+_EDITION = re.compile(r"[\(\[][^\)\]]*[\)\]]")
 _MIN_COVER_BYTES = 1000
 
 
@@ -55,25 +59,42 @@ def title_variants(title: str) -> list[str]:
     full = (title or "").strip()
     if not full:
         return []
-    variants = [full]
-    without_subtitle = _SUBTITLE.sub("", full).strip()
-    if without_subtitle and without_subtitle != full:
-        variants.append(without_subtitle)
+    variants: list[str] = []
+    for base in (full, _SUBTITLE.sub("", full).strip()):
+        for candidate in (base, _EDITION.sub(" ", base)):
+            cleaned = re.sub(r"\s{2,}", " ", candidate).strip(" -–—:")
+            if cleaned and cleaned not in variants:
+                variants.append(cleaned)
     return variants
 
 
-def find_cover_url(title: str, author: str) -> str | None:
-    """First cover found across the title variants, or None."""
+def find_card(title: str, author: str, *, require_cover: bool = False) -> BookCard | None:
+    """First Audible/Audnexus card found across the title variants, or None.
+
+    The one place that knows how to turn messy library metadata into a lookup:
+    subtitles and bracketed editions stripped progressively, ABS's duplicated
+    author tags collapsed. Callers wanting only artwork use `find_cover_url`;
+    callers wanting the rating, blurb or runtime take the whole card.
+    """
     who = clean_author(author)
     for variant in title_variants(title):
         try:
             card = hydrate(variant, who)
-        except Exception:  # noqa: BLE001 — never let artwork break a caller
-            logger.exception("cover lookup failed for %r", variant)
+        except Exception:  # noqa: BLE001 — never let metadata break a caller
+            logger.exception("lookup failed for %r", variant)
             continue
-        if card and card.cover_url:
-            return card.cover_url
+        # `require_cover` keeps the cover path's original behaviour: a card
+        # without artwork is not an answer to "find me a cover", so the search
+        # continues to the next, simpler variant.
+        if card and (card.cover_url or not require_cover):
+            return card
     return None
+
+
+def find_cover_url(title: str, author: str) -> str | None:
+    """First cover found across the title variants, or None."""
+    card = find_card(title, author, require_cover=True)
+    return card.cover_url if card else None
 
 
 def coverless_items(items: list[dict]) -> list[dict]:

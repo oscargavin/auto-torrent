@@ -188,37 +188,3 @@ class TestAbsPayload:
             runtime_s=100.0, chapters=((0.0, "One"), (0.0, "Also One"), (50.0, "Two"))
         )
         assert [c["title"] for c in to_abs_payload(dupes, 100.0)] == ["One", "Two"]
-
-
-class TestSearchTitles:
-    """Library titles carry edition suffixes that Audible's catalogue doesn't."""
-
-    def test_a_bracketed_edition_gets_its_own_attempt(self):
-        from auto_torrent.server.chapters import search_titles
-
-        # Searching "Dune (Unabridged)" returned nothing, so Dune was written
-        # off as not being on Audible at all.
-        assert "Dune" in search_titles("Dune (Unabridged)")
-
-    def test_a_series_marker_is_stripped_too(self):
-        from auto_torrent.server.chapters import search_titles
-
-        assert "The Girl Who Kicked the Hornet's Nest" in search_titles(
-            "The Girl Who Kicked the Hornet's Nest (Millenium 3)"
-        )
-
-    def test_the_full_title_is_still_tried_first(self):
-        from auto_torrent.server.chapters import search_titles
-
-        assert search_titles("Dune (Unabridged)")[0] == "Dune (Unabridged)"
-
-    def test_a_subtitle_and_an_edition_both_reduce(self):
-        from auto_torrent.server.chapters import search_titles
-
-        out = search_titles("Kitchen Confidential - Adventures (Unabridged)")
-        assert "Kitchen Confidential" in out
-
-    def test_no_duplicates_when_there_is_nothing_to_strip(self):
-        from auto_torrent.server.chapters import search_titles
-
-        assert search_titles("Dune") == ["Dune"]

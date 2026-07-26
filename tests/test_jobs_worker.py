@@ -57,7 +57,7 @@ async def test_run_chat_job_marks_running_then_succeeded(redis, store, log, monk
     ))
     monkeypatch.setattr("auto_torrent.server.jobs.worker.run_agent", fake_agent)
     monkeypatch.setattr(
-        "auto_torrent.server.jobs.worker._emit_download_and_poll",
+        "auto_torrent.server.jobs.finish._emit_download_and_poll",
         AsyncMock(),
     )
 
@@ -169,7 +169,7 @@ async def test_success_publishes_exactly_one_completed_event(
         )),
     )
     monkeypatch.setattr(
-        "auto_torrent.server.jobs.worker._emit_download_and_poll", AsyncMock()
+        "auto_torrent.server.jobs.finish._emit_download_and_poll", AsyncMock()
     )
 
     await run_chat_job({"redis": redis, "store": store, "log": log}, job.id)
@@ -195,7 +195,7 @@ async def test_jobs_path_defers_terminal_emit_to_the_store(redis, store, log, mo
         )),
     )
     emit = AsyncMock()
-    monkeypatch.setattr("auto_torrent.server.jobs.worker._emit_download_and_poll", emit)
+    monkeypatch.setattr("auto_torrent.server.jobs.finish._emit_download_and_poll", emit)
 
     await run_chat_job({"redis": redis, "store": store, "log": log}, job.id)
 
@@ -220,7 +220,7 @@ async def test_downloaded_but_not_imported_publishes_a_terminal_event(
         )),
     )
     monkeypatch.setattr(
-        "auto_torrent.server.jobs.worker._emit_download_and_poll",
+        "auto_torrent.server.jobs.finish._emit_download_and_poll",
         AsyncMock(return_value=False),
     )
 
@@ -261,7 +261,7 @@ async def test_unfinished_download_never_reports_success(
         )),
     )
     monkeypatch.setattr(
-        "auto_torrent.server.jobs.worker._emit_download_and_poll",
+        "auto_torrent.server.jobs.finish._emit_download_and_poll",
         AsyncMock(return_value=DownloadResult(
             ok=False, failure_class=failure_class, message=message
         )),
@@ -292,7 +292,7 @@ async def test_finished_download_still_reports_success(redis, store, log, monkey
         )),
     )
     monkeypatch.setattr(
-        "auto_torrent.server.jobs.worker._emit_download_and_poll",
+        "auto_torrent.server.jobs.finish._emit_download_and_poll",
         AsyncMock(return_value=DownloadResult.success()),
     )
 

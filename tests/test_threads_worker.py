@@ -101,11 +101,7 @@ async def test_commit_creates_a_job_and_links_it_into_the_thread(ctx, monkeypatc
         finished["job_id"] = job.id
         finished["bound"] = bus.job_id
 
-    # Patched at the source module: threads.worker imports it inside the
-    # function to break the circular registration, so it resolves at call time.
-    from auto_torrent.server.jobs import worker as jobs_worker
-
-    monkeypatch.setattr(jobs_worker, "finish_agent_outcome", fake_finish)
+    monkeypatch.setattr(worker_mod, "finish_agent_outcome", fake_finish)
     monkeypatch.setattr(
         worker_mod,
         "run_agent",
@@ -172,7 +168,7 @@ async def test_suggested_books_get_cover_art(ctx, monkeypatch):
     that has real covers."""
     monkeypatch.setattr(
         worker_mod,
-        "hydrate",
+        "find_card",
         lambda title, author: BookCard(
             title=title, author=author, cover_url=f"https://img/{title}.jpg",
             description="blurb", rating=4.6, rating_count=1200, runtime_min=610,
@@ -209,7 +205,7 @@ async def test_search_results_keep_their_own_cover(ctx, monkeypatch):
         calls.append(title)
         return BookCard(title=title, author=author, cover_url="https://img/other.jpg")
 
-    monkeypatch.setattr(worker_mod, "hydrate", _spy)
+    monkeypatch.setattr(worker_mod, "find_card", _spy)
     monkeypatch.setattr(
         worker_mod,
         "run_agent",
@@ -233,7 +229,7 @@ async def test_a_failed_cover_lookup_never_costs_the_question(ctx, monkeypatch):
     def _boom(title, author):
         raise RuntimeError("audible down")
 
-    monkeypatch.setattr(worker_mod, "hydrate", _boom)
+    monkeypatch.setattr(worker_mod, "find_card", _boom)
     monkeypatch.setattr(
         worker_mod,
         "run_agent",
@@ -342,7 +338,7 @@ async def test_steps_land_above_the_options_they_produced(ctx, monkeypatch):
         await kw["on_ask"]("Which?", [{"title": "A"}, {"title": "B"}])
         return AgentOutcome(kind="asked", message="Which?", options=[{"title": "A"}])
 
-    monkeypatch.setattr(worker_mod, "hydrate", lambda t, a: None)
+    monkeypatch.setattr(worker_mod, "find_card", lambda t, a: None)
     monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
     thread = await ctx["threads"].create("p1")
 
@@ -372,7 +368,7 @@ async def test_options_carry_what_the_expanded_view_needs(ctx, monkeypatch):
     actually decides on live behind the disclosure."""
     monkeypatch.setattr(
         worker_mod,
-        "hydrate",
+        "find_card",
         lambda title, author: BookCard(
             title=title, author="Susanna Clarke", cover_url="https://img/p.jpg",
             description="A man in an endless house.", rating=4.4,
@@ -404,9 +400,7 @@ async def test_the_download_card_gets_the_cover_they_chose(ctx, monkeypatch):
     async def fake_finish(*, store, bus, job, outcome):
         pass
 
-    from auto_torrent.server.jobs import worker as jobs_worker
-
-    monkeypatch.setattr(jobs_worker, "finish_agent_outcome", fake_finish)
+    monkeypatch.setattr(worker_mod, "finish_agent_outcome", fake_finish)
     monkeypatch.setattr(
         worker_mod,
         "run_agent",
@@ -426,13 +420,9 @@ async def test_a_download_with_no_chosen_row_still_finds_a_cover(ctx, monkeypatc
     async def fake_finish(*, store, bus, job, outcome):
         pass
 
-    from auto_torrent.server.jobs import worker as jobs_worker
-
-    monkeypatch.setattr(jobs_worker, "finish_agent_outcome", fake_finish)
+    monkeypatch.setattr(worker_mod, "finish_agent_outcome", fake_finish)
     monkeypatch.setattr(
-        worker_mod,
-        "hydrate",
-        lambda title, author: BookCard(title=title, author=author, cover_url="https://img/looked-up.jpg"),
+        worker_mod, "find_cover_url", lambda title, author: "https://img/looked-up.jpg"
     )
     monkeypatch.setattr(
         worker_mod,
@@ -445,3 +435,39 @@ async def test_a_download_with_no_chosen_row_still_finds_a_cover(ctx, monkeypatc
 
     job_id = (await ctx["threads"].messages(thread.id))[0].job_id
     assert (await ctx["store"].get(job_id)).cover_url == "https://img/looked-up.jpg"
+
+
+async def test_one_lookup_per_book_not_per_option(ctx, monkeypatch):
+    """A "which edition?" question is N rows of the SAME book. Each lookup is an
+    Audible search plus an Audnexus fetch, so per-option meant 8 HTTP calls for
+    one book's worth of answer — with the user waiting on it."""
+    calls: list[tuple[str, str]] = []
+
+    def _spy(title, author):
+        calls.append((title, author))
+        return BookCard(title=title, author=author, rating=4.5)
+
+    monkeypatch.setattr(worker_mod, "find_card", _spy)
+    monkeypatch.setattr(
+        worker_mod,
+        "run_agent",
+        _agent_returning(
+            AgentOutcome(
+                kind="asked",
+                message="Which narrator?",
+                options=[
+                    {"title": "Dune", "author": "Frank Herbert", "narrator": "Simon Vance"},
+                    {"title": "Dune", "author": "Frank Herbert", "narrator": "Scott Brick"},
+                    {"title": "dune", "author": "frank herbert", "narrator": "Euan Morton"},
+                ],
+            )
+        ),
+    )
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "dune")
+
+    assert calls == [("Dune", "Frank Herbert")]
+    # Every row still gets the answer.
+    opts = (await ctx["threads"].messages(thread.id))[0].options
+    assert [o.rating for o in opts] == [4.5, 4.5, 4.5]

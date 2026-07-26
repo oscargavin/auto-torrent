@@ -237,3 +237,42 @@ class _FakeABS:
         if item_id == self.fail_on:
             raise RuntimeError("ABS rejected it")
         self.set.append((item_id, url))
+
+
+class TestEditionVariants:
+    """Library titles carry edition suffixes that Audible's catalogue doesn't.
+
+    The cover path had this bug too — it searched for "Dune (Unabridged)" and
+    found nothing — which is why the fix belongs here rather than in the
+    chapter module that noticed it.
+    """
+
+    def test_a_bracketed_edition_gets_its_own_attempt(self):
+        from auto_torrent.server.covers import title_variants
+
+        # Searching "Dune (Unabridged)" returned nothing, so Dune was written
+        # off as not being on Audible at all.
+        assert "Dune" in title_variants("Dune (Unabridged)")
+
+    def test_a_series_marker_is_stripped_too(self):
+        from auto_torrent.server.covers import title_variants
+
+        assert "The Girl Who Kicked the Hornet's Nest" in title_variants(
+            "The Girl Who Kicked the Hornet's Nest (Millenium 3)"
+        )
+
+    def test_the_full_title_is_still_tried_first(self):
+        from auto_torrent.server.covers import title_variants
+
+        assert title_variants("Dune (Unabridged)")[0] == "Dune (Unabridged)"
+
+    def test_a_subtitle_and_an_edition_both_reduce(self):
+        from auto_torrent.server.covers import title_variants
+
+        out = title_variants("Kitchen Confidential - Adventures (Unabridged)")
+        assert "Kitchen Confidential" in out
+
+    def test_no_duplicates_when_there_is_nothing_to_strip(self):
+        from auto_torrent.server.covers import title_variants
+
+        assert title_variants("Dune") == ["Dune"]

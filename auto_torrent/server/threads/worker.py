@@ -16,8 +16,9 @@ import logging
 from typing import Any
 from urllib.parse import quote_plus
 
-from ...audnex import hydrate
 from ..agent import run_agent
+from ..covers import find_card, find_cover_url
+from ..jobs.finish import finish_agent_outcome
 from ..jobs.store import JobStore
 from ..settings import Settings
 from .bus import ThreadSink
@@ -27,12 +28,6 @@ from .types import EVENT_ERROR, ChoiceOption, Message, MessageKind, ThreadStatus
 
 logger = logging.getLogger("atb.threads.worker")
 settings = Settings()
-
-# What the agent is told the user said when they tap an option, in place of the
-# text they never typed. Phrased as the user so the transcript reads as a
-# conversation rather than as a protocol.
-CHOICE_ECHO = "That one: {title}"
-
 
 def goodreads_search_url(title: str, author: str) -> str:
     """Where to send someone who wants the reviews.
@@ -46,34 +41,49 @@ def goodreads_search_url(title: str, author: str) -> str:
     return f"https://www.goodreads.com/search?q={query}" if query else ""
 
 
+def _key(option: ChoiceOption) -> tuple[str, str]:
+    """Which book an option is about, for collapsing duplicate lookups."""
+    return (option.title.casefold().strip(), option.author.casefold().strip())
+
+
 async def _hydrate(options: list[ChoiceOption]) -> list[ChoiceOption]:
-    """Fill in everything the expanded view needs, from one lookup per option.
+    """Fill in everything the expanded view needs.
 
     A row can only show a line or two before it stops being scannable, so the
     description, rating and runtime that someone actually decides on live
     behind a disclosure — and none of that exists on a "which book?" option,
     which the agent named from what it knows rather than from a search result.
 
-    Uses the same Audible-then-OpenLibrary pipeline as the recommendations
-    shelf. Concurrent because this runs while the user waits on the question:
-    four sequential lookups would be four times the delay. Guarded throughout —
-    a lookup that fails costs that row its extra detail, never the question.
+    Looked up once per distinct book, not once per option: a "which edition?"
+    question is four rows of the *same* title, and each lookup is an Audible
+    search plus an Audnexus fetch. Concurrent across distinct books, because
+    the user is waiting on this. Guarded throughout — a lookup that fails costs
+    that row its extra detail, never the question.
     """
     if not options:
         return options
-    try:
-        cards = await asyncio.gather(
-            *(asyncio.to_thread(_lookup, o.title, o.author) for o in options),
-            return_exceptions=True,
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("option hydration failed")
-        return options
+
+    # Case-insensitive key, but the *original* strings go to Audible — the key
+    # exists to collapse duplicates, not to rewrite the query.
+    lookups: dict[tuple[str, str], tuple[str, str]] = {}
+    for option in options:
+        lookups.setdefault(_key(option), (option.title, option.author))
+    ordered = list(lookups)
+    cards = await asyncio.gather(
+        *(asyncio.to_thread(find_card, *lookups[key]) for key in ordered),
+        return_exceptions=True,
+    )
+    by_key = {
+        key: card
+        for key, card in zip(ordered, cards)
+        if card is not None and not isinstance(card, BaseException)
+    }
 
     out: list[ChoiceOption] = []
-    for option, card in zip(options, cards):
+    for option in options:
+        card = by_key.get(_key(option))
         patch: dict = {"goodreads_url": goodreads_search_url(option.title, option.author)}
-        if card is not None and not isinstance(card, BaseException):
+        if card is not None:
             # Never overwrite what the search already knew: an edition's own
             # cover is of the actual release, and its author came off the
             # result. Audible fills the gaps, it doesn't correct them.
@@ -92,30 +102,12 @@ async def _hydrate(options: list[ChoiceOption]) -> list[ChoiceOption]:
     return out
 
 
-def _cover_for(title: str, author: str) -> str:
-    card = _lookup(title, author)
-    return (card.cover_url or "") if card else ""
-
-
-def _lookup(title: str, author: str):
-    """Audible/Audnexus card for a title, or None. Never raises."""
-    try:
-        return hydrate(title, author)
-    except Exception:  # noqa: BLE001
-        logger.warning("hydrate failed for %r", title, exc_info=True)
-        return None
-
-
 async def run_thread_turn(
     ctx: dict[str, Any],
     thread_id: str,
     text: str,
     pending_options: list[dict] | None = None,
 ) -> None:
-    # Imported here, not at module scope: jobs.worker registers this function on
-    # WorkerSettings, so a top-level import in the other direction is circular.
-    from ..jobs.worker import finish_agent_outcome
-
     threads: ThreadStore = ctx["threads"]
     jobs: JobStore = ctx["store"]
     log = ctx["log"]
@@ -161,9 +153,7 @@ async def run_thread_turn(
 
     # The option the user tapped, if this turn is answering a question.
     pending_cover = (
-        str((pending_options or [{}])[0].get("cover_url") or "").strip()
-        if pending_options
-        else ""
+        str(pending_options[0].get("cover_url") or "").strip() if pending_options else ""
     )
 
     try:
@@ -206,7 +196,7 @@ async def run_thread_turn(
             # chose rather than a generic glyph. Falling back to a lookup keeps
             # it true for a request that never went through a choice.
             cover = pending_cover or await asyncio.to_thread(
-                _cover_for, outcome.title, outcome.author
+                find_cover_url, outcome.title, outcome.author
             )
             if cover:
                 await jobs.set_cover(job.id, cover)
