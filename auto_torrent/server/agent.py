@@ -133,7 +133,8 @@ makes it different — "unabridged, Stephen Fry" or "the whole trilogy". The not
 is the only thing distinguishing two rows with the same title, so never leave it
 empty and never repeat the title inside it.
 
-Say one short line before asking, so the cards have context.
+Put your one line of context in the tool's `question` argument, not in a
+separate message.
 
 FOLLOW-UPS. The conversation continues. They may reply to what you just did:
 "something shorter", "anything else by her", "no, the other one". Earlier
@@ -314,7 +315,7 @@ async def run_agent(
     sms: SMSClient,
     pending_options: list[dict] | None = None,
     allow_ask: bool = True,
-    on_ask: Callable[[list[dict]], Awaitable[None]] | None = None,
+    on_ask: Callable[[str, list[dict]], Awaitable[None]] | None = None,
     history: list[tuple[str, str]] | None = None,
 ) -> AgentOutcome:
     """Run the concierge agent for one request.
@@ -413,24 +414,30 @@ async def run_agent(
     @tool(
         name="ask_user_to_pick",
         description=(
-            "Ask the user to choose, and end this turn. Each option: "
-            "{label, magnet, title, author, narrator, format, size, cover_url, note}. "
-            "`note` is a SHORT phrase saying what makes this option different from "
-            "the others ('unabridged, Stephen Fry'); it is what the user actually "
-            "chooses on. Give 2-4 options."
+            "Ask the user to choose, and end this turn. `question` is one short "
+            "line of context shown above the options ('Two versions of this one — "
+            "which?'). Each option: {label, magnet, title, author, narrator, "
+            "format, size, cover_url, note}. `note` is a SHORT phrase saying what "
+            "makes this option different from the others ('unabridged, Stephen "
+            "Fry'); it is what the user actually chooses on. Give 2-4 options."
         ),
-        input_schema={"options": list},
+        input_schema={"question": str, "options": list},
     )
     async def ask_user_to_pick(args: dict) -> dict:
         options = args.get("options") or []
         if not options:
             return {"content": [{"type": "text", "text": "error: no options"}]}
+        # Carried on the tool call rather than left to a preceding send_sms.
+        # Observed live: the agent asked with no preamble at all, so the user
+        # got a bare list of near-identical rows and no reason for the question.
+        # A prompt instruction can be ignored; a required argument cannot.
+        question = (args.get("question") or "").strip() or "Which one?"
 
         # The app channel delivers the question as tappable cards and persists
         # the magnets server-side, so it takes the whole payload. SMS can only
         # send text, so it falls through to the numbered list below.
         if on_ask is not None:
-            await on_ask(options)
+            await on_ask(question, options)
             state["outcome"] = AgentOutcome(kind="asked", options=options)
             return {"content": [{"type": "text", "text": "asked user; conversation ended"}]}
 
@@ -445,7 +452,7 @@ async def run_agent(
             for o in options
         ])
 
-        lines = ["Found a few — which?"]
+        lines = [question]
         for i, o in enumerate(options[:4], 1):
             label = o.get("label") or o.get("title", "Unknown")
             extras = []

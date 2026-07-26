@@ -35,7 +35,7 @@ def _agent_returning(outcome: AgentOutcome, *, calls: list | None = None):
         if outcome.kind == "asked":
             # The real tool calls on_ask before returning; mirror that so the
             # choice message is written the way production writes it.
-            await kw["on_ask"](outcome.options)
+            await kw["on_ask"](outcome.message or "Which one?", outcome.options)
         return outcome
 
     return fake_run_agent
@@ -49,7 +49,11 @@ async def test_question_parks_the_thread_and_creates_no_job(ctx, monkeypatch, re
     monkeypatch.setattr(
         worker_mod,
         "run_agent",
-        _agent_returning(AgentOutcome(kind="asked", options=options)),
+        _agent_returning(
+            AgentOutcome(
+                kind="asked", options=options, message="Two narrators — which?"
+            )
+        ),
     )
     thread = await ctx["threads"].create("p1")
 
@@ -59,6 +63,10 @@ async def test_question_parks_the_thread_and_creates_no_job(ctx, monkeypatch, re
     msgs = await ctx["threads"].messages(thread.id)
     assert [m.kind for m in msgs] == [MessageKind.choice]
     assert len(msgs[0].options) == 2
+    # The question rides on the choice message rather than arriving as a
+    # separate assistant line — observed live, the agent skipped the preamble
+    # entirely and left a bare list of near-identical rows.
+    assert msgs[0].text == "Two narrators — which?"
     # No job — nothing is downloading.
     assert await ctx["store"].list_for_profile("p1") == []
     # Magnets stayed server-side.

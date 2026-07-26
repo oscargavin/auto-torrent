@@ -147,3 +147,28 @@ async def test_list_for_profile_is_most_recent_first(store):
     await store.set_status(a.id, ThreadStatus.working)  # bumps updated_at
     assert [t.id for t in await store.list_for_profile("p1")][0] == a.id
     assert b.id in [t.id for t in await store.list_for_profile("p1")]
+
+
+async def test_expired_question_unsticks_so_the_composer_returns(store, redis):
+    """A question past the pending TTL is unanswerable — every tap 409s or 410s —
+    so leaving the thread on awaiting_choice strands the conversation."""
+    from auto_torrent.server.threads.store import PENDING_TTL_S
+
+    t = await store.create("p1")
+    await store.set_status(t.id, ThreadStatus.awaiting_choice)
+    await redis.hset(f"thread:{t.id}", "updated_at", str(time.time() - PENDING_TTL_S - 60))
+    assert (await store.get(t.id)).status is ThreadStatus.idle
+
+
+async def test_open_question_is_left_alone(store):
+    t = await store.create("p1")
+    await store.set_status(t.id, ThreadStatus.awaiting_choice)
+    assert (await store.get(t.id)).status is ThreadStatus.awaiting_choice
+
+
+async def test_scraper_placeholders_become_absent_fields(store):
+    """"unknown" in a line whose job is to help someone choose is worse than
+    an absent field."""
+    opt = option_from_payload(0, {"title": "Dune", "format": "unknown", "size": "N/A"})
+    assert opt.book_format == ""
+    assert opt.size == ""

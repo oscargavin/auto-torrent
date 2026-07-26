@@ -55,7 +55,7 @@ async def run_thread_turn(
         log, thread_id=thread_id, thread_log=thread_log, threads=threads
     )
 
-    async def on_ask(options: list[dict]) -> None:
+    async def on_ask(question: str, options: list[dict]) -> None:
         """Turn the agent's options into a choice message.
 
         The magnets stay in `set_pending`; only the presentable fields reach
@@ -69,6 +69,7 @@ async def run_thread_turn(
             Message.new(
                 thread_id,
                 MessageKind.choice,
+                text=question,
                 options=[option_from_payload(i, o) for i, o in enumerate(options)],
             ),
         )

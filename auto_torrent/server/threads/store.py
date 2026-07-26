@@ -85,15 +85,28 @@ class ThreadStore:
         return await self._unstick(await self._fetch(thread_id))
 
     async def _unstick(self, thread: Thread | None) -> Thread | None:
-        """Return a thread whose worker died to `idle`, so the composer unlocks.
+        """Return a thread that can no longer make progress to `idle`.
 
-        Deliberately silent: the user's message is still in the transcript and
-        re-sending it is the natural recovery. Announcing "the server dropped
-        this" would be accurate and useless.
+        Two ways in, both ending with a conversation nothing will ever move:
+
+        - `working` with a dead worker (OOM, SIGKILL, host reboot). Nothing else
+          notices, so the read path has to.
+        - `awaiting_choice` past the pending TTL. The magnets are gone, so every
+          tap now 409s or 410s — the question is on screen and unanswerable.
+
+        Deliberately silent in both cases: the user's message is still in the
+        transcript and re-sending it is the natural recovery. Announcing "the
+        server dropped this" would be accurate and useless.
         """
-        if thread is None or thread.status is not ThreadStatus.working:
+        if thread is None:
             return thread
-        if time.time() - thread.updated_at <= STUCK_AFTER_S:
+        if thread.status is ThreadStatus.working:
+            limit = STUCK_AFTER_S
+        elif thread.status is ThreadStatus.awaiting_choice:
+            limit = PENDING_TTL_S
+        else:
+            return thread
+        if time.time() - thread.updated_at <= limit:
             return thread
         return await self.set_status(thread.id, ThreadStatus.idle) or thread
 
@@ -213,6 +226,12 @@ class ThreadStore:
         await self._r.delete(_pending_key(thread_id))
 
 
+def _known(value: object) -> str:
+    """Placeholder strings from the scraper, normalised to absent."""
+    text = str(value or "").strip()
+    return "" if text.lower() in {"", "unknown", "n/a", "none"} else text
+
+
 def option_from_payload(index: int, payload: dict) -> ChoiceOption:
     """Agent-side result dict → the client-safe option.
 
@@ -226,8 +245,12 @@ def option_from_payload(index: int, payload: dict) -> ChoiceOption:
         title=payload.get("title") or "Unknown",
         author=payload.get("author") or "",
         narrator=payload.get("narrator") or "",
-        book_format=payload.get("format") or "",
-        size=payload.get("size") or "",
+        # The scraper writes the literal string "unknown" when it can't parse a
+        # format. Rendering that puts the word "unknown" in a metadata line
+        # whose whole job is to help someone choose — an absent field is more
+        # honest and reads better than a confident "unknown".
+        book_format=_known(payload.get("format")),
+        size=_known(payload.get("size")),
         cover_url=payload.get("cover_url") or "",
         abridged=bool(payload.get("abridged")),
         note=payload.get("note") or "",
