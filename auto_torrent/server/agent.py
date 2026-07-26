@@ -90,7 +90,19 @@ Pending options:
 - If "Pending options" are present in the user prompt, treat the user's message as a pick from those options. Resolve to the magnet they meant and commit_download. Don't re-search.
 - A pending option with no magnet is a BOOK the user chose from your suggestions, not a copy. Search for it as a fresh request, then continue as normal — including asking which edition if the copies differ.
 
-End as soon as you have committed or asked. Don't keep tool-calling after."""
+ANSWERING RATHER THAN FETCHING.
+Not every message is a request for a book. "What's Piranesi about?", "who
+narrates it?", "which of those is shortest?", "do I already have Mistborn?",
+"why that one?" — these want an answer, not a download. Use `reply` for them:
+say the thing, in a sentence or two, and end. Never run a search to answer a
+question you already know the answer to, and never fall back to "couldn't find
+that one" when they didn't ask you to find anything.
+
+Use `search_library` when the question is about what they own, and before
+offering suggestions so you don't recommend a book already on the shelf.
+
+End as soon as you have committed, asked, or replied. Don't keep tool-calling
+after."""
 
 # Appended when the caller has no way to deliver an answer back to the agent.
 # Without it the model still tries to ask, and the "question" lands as a
@@ -183,6 +195,35 @@ working, not a loop to escape — keep offering until they pick one or ask you
 to decide."""
 
 
+# How many library matches a search returns. Enough to answer "what have I got
+# by Sanderson?" honestly, few enough not to flood the context.
+LIBRARY_MATCH_LIMIT = 12
+
+
+async def _search_library(settings: Settings, query: str) -> list[dict]:
+    """Substring match over the family's shelf, on title and author.
+
+    Deliberately looser than `library_match.find_existing`, which exists to
+    decide whether to skip a download and so must not produce false positives.
+    This one answers questions, where a near-miss in the list is useful and a
+    miss is not.
+    """
+    from .audiobookshelf import ABSClient
+
+    items = await ABSClient(settings).list_items(settings.abs_library_id)
+    needle = query.casefold().strip()
+    out: list[dict] = []
+    for item in items:
+        meta = ((item.get("media") or {}).get("metadata")) or {}
+        title = meta.get("title") or ""
+        author = meta.get("authorName") or ""
+        if needle in title.casefold() or needle in author.casefold():
+            out.append({"title": title, "author": author})
+            if len(out) >= LIBRARY_MATCH_LIMIT:
+                break
+    return out
+
+
 def _system_prompt(allow_ask: bool, is_app: bool) -> str:
     """One place that decides what the agent is allowed to do this turn.
 
@@ -196,7 +237,12 @@ def _system_prompt(allow_ask: bool, is_app: bool) -> str:
 
 @dataclass
 class AgentOutcome:
-    kind: Literal["committed", "asked", "no_results", "error"]
+    #: `replied` is a turn that answered a question instead of fetching
+    #: anything — "what's Piranesi about?", "do I already have Mistborn?".
+    #: Without it, ending without committing fell through to the not-found
+    #: fallback, so a perfectly good question got "Couldn't find that one —
+    #: try the full title and author."
+    kind: Literal["committed", "asked", "replied", "no_results", "error"]
     download: dict | None = None
     fallbacks: list[dict] = field(default_factory=list)
     options: list[dict] = field(default_factory=list)
@@ -508,6 +554,55 @@ async def run_agent(
         return {"content": [{"type": "text", "text": "asked user; conversation ended"}]}
 
     @tool(
+        name="reply",
+        description=(
+            "Answer the user and end the turn. Use whenever they asked something "
+            "rather than asked for something — what a book is about, who narrates "
+            "it, what you'd recommend and why, or a follow-up to your own last "
+            "message. Do NOT search first; answer from what you know."
+        ),
+        input_schema={"text": str},
+    )
+    async def reply(args: dict) -> dict:
+        text = (args.get("text") or "").strip()
+        if not text:
+            return {"content": [{"type": "text", "text": "error: empty reply"}]}
+        try:
+            await asyncio.to_thread(sms.send, phone, text)
+        except Exception as e:  # noqa: BLE001
+            return {"content": [{"type": "text", "text": f"error: {e}"}]}
+        state["outcome"] = AgentOutcome(kind="replied", message=text)
+        return {"content": [{"type": "text", "text": "replied; conversation ended"}]}
+
+    @tool(
+        name="search_library",
+        description=(
+            "Search the family's existing Audiobookshelf library. Returns "
+            "{matches: [{title, author}]}. Use before offering suggestions so you "
+            "don't suggest something they already own, and to answer 'do I have "
+            "X?' or 'what have I got by Y?'."
+        ),
+        input_schema={"query": str},
+    )
+    async def search_library(args: dict) -> dict:
+        query = (args.get("query") or "").strip()
+        if not query:
+            return {"content": [{"type": "text", "text": json.dumps({"matches": []})}]}
+        try:
+            matches = await _search_library(settings, query)
+        except Exception as e:  # noqa: BLE001
+            # A library that can't be reached must not fail the turn — the
+            # answer degrades to "I can't see your shelf right now", which is
+            # far better than the whole request erroring.
+            logger.warning("library search failed: %r", e)
+            return {
+                "content": [
+                    {"type": "text", "text": json.dumps({"error": "library unavailable"})}
+                ]
+            }
+        return {"content": [{"type": "text", "text": json.dumps({"matches": matches})}]}
+
+    @tool(
         name="commit_download",
         description="Start the BG download. `primary` and each `fallbacks` entry: {magnet, title, author, narrator, format}. Include narrator and format on `primary` whenever the search result or analyze_cover gave them — they're shown to the user so they can see which edition was chosen. ALWAYS include 1-2 fallbacks when you have viable alternates — the polling layer uses them if the primary stalls.",
         input_schema={"primary": dict, "fallbacks": list},
@@ -560,6 +655,8 @@ async def run_agent(
         analyze_cover,
         probe_peers,
         send_sms,
+        reply,
+        search_library,
         commit_download,
     ]
     if allow_ask:
@@ -590,6 +687,8 @@ async def run_agent(
         "mcp__atb__analyze_cover",
         "mcp__atb__probe_peers",
         "mcp__atb__send_sms",
+        "mcp__atb__reply",
+        "mcp__atb__search_library",
         "mcp__atb__commit_download",
     ]
     if allow_ask:

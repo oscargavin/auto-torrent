@@ -6,6 +6,8 @@ leave no job behind — otherwise the app shows a progress card with no honest
 status in it, and the reaper eventually fails a job that never started.
 """
 
+import asyncio
+
 import pytest
 
 from auto_torrent.server.agent import AgentOutcome
@@ -242,3 +244,25 @@ async def test_a_failed_cover_lookup_never_costs_the_question(ctx, monkeypatch):
     assert msgs[0].kind is MessageKind.choice
     assert msgs[0].options[0].cover_url == ""
     assert (await ctx["threads"].get(thread.id)).status is ThreadStatus.awaiting_choice
+
+
+async def test_a_question_is_answered_not_searched_for(ctx, monkeypatch):
+    """Observed live: "whats piranesi actually about?" came back as "Couldn't
+    find that one — try the full title and author." Ending without committing
+    fell through to the not-found fallback, so a good question got a nonsense
+    answer about a book the agent had just recommended."""
+    async def fake_run_agent(raw_query, phone, settings, sms, **kw):
+        await asyncio.to_thread(sms.send, phone, "A man in an endless house of statues.")
+        return AgentOutcome(kind="replied", message="A man in an endless house of statues.")
+
+    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "whats piranesi about?")
+
+    msgs = await ctx["threads"].messages(thread.id)
+    assert [m.kind for m in msgs] == [MessageKind.assistant]
+    assert msgs[0].text == "A man in an endless house of statues."
+    # No download, no question, composer handed straight back.
+    assert await ctx["store"].list_for_profile("p1") == []
+    assert (await ctx["threads"].get(thread.id)).status is ThreadStatus.idle

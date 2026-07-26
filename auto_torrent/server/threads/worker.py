@@ -133,6 +133,12 @@ async def run_thread_turn(
             history=history or None,
         )
 
+        if outcome.kind == "replied":
+            # The answer already landed as an assistant message. Nothing to
+            # download, nothing to ask — just hand the composer back.
+            await threads.set_status(thread_id, ThreadStatus.idle)
+            return
+
         if outcome.kind == "asked":
             # on_ask already wrote the message. Park the thread; the worker slot
             # is released by returning, which is the whole reason the agent is
