@@ -122,9 +122,25 @@ def build_router(
             thread_id,
             Message.new(thread_id, MessageKind.user, text=CHOICE_ECHO.format(title=title)),
         )
-        # Only the chosen option goes back to the agent. Handing it the whole
-        # list again would let it re-decide, and the user already decided.
-        await enqueue_turn(thread_id, f"Download {title}", [chosen])
+
+        # Two kinds of question reach here, distinguished by whether the option
+        # carries a magnet.
+        #
+        # "Which edition?" options come straight from a search, so the magnet is
+        # known and the only thing left is to start it. Only the chosen option
+        # goes back — handing the agent the whole list again would let it
+        # re-decide something the user already decided.
+        #
+        # "Which book?" options are titles the agent proposed without searching
+        # (answering "something like Name of the Wind" means naming books, not
+        # torrents). There is nothing to commit yet, so the next turn is a fresh
+        # search for the book they picked.
+        if chosen.get("magnet"):
+            await enqueue_turn(thread_id, f"Download {title}", [chosen])
+        else:
+            author = (chosen.get("author") or "").strip()
+            request = f"{title} by {author}" if author else title
+            await enqueue_turn(thread_id, request, None)
         return resolved
 
     @router.get("/chat/threads/{thread_id}/events")

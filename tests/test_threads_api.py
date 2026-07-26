@@ -177,3 +177,63 @@ async def test_list_threads_is_profile_scoped(client):
     other = r.json()["id"]
     ids = [t["id"] for t in (await client.get("/chat/threads?profile_id=p1")).json()]
     assert a in ids and other not in ids
+
+
+async def _open_book_choice(app, tid: str) -> Message:
+    """A "which book?" question — suggestions the agent named without searching,
+    so no magnets."""
+    from auto_torrent.server.threads.store import option_from_payload
+
+    await app.state.store.set_pending(
+        tid,
+        [
+            {"title": "The Way of Kings", "author": "Brandon Sanderson"},
+            {"title": "The Lies of Locke Lamora", "author": "Scott Lynch"},
+        ],
+    )
+    msg = await app.state.store.append(
+        tid,
+        Message.new(
+            tid,
+            MessageKind.choice,
+            text="A few that scratch the same itch — which?",
+            options=[
+                option_from_payload(0, {"title": "The Way of Kings", "author": "Brandon Sanderson"}),
+                option_from_payload(1, {"title": "The Lies of Locke Lamora", "author": "Scott Lynch"}),
+            ],
+        ),
+    )
+    await app.state.store.set_status(tid, ThreadStatus.awaiting_choice)
+    return msg
+
+
+async def test_choosing_a_suggested_book_starts_a_fresh_search(app, client):
+    """There is no magnet to commit — the agent named books, not torrents — so
+    the next turn has to search for the one they picked."""
+    tid = await _new_thread(client)
+    msg = await _open_book_choice(app, tid)
+
+    r = await client.post(
+        f"/chat/threads/{tid}/choose", json={"message_id": msg.id, "option_index": 1}
+    )
+    assert r.status_code == 200
+
+    _tid, text, pending = app.state.turns[0]
+    assert pending is None  # fresh search, not a commit
+    assert "Lies of Locke Lamora" in text
+    assert "Scott Lynch" in text
+
+
+async def test_choosing_an_edition_commits_without_researching(app, client):
+    """The opposite case: the magnet is known, so the turn should commit it
+    rather than search again and risk landing on a different copy."""
+    tid = await _new_thread(client)
+    msg = await _open_choice(app, tid)
+
+    r = await client.post(
+        f"/chat/threads/{tid}/choose", json={"message_id": msg.id, "option_index": 0}
+    )
+    assert r.status_code == 200
+
+    _tid, _text, pending = app.state.turns[0]
+    assert pending is not None and pending[0]["magnet"] == "magnet:?xt=a"
