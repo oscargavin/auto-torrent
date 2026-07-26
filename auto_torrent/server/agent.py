@@ -402,7 +402,7 @@ async def run_agent(
     sms: SMSClient,
     pending_options: list[dict] | None = None,
     allow_ask: bool = True,
-    on_ask: Callable[[str, list[dict]], Awaitable[None]] | None = None,
+    on_ask: Callable[[str, str, list[dict]], Awaitable[None]] | None = None,
     history: list[tuple[str, str]] | None = None,
 ) -> AgentOutcome:
     """Run the concierge agent for one request.
@@ -501,14 +501,18 @@ async def run_agent(
     @tool(
         name="ask_user_to_pick",
         description=(
-            "Ask the user to choose, and end this turn. `question` is one short "
+            "Ask the user to choose, and end this turn. `kind` is 'book' when the "
+            "options are different BOOKS to pick between, or 'edition' when they are "
+            "different copies of the same book — answering the first runs a search, "
+            "answering the second starts a download, and the app says so. "
+            "`question` is one short "
             "line of context shown above the options ('Two versions of this one — "
             "which?'). Each option: {label, magnet, title, author, narrator, "
             "format, size, cover_url, note}. `note` is a SHORT phrase saying what "
             "makes this option different from the others ('unabridged, Stephen "
             "Fry'); it is what the user actually chooses on. Give 2-4 options."
         ),
-        input_schema={"question": str, "options": list},
+        input_schema={"kind": str, "question": str, "options": list},
     )
     async def ask_user_to_pick(args: dict) -> dict:
         options = args.get("options") or []
@@ -519,12 +523,16 @@ async def run_agent(
         # got a bare list of near-identical rows and no reason for the question.
         # A prompt instruction can be ignored; a required argument cannot.
         question = (args.get("question") or "").strip() or "Which one?"
+        # Falls back to `edition`, the costlier reading: mislabelling a search
+        # as a download is a smaller error than the reverse, where a tap the
+        # user thought was cheap starts twenty minutes of work.
+        kind = "book" if str(args.get("kind") or "").lower() == "book" else "edition"
 
         # The app channel delivers the question as tappable cards and persists
         # the magnets server-side, so it takes the whole payload. SMS can only
         # send text, so it falls through to the numbered list below.
         if on_ask is not None:
-            await on_ask(question, options)
+            await on_ask(question, kind, options)
             state["outcome"] = AgentOutcome(kind="asked", options=options)
             return {"content": [{"type": "text", "text": "asked user; conversation ended"}]}
 

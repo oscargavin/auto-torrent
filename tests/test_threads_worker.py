@@ -31,14 +31,14 @@ def ctx(redis):
     }
 
 
-def _agent_returning(outcome: AgentOutcome, *, calls: list | None = None):
+def _agent_returning(outcome: AgentOutcome, *, calls: list | None = None, kind: str = "edition"):
     async def fake_run_agent(raw_query, phone, settings, sms, **kw):
         if calls is not None:
             calls.append({"query": raw_query, **kw})
         if outcome.kind == "asked":
             # The real tool calls on_ask before returning; mirror that so the
             # choice message is written the way production writes it.
-            await kw["on_ask"](outcome.message or "Which one?", outcome.options)
+            await kw["on_ask"](outcome.message or "Which one?", kind, outcome.options)
         return outcome
 
     return fake_run_agent
@@ -335,7 +335,7 @@ async def test_text_between_tool_calls_starts_a_new_group(ctx, monkeypatch):
 async def test_steps_land_above_the_options_they_produced(ctx, monkeypatch):
     async def fake_run_agent(raw_query, phone, settings, sms, **kw):
         await sms.emit_async("progress", {"text": "Searching…"})
-        await kw["on_ask"]("Which?", [{"title": "A"}, {"title": "B"}])
+        await kw["on_ask"]("Which?", "edition", [{"title": "A"}, {"title": "B"}])
         return AgentOutcome(kind="asked", message="Which?", options=[{"title": "A"}])
 
     monkeypatch.setattr(worker_mod, "find_card", lambda t, a: None)

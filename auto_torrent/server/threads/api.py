@@ -13,6 +13,7 @@ from ..app import _require_bearer
 from ..jobs.events import EventLog
 from .store import ThreadStore
 from .types import (
+    ChoiceKind,
     ChooseRequest,
     CreateThreadRequest,
     Message,
@@ -123,21 +124,22 @@ def build_router(
             Message.new(thread_id, MessageKind.user, text=CHOICE_ECHO.format(title=title)),
         )
 
-        # Two kinds of question reach here, distinguished by whether the option
-        # carries a magnet.
-        #
-        # "Which edition?" options come straight from a search, so the magnet is
-        # known and the only thing left is to start it. Only the chosen option
-        # goes back — handing the agent the whole list again would let it
-        # re-decide something the user already decided.
-        #
-        # "Which book?" options are titles the agent proposed without searching
-        # (answering "something like Name of the Wind" means naming books, not
-        # torrents). There is nothing to commit yet, so the next turn is a fresh
-        # search for the book they picked.
-        if chosen.get("magnet"):
+        # The agent told us which question it asked, so this dispatches on that
+        # rather than reconstructing it from whether the option happens to carry
+        # a magnet. Older messages predate the field and fall back to the
+        # inference they were written under.
+        kind = resolved.choice_kind or (
+            ChoiceKind.edition if chosen.get("magnet") else ChoiceKind.book
+        )
+        # An edition's magnet is known and the only thing left is to start it.
+        # Only the chosen option goes back — handing the agent the whole list
+        # again would let it re-decide what the user already decided.
+        if kind is ChoiceKind.edition and chosen.get("magnet"):
             await enqueue_turn(thread_id, f"Download {title}", [chosen])
         else:
+            # A book the agent named without searching ("something like Name of
+            # the Wind" means naming books, not torrents). Nothing to commit —
+            # the next turn searches for the one they picked.
             author = (chosen.get("author") or "").strip()
             request = f"{title} by {author}" if author else title
             await enqueue_turn(thread_id, request, None)

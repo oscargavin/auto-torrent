@@ -42,6 +42,20 @@ class MessageKind(str, enum.Enum):
     job = "job"
 
 
+class ChoiceKind(str, enum.Enum):
+    """What a question is actually asking, and therefore what answering it does.
+
+    The agent knows this when it asks — the app-channel prompt names them as two
+    separate decisions — so it is carried rather than reconstructed downstream
+    from whether an option happens to have a magnet. Answering `book` runs a
+    fresh search; answering `edition` commits a download. The client needs the
+    difference too: one tap costs a second, the other costs twenty minutes.
+    """
+
+    book = "book"
+    edition = "edition"
+
+
 class ThreadStatus(str, enum.Enum):
     idle = "idle"
     #: An agent turn is running. The composer stays usable; the client shows a
@@ -112,6 +126,9 @@ class Message(BaseModel):
     text: str = ""
     options: list[ChoiceOption] = Field(default_factory=list)
     chosen_index: int | None = None
+    #: Set on `choice` messages. Optional so a message written before this
+    #: existed still deserialises; the API falls back to inferring it.
+    choice_kind: ChoiceKind | None = None
     job_id: str | None = None
     steps: list[Step] = Field(default_factory=list)
 

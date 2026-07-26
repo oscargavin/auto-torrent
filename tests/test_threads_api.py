@@ -237,3 +237,50 @@ async def test_choosing_an_edition_commits_without_researching(app, client):
 
     _tid, _text, pending = app.state.turns[0]
     assert pending is not None and pending[0]["magnet"] == "magnet:?xt=a"
+
+
+async def test_a_book_choice_searches_even_when_a_magnet_is_present(app, client):
+    """The kind is what the agent asked, not what the payload happens to carry.
+    A suggested book that incidentally has a magnet must still be searched for —
+    inferring from the field would silently commit it instead."""
+    from auto_torrent.server.threads.store import option_from_payload
+    from auto_torrent.server.threads.types import ChoiceKind
+
+    tid = await _new_thread(client)
+    await app.state.store.set_pending(
+        tid, [{"title": "Elantris", "author": "Brandon Sanderson", "magnet": "magnet:?xt=x"}]
+    )
+    msg = await app.state.store.append(
+        tid,
+        Message.new(
+            tid,
+            MessageKind.choice,
+            text="Which?",
+            choice_kind=ChoiceKind.book,
+            options=[option_from_payload(0, {"title": "Elantris", "author": "Brandon Sanderson"})],
+        ),
+    )
+    await app.state.store.set_status(tid, ThreadStatus.awaiting_choice)
+
+    r = await client.post(
+        f"/chat/threads/{tid}/choose", json={"message_id": msg.id, "option_index": 0}
+    )
+    assert r.status_code == 200
+    _tid, text, pending = app.state.turns[0]
+    assert pending is None
+    assert "Elantris" in text
+
+
+async def test_a_message_without_a_kind_falls_back_to_inference(app, client):
+    """Choices written before the field existed still resolve the way they were
+    written."""
+    tid = await _new_thread(client)
+    msg = await _open_choice(app, tid)  # no choice_kind, magnets present
+    assert msg.choice_kind is None
+
+    r = await client.post(
+        f"/chat/threads/{tid}/choose", json={"message_id": msg.id, "option_index": 0}
+    )
+    assert r.status_code == 200
+    _tid, _text, pending = app.state.turns[0]
+    assert pending is not None and pending[0]["magnet"] == "magnet:?xt=a"

@@ -24,7 +24,14 @@ from ..settings import Settings
 from .bus import ThreadSink
 from .history import render_history
 from .store import ThreadStore, option_from_payload
-from .types import EVENT_ERROR, ChoiceOption, Message, MessageKind, ThreadStatus
+from .types import (
+    EVENT_ERROR,
+    ChoiceKind,
+    ChoiceOption,
+    Message,
+    MessageKind,
+    ThreadStatus,
+)
 
 logger = logging.getLogger("atb.threads.worker")
 settings = Settings()
@@ -123,7 +130,7 @@ async def run_thread_turn(
         log, thread_id=thread_id, thread_log=thread_log, threads=threads
     )
 
-    async def on_ask(question: str, options: list[dict]) -> None:
+    async def on_ask(question: str, kind: str, options: list[dict]) -> None:
         """Turn the agent's options into a choice message.
 
         The magnets stay in `set_pending`; only the presentable fields reach
@@ -147,7 +154,11 @@ async def run_thread_turn(
         await threads.append(
             thread_id,
             Message.new(
-                thread_id, MessageKind.choice, text=question, options=hydrated
+                thread_id,
+                MessageKind.choice,
+                text=question,
+                choice_kind=ChoiceKind(kind),
+                options=hydrated,
             ),
         )
 
