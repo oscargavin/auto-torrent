@@ -3,6 +3,7 @@
 from auto_torrent.server.chapters import (
     AudibleChapters,
     is_placeholder,
+    placeholder_share,
     runtimes_agree,
     to_abs_payload,
     worth_replacing,
@@ -23,6 +24,33 @@ class TestPlaceholderTitles:
     def test_spelled_out_chapter_numbers_say_nothing(self):
         assert is_placeholder("Chapter One")
         assert is_placeholder("chapter three")
+
+    def test_a_number_with_a_letter_says_nothing(self):
+        # The Midnight Library: 189 chapters called 1a, 1b, 1c…
+        for t in ("1a", "1b", "12c"):
+            assert is_placeholder(t)
+
+    def test_disc_labels_say_nothing(self):
+        # Steve Jobs: "01 Audio CD" ×7.
+        assert is_placeholder("01 Audio CD")
+
+    def test_the_books_own_name_says_nothing(self):
+        # Best Served Cold: every chapter is the title plus a number.
+        assert is_placeholder("Best Served Cold 01", "Best Served Cold")
+        assert is_placeholder("Still Life - 04", "Still Life")
+        assert is_placeholder(
+            "01/15 - The Girl Who Played with Fire", "The Girl Who Played with Fire"
+        )
+
+    def test_an_edition_suffix_on_the_book_title_is_ignored(self):
+        # The library title carries "(Unabridged)"; the chapters never do.
+        assert is_placeholder("Dune 001", "Dune (Unabridged)")
+
+    def test_a_numbered_real_title_still_counts(self):
+        # Kitchen Confidential: "001 - Introduction" is a real chapter name
+        # that merely happens to be numbered.
+        assert not is_placeholder("001 - Introduction")
+        assert not is_placeholder("002 - Food Is Good")
 
     def test_empty_says_nothing(self):
         assert is_placeholder("")
@@ -53,6 +81,22 @@ class TestWorthReplacing:
             [{"title": "1. The Riddle House"}, {"title": "2. The Scar"}]
         )
 
+    def test_dune_qualifies(self):
+        # 48 bare "Chapter N" against three part names. The old 5% rule kept
+        # this, which is the case that proved the rule wrong.
+        chapters = (
+            [{"title": "Book One: Dune"}, {"title": "Book Two: Muad'Dib"}, {"title": "Book Three: The Prophet"}]
+            + [{"title": f"Chapter {i}"} for i in range(1, 49)]
+        )
+        assert worth_replacing(chapters, "Dune (Unabridged)")
+
+    def test_identical_titles_qualify_however_wordy(self):
+        # 16 rows reading the same thing tell you as much as 16 reading "001".
+        assert worth_replacing(
+            [{"title": "The Girl with the Dragon Tattoo"}] * 16,
+            "The Girl With The Dragon Tattoo",
+        )
+
     def test_a_mostly_named_list_is_left_alone(self):
         chapters = [{"title": "Opening Credits"}] + [
             {"title": f"Chapter {i} - Something"} for i in range(1, 20)
@@ -64,6 +108,25 @@ class TestWorthReplacing:
             {"title": f"{i:03d}"} for i in range(60)
         ]
         assert worth_replacing(chapters)
+
+    def test_harry_potter_is_left_alone(self):
+        chapters = [{"title": "Opening Credits"}] + [
+            {"title": t}
+            for t in (
+                "Chapter One - Dudley Demented",
+                "Chapter Two - A Peck of Owls",
+                "Chapter Three - The Advance Guard",
+            )
+        ]
+        assert not worth_replacing(chapters, "Harry Potter and the Order of the Phoenix")
+
+
+class TestPlaceholderShare:
+    def test_an_empty_list_is_wholly_uninformative(self):
+        assert placeholder_share([]) == 1.0
+
+    def test_a_mixed_list_reports_the_fraction(self):
+        assert placeholder_share(["001", "002", "The Riddle House", "The Scar"]) == 0.5
 
 
 class TestRuntimesAgree:

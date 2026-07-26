@@ -35,18 +35,31 @@ logger = logging.getLogger("atb.chapters")
 RUNTIME_TOLERANCE = 0.02
 RUNTIME_TOLERANCE_MIN_S = 60
 
-# A chapter title carrying no information: a bare number, a track/part/file
-# label, or nothing at all. These are what ABS derives from filenames.
-_EMPTY_TITLE = re.compile(
-    r"""^\s*(
-        \d+                                  # 001
-        | (chapter|track|part|file|disc|cd)   # Part 001, Track 5
-          \s*[-_.\s]*\d+
-        | (chapter|track|part)\s+
-          (one|two|three|four|five|six|seven|eight|nine|ten)
-    )\s*$""",
-    re.IGNORECASE | re.VERBOSE,
+# Structural words that label a position rather than name one.
+_STRUCTURAL = re.compile(
+    r"\b(chapter|chapters|track|part|section|file|disc|cd|audio|book|volume|"
+    r"unabridged|abridged|prologue\s+to)\b",
+    re.IGNORECASE,
 )
+# Numbers written out, which appear in exactly the same position as digits.
+_SPELLED = re.compile(
+    r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+    r"thirty|forty|fifty)\b",
+    re.IGNORECASE,
+)
+# What a title has to have left, after the noise, to be telling you anything.
+_MIN_MEANINGFUL_LETTERS = 3
+# Parenthetical and bracketed editions on the book's own title, which never
+# appear in its chapter labels: "Dune (Unabridged)", "…[Headphones]".
+_EDITION = re.compile(r"[\(\[][^\)\]]*[\)\]]")
+
+# Above this share of uninformative titles, the list is a file listing wearing
+# chapter clothes. Deliberately not 100%: a release with one real "Opening
+# Credits" and sixty numbered files is still a file listing, and Dune's three
+# part names among forty-eight bare "Chapter N" is the case that made the old
+# 5% rule wrong.
+REPLACE_ABOVE_PLACEHOLDER_SHARE = 0.8
 
 
 @dataclass(frozen=True)
@@ -56,24 +69,60 @@ class AudibleChapters:
     chapters: tuple[tuple[float, str], ...]
 
 
-def is_placeholder(title: str) -> bool:
-    """Does this chapter title tell you anything?"""
-    return bool(_EMPTY_TITLE.match(title or "")) or not (title or "").strip()
+def is_placeholder(title: str, book_title: str = "") -> bool:
+    """Does this chapter title tell you anything?
+
+    Asked by subtraction rather than by pattern: strip the book's own name, the
+    structural words, and every number, and see whether anything is left. An
+    enumerated list of shapes kept missing real cases — `1a`, `01 Audio CD`,
+    `Best Served Cold 01`, `01/15 - The Girl Who Played with Fire` all named
+    nothing while matching nothing.
+
+    `book_title` matters more than it looks: repeating the book's name in every
+    chapter is one of the commonest ways a release ends up with 16 identically
+    labelled "chapters".
+    """
+    text = (title or "").strip()
+    if not text:
+        return True
+    # Underscores are separators in a filename but word characters to a regex,
+    # so `file_03` would keep its "file" and read as meaningful.
+    stripped = text.casefold().replace("_", " ")
+    book = _EDITION.sub(" ", book_title or "").casefold().strip()
+    if book:
+        stripped = stripped.replace(book, " ")
+    stripped = _STRUCTURAL.sub(" ", stripped)
+    stripped = _SPELLED.sub(" ", stripped)
+    # Everything that isn't a letter goes, which takes the digits with it — and
+    # the stray letter in `1a` with them.
+    letters = re.sub(r"[^a-z]", "", stripped)
+    return len(letters) < _MIN_MEANINGFUL_LETTERS
 
 
-def worth_replacing(existing: list[dict]) -> bool:
+def placeholder_share(titles: list[str], book_title: str = "") -> float:
+    """What fraction of these titles name nothing. 1.0 for an empty list."""
+    if not titles:
+        return 1.0
+    # Every chapter carrying the same label is a file listing however much text
+    # it contains — sixteen rows reading "The Girl with the Dragon Tattoo" tell
+    # you exactly as much as sixteen rows reading "001".
+    if len(set(t.strip() for t in titles)) == 1:
+        return 1.0
+    return sum(1 for t in titles if is_placeholder(t, book_title)) / len(titles)
+
+
+def worth_replacing(existing: list[dict], book_title: str = "") -> bool:
     """Whether an item's current chapters are worth overwriting.
 
-    True when the item has none, or when effectively all of them are
-    placeholders. A book with even a handful of real titles is left alone — a
-    partially-named list is far more likely to be correct metadata we don't
-    understand than something worth destroying.
+    True when the item has none, or when the overwhelming majority name
+    nothing. A book with a real set of titles is left alone: Audible's own are
+    frequently just "Chapter 1", so replacing good embedded metadata would be a
+    downgrade rather than a fix.
     """
     if not existing:
         return True
     titles = [str(c.get("title") or "") for c in existing]
-    named = sum(1 for t in titles if not is_placeholder(t))
-    return named <= max(1, len(titles) // 20)
+    return placeholder_share(titles, book_title) >= REPLACE_ABOVE_PLACEHOLDER_SHARE
 
 
 def runtimes_agree(item_s: float, audible_s: float) -> bool:
@@ -170,7 +219,7 @@ async def apply_to_item(abs_client, item_id: str, *, dry_run: bool = False) -> d
     title = meta.get("title") or ""
     author = meta.get("authorName") or ""
 
-    if not worth_replacing(media.get("chapters") or []):
+    if not worth_replacing(media.get("chapters") or [], title):
         return {"applied": False, "reason": "already_named", "title": title}
 
     found = await asyncio.to_thread(lookup, title, author)
