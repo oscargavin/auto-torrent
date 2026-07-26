@@ -20,6 +20,7 @@ from ..covers import find_cover_url
 from ..jobs.store import JobStore
 from ..settings import Settings
 from .bus import ThreadSink
+from .history import render_history
 from .store import ThreadStore, option_from_payload
 from .types import EVENT_ERROR, ChoiceOption, Message, MessageKind, ThreadStatus
 
@@ -116,12 +117,11 @@ async def run_thread_turn(
         )
 
     try:
-        history = [
-            ("user" if m.kind is MessageKind.user else "assistant", m.text)
-            for m in await threads.history_for_agent(thread_id)
+        history = render_history(
+            await threads.history_for_agent(thread_id),
             # The message just posted is the request itself, not history.
-            if m.text and m.text != text
-        ]
+            exclude_last_text=text,
+        )
 
         outcome = await run_agent(
             text,

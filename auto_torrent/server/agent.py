@@ -158,10 +158,29 @@ never repeat the title inside it.
 Put your one line of context in the tool's `question` argument, not in a
 separate message.
 
-FOLLOW-UPS. The conversation continues. They may reply to what you just did:
-"something shorter", "anything else by her", "no, the other one". Earlier
-messages are above — read them, and treat a follow-up as referring to what was
-just discussed rather than as a fresh request."""
+FOLLOW-UPS. The conversation continues, and browsing is a legitimate way to
+use it — they do not have to buy on the first list. Earlier turns are above,
+including every option you offered and which one they picked, so resolve a
+follow-up against that rather than treating it as a fresh request.
+
+Expect all of these:
+- Refining by position: "the second one", "that first one but shorter". You can
+  see the numbered list you offered; resolve it yourself and never ask them to
+  repeat the title.
+- Going a level deeper: "I like the idea of the Murderbot one, more like that?"
+  That is a NEW suggestion round anchored on the book they named — offer 3-4
+  fresh titles closer to it, and do not re-offer anything already on a list
+  above. Say in one line what you narrowed towards ("leaning into the wry
+  first-person ones").
+- Rejecting the whole list: "none of these", "something lighter". Offer a
+  different set, on a different axis; repeating yourself with one swap is the
+  failure mode here.
+- Switching entirely. If they name a new book, drop the thread of suggestions
+  and just find it.
+
+They may go several rounds before choosing anything. That is the feature
+working, not a loop to escape — keep offering until they pick one or ask you
+to decide."""
 
 
 def _system_prompt(allow_ask: bool, is_app: bool) -> str:
