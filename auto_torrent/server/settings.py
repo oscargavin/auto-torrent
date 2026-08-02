@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # runs when a profile's finished books change (or on refresh).
     rec_cache_path: str = "rec-cache.json"
 
+    # Per-(book, chapter) "previously on…" recap cache — recaps of a published
+    # book never change, so Claude runs once per chapter per book, ever.
+    recap_cache_path: str = "recap-cache.json"
+
     redis_url: str = "redis://127.0.0.1:6379/0"
     # How long completed/failed job rows live in Redis before GC.
     job_state_ttl_s: int = 7 * 24 * 3600

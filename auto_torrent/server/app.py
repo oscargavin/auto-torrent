@@ -19,6 +19,7 @@ from .agent import AgentOutcome, run_agent
 from .event_types import EVENT_PROGRESS, STAGE_DOWNLOADING, STAGE_FOUND
 from .llm import clear_conversation, get_pending_options, get_pending_result
 from .profiles import ALLOWED_AVATAR_STYLES, ProfileStore, public_view
+from .recap import RECAP_CACHE_TTL_S, build_recap
 from .recommend import DEFAULT_N, RecCache, build_recommendations
 from .settings import Settings
 from .sms import SMSClient
@@ -38,6 +39,7 @@ settings = Settings()
 sms = SMSClient(settings)
 profile_store = ProfileStore(settings)
 rec_cache = RecCache(settings.rec_cache_path)
+recap_cache = RecCache(settings.recap_cache_path, ttl_s=RECAP_CACHE_TTL_S)
 
 # Strong references to detached /chat work tasks so they aren't garbage-collected
 # if the client disconnects mid-download (app backgrounded/closed).
@@ -737,6 +739,36 @@ class RecommendRequest(BaseModel):
     exclude: list[str] = []
     refresh: bool = False
     n: int = DEFAULT_N
+
+
+# --- Bookkeeper "previously on…" recaps ----------------------------------
+#
+# A spoiler-safe recap of the story so far, for re-opening a book after weeks
+# away. Claude recaps from its knowledge of the published work and refuses
+# (recap: null) when it doesn't know the book — the app then shows only its
+# local "last heard N days ago" line. Cached per (book, chapter); shared across
+# profiles because a recap has no personal content. See recap.py.
+
+
+class RecapRequest(BaseModel):
+    title: str
+    author: str = ""
+    chapter_index: int = 0
+    chapter_title: str = ""
+    chapters_total: int = 0
+
+
+@app.post("/recap")
+async def recap(req: RecapRequest, _: None = Depends(_require_bearer)) -> dict:
+    text = await build_recap(
+        req.title,
+        req.author,
+        max(0, req.chapter_index),
+        req.chapter_title,
+        max(0, req.chapters_total),
+        cache=recap_cache,
+    )
+    return {"recap": text}
 
 
 @app.post("/recommend")
