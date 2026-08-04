@@ -17,7 +17,7 @@ from pathlib import Path
 
 import libtorrent as lt
 
-from . import abb, tpb
+from . import abb, abb_index, tpb
 from .abb import ABBError
 from .config import (
     DEFAULT_LIMIT, DEFAULT_TRACKERS, DHT_BOOTSTRAP_NODES, DOWNLOAD_DIR,
@@ -1232,14 +1232,42 @@ def _build_parser(prog: str = "auto-torrent", default_source: str = "abb") -> ar
     stream_p.add_argument("--json", action="store_true", help="Output structured JSON")
     stream_p.add_argument("--proxy", help="Proxy URL (socks5h://user:pass@host:port or http://host:port)")
 
+    # index (local mirror of AudiobookBay listings — their own search is broken)
+    index_p = subs.add_parser("index", help="Manage the local AudiobookBay index")
+    index_p.add_argument(
+        "action", choices=["backfill", "refresh", "search", "count"],
+        help="backfill: crawl every category (~20 min); refresh: pick up new posts",
+    )
+    index_p.add_argument("query", nargs="*", help="Query for the search action")
+
     return parser
+
+
+def cmd_index(args: argparse.Namespace) -> None:
+    if args.action == "backfill":
+        started = time.time()
+        total = abb_index.backfill(
+            on_archive=lambda cat, pages, new: print(
+                f"  {cat:26} {pages:>4} pages  +{new} new", flush=True
+            )
+        )
+        print(f"backfill: +{total} new posts, {abb_index.count()} indexed, {time.time() - started:.0f}s")
+    elif args.action == "refresh":
+        print(f"refresh: +{abb_index.refresh()} new posts, {abb_index.count()} indexed")
+    elif args.action == "count":
+        print(abb_index.count())
+    else:
+        for r in abb_index.search(" ".join(args.query)):
+            print(f"{r.title}\n  {r.link}  [{r.format} {r.file_size} {r.posted}]")
 
 
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
-    if args.command == "search":
+    if args.command == "index":
+        cmd_index(args)
+    elif args.command == "search":
         cmd_search(args)
     elif args.command == "download":
         cmd_download(args)

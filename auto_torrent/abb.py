@@ -1,3 +1,5 @@
+import base64
+import binascii
 import random
 import re
 import time
@@ -5,7 +7,7 @@ from dataclasses import replace
 from urllib.parse import quote
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
@@ -72,69 +74,89 @@ def _delay() -> None:
     time.sleep(random.uniform(*_REQUEST_DELAY))
 
 
+def _decoded(post: Tag) -> Tag:
+    """Some listing pages ship their posts base64'd into a hidden div for the
+    page's own JS to expand (`<div class="post re-ab" style="display:none">`).
+    Decode those so the markup looks the same either way."""
+    if post.select_one(".postTitle"):
+        return post
+    try:
+        html = base64.b64decode(post.get_text(strip=True), validate=True).decode("utf-8", "ignore")
+    except (ValueError, binascii.Error):
+        return post
+    return BeautifulSoup(html, "html.parser")
+
+
+def parse_listing(html: str) -> list[SearchResult]:
+    """Parse any AudiobookBay listing page (search, homepage, category, tag)."""
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[SearchResult] = []
+
+    for post in soup.select(".post"):
+        post = _decoded(post)
+        title_el = post.select_one(".postTitle > h2 > a")
+        if not title_el:
+            continue
+
+        fields: dict[str, str] = {}
+        details_p = post.select_one(".postContent p[style*='text-align:center']")
+        if details_p:
+            details = str(details_p)
+            for field in ("Format", "Bitrate", "File Size"):
+                m = re.search(rf"{field}:\s*<span[^>]*>([^<]+)</span>\s*([^<]*)", details)
+                if m:
+                    fields[field] = f"{m.group(1).strip()} {m.group(2).strip()}".strip()
+            date_m = re.search(r"Posted:\s*([^<]+)", details)
+            if date_m:
+                fields["Posted"] = date_m.group(1).strip()
+
+        results.append(SearchResult(
+            title=title_el.text.strip(),
+            link=f"{ABB_BASE_URL}{title_el['href']}",
+            format=fields.get("Format", ""),
+            bitrate=fields.get("Bitrate", ""),
+            file_size=fields.get("File Size", ""),
+            posted=fields.get("Posted", ""),
+        ))
+    return results
+
+
+def fetch_html(path: str) -> str:
+    """GET one page off the site. Raises ABBError on any transport failure."""
+    try:
+        resp = _get_session().get(f"{ABB_BASE_URL}{path}", timeout=_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.ConnectTimeout:
+        raise ABBError("AudiobookBay is not responding (connection timed out)")
+    except requests.HTTPError as e:
+        raise ABBError(f"AudiobookBay returned an error (HTTP {e.response.status_code})")
+    except requests.RequestException:
+        raise ABBError("AudiobookBay is unreachable (connection failed)")
+    return resp.text
+
+
+def fetch_listing(path: str) -> list[SearchResult]:
+    return parse_listing(fetch_html(path))
+
+
 def search(query: str, max_pages: int = 2) -> list[SearchResult]:
-    session = _get_session()
     results: list[SearchResult] = []
     for page in range(1, max_pages + 1):
         if page > 1 or results:
             _delay()
 
-        url = f"{ABB_BASE_URL}/page/{page}/?s={query.lower().replace(' ', '+')}"
-        try:
-            resp = session.get(url, timeout=_REQUEST_TIMEOUT)
-            resp.raise_for_status()
-        except requests.ConnectTimeout:
-            raise ABBError("AudiobookBay is not responding (connection timed out)")
-        except requests.ConnectionError:
-            raise ABBError("AudiobookBay is unreachable (connection failed)")
-        except requests.HTTPError as e:
-            raise ABBError(f"AudiobookBay returned an error (HTTP {e.response.status_code})")
-        except requests.RequestException:
+        page_results = fetch_listing(f"/page/{page}/?s={query.lower().replace(' ', '+')}")
+        if not page_results:
             break
+        results.extend(page_results)
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        posts = soup.select(".post")
-        if not posts:
-            break
+    # Their own search index has been returning nothing for every query since
+    # Aug 2026 while the site itself serves fine, so fall back to the local
+    # mirror of their listing pages (see abb_index).
+    if not results:
+        from . import abb_index
 
-        for post in posts:
-            title_el = post.select_one(".postTitle > h2 > a")
-            if not title_el:
-                continue
-
-            title = title_el.text.strip()
-            link = f"{ABB_BASE_URL}{title_el['href']}"
-
-            fmt = ""
-            bitrate = ""
-            file_size = ""
-            posted = ""
-
-            details_p = post.select_one(".postContent p[style*='text-align:center']")
-            if details_p:
-                html = str(details_p)
-                for field, attr in [("Format", "format"), ("Bitrate", "bitrate"), ("File Size", "file_size")]:
-                    m = re.search(rf"{field}:\s*<span[^>]*>([^<]+)</span>\s*([^<]*)", html)
-                    if m:
-                        val = f"{m.group(1).strip()} {m.group(2).strip()}".strip()
-                        if attr == "format":
-                            fmt = val
-                        elif attr == "bitrate":
-                            bitrate = val
-                        else:
-                            file_size = val
-                date_m = re.search(r"Posted:\s*([^<]+)", html)
-                if date_m:
-                    posted = date_m.group(1).strip()
-
-            results.append(SearchResult(
-                title=title,
-                link=link,
-                format=fmt,
-                bitrate=bitrate,
-                file_size=file_size,
-                posted=posted,
-            ))
+        return abb_index.search(query)
     return results
 
 
