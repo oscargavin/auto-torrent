@@ -207,7 +207,22 @@ def _organize_files(
     if src.exists() and not any(src.iterdir()):
         src.rmdir()
 
+    _split_boxset(dest)
     return dest
+
+
+def _split_boxset(dest: Path) -> None:
+    """One .m4b is one book. A release that ships several (a series box set)
+    would otherwise scan as a single 400-hour item, so each extra .m4b moves
+    to its own sibling folder named after the file."""
+    m4bs = sorted(dest.rglob("*.m4b"))
+    if len(m4bs) < 2:
+        return
+    for f in m4bs:
+        book = dest.parent / _sanitize(f.stem)
+        book.mkdir(exist_ok=True)
+        shutil.move(str(f), str(book / f.name))
+    shutil.rmtree(dest)
 
 
 def _refresh_state(download_id: str) -> dict | None:

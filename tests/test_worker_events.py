@@ -538,3 +538,24 @@ def test_no_seeders_message_explains_the_problem():
     )
     assert "sharing" in result.message
     assert result.failure_class == "no_seeders"
+
+
+def test_organize_splits_a_boxset_into_one_folder_per_m4b(tmp_path):
+    src = tmp_path / "landing" / "RotE" / "01 Novels"
+    src.mkdir(parents=True)
+    for n in ("RotE 01 Book One.m4b", "RotE 02 Book Two.m4b"):
+        (src / n).write_bytes(b"x")
+    lib = tmp_path / "lib"
+    _organize_files(str(tmp_path / "landing"), str(lib), "Robin Hobb", "Book One")
+    assert sorted(p.name for p in (lib / "Robin Hobb").iterdir()) == ["RotE 01 Book One", "RotE 02 Book Two"]
+    assert (lib / "Robin Hobb" / "RotE 02 Book Two" / "RotE 02 Book Two.m4b").exists()
+
+
+def test_organize_leaves_a_single_m4b_alone(tmp_path):
+    src = tmp_path / "landing"
+    src.mkdir()
+    (src / "Dune.m4b").write_bytes(b"x")
+    lib = tmp_path / "lib"
+    dest = _organize_files(str(src), str(lib), "Frank Herbert", "Dune")
+    assert dest == lib / "Frank Herbert" / "Dune"
+    assert (dest / "Dune.m4b").exists()
