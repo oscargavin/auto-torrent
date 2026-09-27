@@ -275,6 +275,41 @@ async def test_rediscovery_capped(tmp_path, monkeypatch):
     assert any("Couldn't get" in s for s in sink.sent)
 
 
+@pytest.mark.anyio
+async def test_rediscovery_skips_candidates_for_other_books(tmp_path, monkeypatch):
+    """A re-search for "The Late Lord Thorpe" once returned a 75 GB Horus
+    Heresy collection (one author is Gav Thorpe), and the fallback took it."""
+    monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
+    monkeypatch.setattr(worker_module, "_watch_until_done", lambda _id, **_kw: _async("failed"))
+    monkeypatch.setattr(
+        worker_module, "_refresh_state",
+        lambda _id: {"id": _id, "magnet": "magnet:dead", "status": "failed"},
+    )
+    monkeypatch.setattr(worker_module, "_kill_download_and_clean", lambda _s: _async(None))
+    started = []
+    monkeypatch.setattr(
+        worker_module, "_execute_download_bg",
+        lambda title, magnet, cover: started.append(magnet) or {"id": "dN", "magnet": magnet},
+    )
+    monkeypatch.setattr(
+        worker_module, "_rediscover_candidates",
+        lambda q, t: _async([{
+            "magnet": "magnet:hh",
+            "title": "The Horus Heresy Ultimate Complete Collection v1.3 - Dan Abnett, Gav Thorpe, Various",
+        }]),
+    )
+
+    settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
+    with pytest.raises(worker_module.NoCandidatesLeftError):
+        await poll_and_finalise(
+            download={"id": "d1", "magnet": "magnet:dead"}, fallbacks=[],
+            display="“The Late Lord Thorpe”", author="Peter Grainger",
+            title="The Late Lord Thorpe", phone="s", settings=settings,
+            sms=BusSink(), query="The late lord thorpe",
+        )
+    assert started == []
+
+
 def test_organize_files_namespaces_on_collision(tmp_path):
     library = tmp_path / "library"
 

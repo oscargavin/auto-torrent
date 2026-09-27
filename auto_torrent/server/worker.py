@@ -15,6 +15,8 @@ from pathlib import Path
 
 from typing import Awaitable, Callable
 
+from rapidfuzz import fuzz
+
 from ..cli import _execute_download_bg, _read_state, _resolve_status
 from ..config import STATE_DIR
 from .audiobookshelf import ABSClient
@@ -38,6 +40,10 @@ POLL_TIMEOUT_S = 60 * 60       # 60 min per attempt (legacy callers, no job dead
 JOB_BUDGET_S = 60 * 60         # whole-job wall clock when a deadline is supplied
 STALL_GRACE_S = 3 * 60         # progress must move within 3 min or we declare stalled
 MAX_REDISCOVERY_ROUNDS = 2     # how many times to re-search when fallbacks run dry
+# A re-search has no agent to judge its hits, and the pipeline returns its
+# best guesses even when none match. "The Late Lord Thorpe" once fell back to
+# an 80 GB Horus Heresy collection because Gav Thorpe is one of its authors.
+REDISCOVERY_MIN_TITLE_MATCH = 90
 
 
 async def _reprobe_seeders(magnet: str) -> int:
@@ -71,6 +77,10 @@ async def _rediscover_candidates(query: str, tried_magnets: set[str]) -> list[di
         if magnet and magnet not in tried_magnets:
             out.append({"magnet": magnet, "title": r.get("title", "")})
     return out
+
+
+def _matches_title(candidate: str, title: str) -> bool:
+    return fuzz.partial_ratio(title.lower(), candidate.lower()) >= REDISCOVERY_MIN_TITLE_MATCH
 
 
 def _emit_event(sink: object, event: str, data: dict) -> None:
@@ -380,8 +390,7 @@ async def poll_and_finalise(
                     rediscovery_rounds += 1
                     logger.info("Rediscovery round %d for %s", rediscovery_rounds, display)
                     found = await _rediscover_candidates(query, tried_magnets)
-                    if found:
-                        fallbacks.extend(found)
+                    fallbacks.extend(f for f in found if _matches_title(f["title"], title))
                 if not fallbacks:
                     logger.info("No fallbacks left for %s", display)
                     sms.send(phone, f"Couldn't get {display} tonight, sorry — try in the morning?")
