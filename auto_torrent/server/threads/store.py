@@ -29,6 +29,7 @@ from .types import (
     ChoiceOption,
     Message,
     MessageKind,
+    Step,
     Thread,
     ThreadStatus,
 )
@@ -54,6 +55,10 @@ def _messages_key(thread_id: str) -> str:
 
 def _profile_key(profile_id: str) -> str:
     return f"thread:by_profile:{profile_id}"
+
+
+def _live_key(thread_id: str) -> str:
+    return f"thread:{thread_id}:live"
 
 
 def _pending_key(thread_id: str) -> str:
@@ -121,6 +126,10 @@ class ThreadStore:
         )
         await self._r.zadd(_profile_key(current.profile_id), {thread_id: updated_at})
         await self._r.expire(_thread_key(thread_id), self._ttl)
+        if status is not ThreadStatus.working:
+            # Every way a turn ends passes through here, the crash path and the
+            # stuck-thread reaper included, so live steps can never outlive it.
+            await self._r.delete(_live_key(thread_id))
         await self._log.publish(thread_id, EVENT_STATUS, {"status": status.value})
         return current.model_copy(update={"status": status, "updated_at": updated_at})
 
@@ -132,6 +141,22 @@ class ThreadStore:
             if thread is not None:
                 out.append(thread)
         return out
+
+    # ---- live steps ----
+
+    async def set_live_steps(self, thread_id: str, steps: list[Step]) -> None:
+        """Replace the running turn's unpersisted steps. Empty clears them."""
+        if not steps:
+            await self._r.delete(_live_key(thread_id))
+            return
+        payload = json.dumps([s.model_dump(mode="json") for s in steps])
+        await self._r.set(_live_key(thread_id), payload, ex=self._ttl)
+
+    async def live_steps(self, thread_id: str) -> list[Step]:
+        raw = await self._r.get(_live_key(thread_id))
+        if not raw:
+            return []
+        return [Step.model_validate(s) for s in json.loads(raw)]
 
     # ---- messages ----
 

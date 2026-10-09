@@ -14,7 +14,13 @@ import logging
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Literal
 
-from claude_agent_sdk import ClaudeAgentOptions, create_sdk_mcp_server, query, tool
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ResultMessage,
+    create_sdk_mcp_server,
+    query,
+    tool,
+)
 
 from .. import abb
 from ..cli import (
@@ -255,6 +261,9 @@ class AgentOutcome:
     # rather than silently landing in a shared family library.
     narrator: str = ""
     file_format: str = ""
+    # The agent loop died rather than finishing. Whatever the agent said before
+    # that was mid-search narration, so the turn still owes the user an answer.
+    crashed: bool = False
 
 
 def _truncate(text: str, n: int = 220) -> str:
@@ -728,8 +737,12 @@ async def run_agent(
     if allow_ask:
         allowed_tools.append("mcp__atb__ask_user_to_pick")
 
+    # The SDK reports running out of turns as a result message, then raises the
+    # same bare "exit code 1" as a dead CLI. Remembered so the two get different
+    # sentences: one is a search that needs a narrower request, the other is ours.
+    ran_out = False
     try:
-        async for _ in query(
+        async for msg in query(
             prompt=user_prompt,
             options=ClaudeAgentOptions(
                 model=AGENT_MODEL,
@@ -737,12 +750,32 @@ async def run_agent(
                 system_prompt=_system_prompt(allow_ask, on_ask is not None),
                 mcp_servers={"atb": server},
                 allowed_tools=allowed_tools,
+                # Without this the CLI's own error text is lost ("Check stderr
+                # output for details"), and an auth failure looks like any other.
+                stderr=lambda line: logger.warning("claude cli: %s", line.rstrip()),
             ),
         ):
+            if isinstance(msg, ResultMessage) and msg.subtype == "error_max_turns":
+                ran_out = True
             if state["outcome"] is not None:
                 # Tool already terminated the agent's job.
                 continue
     except Exception:
+        if state["outcome"] is not None:
+            # A tool had already settled the turn; the CLI dying afterwards
+            # changes nothing the user needs to hear about.
+            logger.warning("agent loop ended with an error after the outcome was set")
+            return state["outcome"]
+        if ran_out:
+            logger.warning("agent ran out of turns (%d)", AGENT_MAX_TURNS)
+            return AgentOutcome(
+                kind="error",
+                crashed=True,
+                message=(
+                    "I searched for a while but couldn't pin down the right copy. "
+                    "Try the exact title and author, or name the narrator."
+                ),
+            )
         # Typically the claude CLI subprocess dying — an expired subscription
         # token surfaces here as a bare "Command failed with exit code 1".
         # The traceback goes to the log for us; the card gets a sentence that
@@ -750,6 +783,7 @@ async def run_agent(
         logger.exception("agent loop crashed")
         return AgentOutcome(
             kind="error",
+            crashed=True,
             message="Couldn't reach the book finder just now. Try again shortly.",
         )
 

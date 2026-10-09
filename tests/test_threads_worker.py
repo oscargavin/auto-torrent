@@ -478,3 +478,63 @@ async def test_one_lookup_per_book_not_per_option(ctx, monkeypatch):
     # Every row still gets the answer.
     opts = (await ctx["threads"].messages(thread.id))[0].options
     assert [o.rating for o in opts] == [4.5, 4.5, 4.5]
+
+
+async def test_a_failed_search_after_narration_still_answers(ctx, monkeypatch):
+    """Narration used to count as having spoken, so a turn that searched and
+    then failed ended with its steps and no reply — the app looked stuck."""
+    async def fake_run_agent(raw_query, phone, settings, sms, **kw):
+        await sms.emit_async("progress", {"text": "Searching…"})
+        return AgentOutcome(kind="no_results", message="I couldn't find that one.")
+
+    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "dune")
+
+    msgs = await ctx["threads"].messages(thread.id)
+    assert [m.kind for m in msgs] == [MessageKind.steps, MessageKind.assistant]
+    assert msgs[1].text == "I couldn't find that one."
+
+
+async def test_a_crash_after_the_agent_spoke_still_answers(ctx, monkeypatch):
+    """Running out of turns mid-search: what the agent said was narration
+    ("Let me check the omnibus"), not an answer."""
+    async def fake_run_agent(raw_query, phone, settings, sms, **kw):
+        await asyncio.to_thread(sms.send, phone, "Let me check the omnibus.")
+        return AgentOutcome(kind="error", crashed=True, message="Try the exact title.")
+
+    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "dune")
+
+    texts = [m.text for m in await ctx["threads"].messages(thread.id)]
+    assert texts[-1] == "Try the exact title."
+
+
+async def test_running_steps_are_in_the_snapshot_until_the_turn_ends(ctx, monkeypatch):
+    """A client that missed the live stream (backgrounded, or cold-started)
+    rebuilds the thinking row from the snapshot instead of showing it empty."""
+    seen: dict = {}
+
+    async def fake_run_agent(raw_query, phone, settings, sms, **kw):
+        await sms.emit_async("progress", {"text": "Searching…"})
+        await sms.emit_async("progress", {"text": "Found 8 copies…"})
+        seen["mid"] = [s.text for s in await ctx["threads"].live_steps(thread.id)]
+        await asyncio.to_thread(sms.send, phone, "Two editions.")
+        await sms.drain()
+        seen["after_reply"] = await ctx["threads"].live_steps(thread.id)
+        await sms.emit_async("progress", {"text": "Checking covers…"})
+        seen["next_group"] = [s.text for s in await ctx["threads"].live_steps(thread.id)]
+        return AgentOutcome(kind="replied", message="Two editions.")
+
+    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    thread = await ctx["threads"].create("p1")
+
+    await worker_mod.run_thread_turn(ctx, thread.id, "dune")
+
+    assert seen["mid"] == ["Searching…", "Found 8 copies…"]
+    assert seen["after_reply"] == []
+    assert seen["next_group"] == ["Checking covers…"]
+    assert await ctx["threads"].live_steps(thread.id) == []

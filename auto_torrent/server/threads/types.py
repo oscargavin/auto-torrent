@@ -183,6 +183,11 @@ class ThreadView(BaseModel):
 
     thread: Thread
     messages: list[Message]
+    # The steps of the turn still running, not yet persisted as a `steps`
+    # message. Without them, a client that missed the live stream (the app was
+    # backgrounded, or killed and cold-started) showed a thinking row with
+    # nothing in it for the rest of the turn, which read as a hang.
+    live_steps: list[Step] = Field(default_factory=list)
 
 
 class CreateThreadRequest(BaseModel):

@@ -56,6 +56,11 @@ class ThreadSink(StreamEventBus):
         self._thread_log = thread_log
         self._threads = threads
         self._steps: list[Step] = []
+        # Whether the agent said anything to the user in its own words.
+        # `messaged` cannot answer that here: every narration line sets it, so a
+        # turn that searched and then failed looked as if it had already
+        # explained itself, and ended with no reply at all.
+        self.spoke = False
         # Writes are scheduled fire-and-forget from tool callbacks, and each one
         # appends twice (its step group, then its message). Without a lock two
         # scheduled writes interleave and the transcript comes out as
@@ -85,8 +90,17 @@ class ThreadSink(StreamEventBus):
             self._steps.append(
                 Step(text=text, stage=str(payload.get("stage") or ""), at=time.time())
             )
+            await self._save_live()
         await self._thread_log.publish(self._thread_id, EVENT_ACTIVITY, payload)
         self.messaged = True
+
+    async def _save_live(self) -> None:
+        """Mirror the unpersisted steps into the thread snapshot, for a client
+        that was not listening when they streamed."""
+        try:
+            await self._threads.set_live_steps(self._thread_id, list(self._steps))
+        except Exception:  # noqa: BLE001
+            logger.exception("thread %s: live steps write failed", self._thread_id)
 
     def take_steps(self) -> list[Step]:
         """Detach the accumulated group. Synchronous on purpose — see `send`."""
@@ -103,6 +117,7 @@ class ThreadSink(StreamEventBus):
         rather than needing to be detected.
         """
         await self._append_steps(self.take_steps())
+        await self._save_live()
 
     async def _append_steps(self, steps: list[Step]) -> None:
         if not steps:
@@ -132,6 +147,7 @@ class ThreadSink(StreamEventBus):
             return
         steps = self.take_steps()
         self.messaged = True
+        self.spoke = True
         self._loop.call_soon_threadsafe(
             lambda: self._track(_schedule(self._write_reply(text.strip(), steps)))
         )
@@ -155,6 +171,7 @@ class ThreadSink(StreamEventBus):
         if not text:
             return
         self.messaged = True
+        self.spoke = True
         await self._write_reply(text, self.take_steps())
 
     async def _write_reply(self, text: str, steps: list[Step]) -> None:
@@ -165,6 +182,8 @@ class ThreadSink(StreamEventBus):
 
     async def _write_reply_locked(self, text: str, steps: list[Step]) -> None:
         await self._append_steps(steps)
+        # The group just persisted; the snapshot keeps only what came after.
+        await self._save_live()
         try:
             await self._threads.append(
                 self._thread_id,

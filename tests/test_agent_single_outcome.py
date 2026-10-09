@@ -98,3 +98,25 @@ async def test_the_first_terminal_call_still_works(tools):
     """The guard must not break the normal single-outcome path."""
     out = await tools["reply"]({"text": "Piranesi is about a house."})
     assert "replied" in out["content"][0]["text"]
+
+
+async def test_running_out_of_turns_gets_its_own_answer(monkeypatch):
+    """The SDK reports max turns as a result message, then raises the same bare
+    "exit code 1" as a dead CLI. The user hears what to do differently."""
+    from claude_agent_sdk import ResultMessage
+
+    async def fake_query(prompt, options):
+        yield ResultMessage(
+            subtype="error_max_turns", duration_ms=1, duration_api_ms=1,
+            is_error=True, num_turns=16, session_id="s",
+        )
+        raise Exception("Command failed with exit code 1 (exit code: 1)")
+
+    monkeypatch.setattr(agent_mod, "create_sdk_mcp_server", lambda name, tools: object())
+    monkeypatch.setattr(agent_mod, "query", fake_query)
+
+    outcome = await agent_mod.run_agent("dune", "t1", agent_mod.Settings(), _Sink())
+
+    assert outcome.kind == "error"
+    assert outcome.crashed
+    assert "exact title" in outcome.message

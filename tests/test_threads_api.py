@@ -5,7 +5,7 @@ from httpx import ASGITransport, AsyncClient
 from auto_torrent.server.jobs.events import EventLog
 from auto_torrent.server.threads.api import build_router
 from auto_torrent.server.threads.store import ThreadStore
-from auto_torrent.server.threads.types import Message, MessageKind, ThreadStatus
+from auto_torrent.server.threads.types import Message, MessageKind, Step, ThreadStatus
 
 
 @pytest.fixture
@@ -284,3 +284,18 @@ async def test_a_message_without_a_kind_falls_back_to_inference(app, client):
     assert r.status_code == 200
     _tid, _text, pending = app.state.turns[0]
     assert pending is not None and pending[0]["magnet"] == "magnet:?xt=a"
+
+
+async def test_get_thread_carries_the_running_turns_steps(app, client):
+    """The steps a backgrounded client missed come back with the snapshot, and
+    only while the turn is running."""
+    tid = await _new_thread(client)
+    store = app.state.store
+    await store.set_status(tid, ThreadStatus.working)
+    await store.set_live_steps(tid, [Step(text="Searching…", at=1.0)])
+    body = (await client.get(f"/chat/threads/{tid}")).json()
+    assert [s["text"] for s in body["live_steps"]] == ["Searching…"]
+
+    await store.set_status(tid, ThreadStatus.idle)
+    body = (await client.get(f"/chat/threads/{tid}")).json()
+    assert body["live_steps"] == []

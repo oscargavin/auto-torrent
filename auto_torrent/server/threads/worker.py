@@ -236,7 +236,7 @@ async def run_thread_turn(
         # end in silence.
         await sink.drain()
         await sink.flush_steps()
-        if not sink.messaged:
+        if outcome.crashed or not sink.spoke:
             await threads.append(
                 thread_id,
                 Message.new(

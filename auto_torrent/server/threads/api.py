@@ -64,7 +64,14 @@ def build_router(
         thread_id: str, _: None = Depends(_require_bearer)
     ) -> ThreadView:
         thread = await _require_thread(thread_id)
-        return ThreadView(thread=thread, messages=await threads.messages(thread_id))
+        live = (
+            await threads.live_steps(thread_id)
+            if thread.status is ThreadStatus.working
+            else []
+        )
+        return ThreadView(
+            thread=thread, messages=await threads.messages(thread_id), live_steps=live
+        )
 
     @router.post("/chat/threads/{thread_id}/messages", response_model=Message)
     async def post_message(
