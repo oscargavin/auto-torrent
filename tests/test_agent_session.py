@@ -100,3 +100,24 @@ async def test_the_pool_closes_idle_sessions_and_keeps_only_a_few(pool):
         session.last_used -= worker_mod.SESSION_IDLE_S + 1
     await worker_mod.close_idle_sessions()
     assert pool == {}
+
+
+async def test_two_turns_on_one_session_run_one_after_the_other():
+    import asyncio
+
+    order: list = []
+
+    async def slow(prompt, options):
+        order.append(("start", prompt.split("'")[1]))
+        await asyncio.sleep(0.05)
+        order.append(("end", prompt.split("'")[1]))
+        return
+        yield
+
+    with patch.object(agent_module, "ClaudeSDKClient", fake_client(slow)):
+        session = agent_module.AgentSession()
+        await asyncio.gather(
+            agent_module.run_agent("one", "t1", object(), _Bus(), on_ask=_no_ask, session=session),
+            agent_module.run_agent("two", "t1", object(), _Bus(), on_ask=_no_ask, session=session),
+        )
+    assert order == [("start", "one"), ("end", "one"), ("start", "two"), ("end", "two")]

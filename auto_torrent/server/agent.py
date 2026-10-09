@@ -765,6 +765,9 @@ class AgentSession:
         self.probing: dict[str, asyncio.Task] = {}
         self._new_turn("", "", None, None, None)
         self._client: ClaudeSDKClient | None = None
+        # One turn at a time. Two turns raced on one session in a live test:
+        # the second found the CLI still connecting and crashed.
+        self._lock = asyncio.Lock()
         self._server = create_sdk_mcp_server(name="atb", tools=_build_tools(self))
 
     def _new_turn(self, raw_query, phone, settings, sms, on_ask) -> None:
@@ -790,14 +793,15 @@ class AgentSession:
     ) -> AgentOutcome:
         """Run one request. `history` is used only on the session's first turn:
         after that the session remembers the conversation itself."""
-        self._new_turn(raw_query, phone, settings, sms, on_ask)
         self.last_used = time.monotonic()
-        prompt = _prompt(raw_query, pending_options, history if self.turns == 0 else None)
-        self.turns += 1
-        try:
-            return await self._run(prompt)
-        finally:
-            self.last_used = time.monotonic()
+        async with self._lock:
+            self._new_turn(raw_query, phone, settings, sms, on_ask)
+            prompt = _prompt(raw_query, pending_options, history if self.turns == 0 else None)
+            self.turns += 1
+            try:
+                return await self._run(prompt)
+            finally:
+                self.last_used = time.monotonic()
 
     async def _run(self, prompt: str) -> AgentOutcome:
         state = self.state
@@ -811,8 +815,9 @@ class AgentSession:
             if self._client is None:
                 options = _options()
                 options.mcp_servers = {"atb": self._server}
-                self._client = ClaudeSDKClient(options=options)
-                await self._client.connect()
+                client = ClaudeSDKClient(options=options)
+                await client.connect()
+                self._client = client
             await self._client.query(prompt)
             async for msg in self._client.receive_response():
                 if isinstance(msg, ResultMessage):

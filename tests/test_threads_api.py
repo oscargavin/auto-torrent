@@ -299,3 +299,14 @@ async def test_get_thread_carries_the_running_turns_steps(app, client):
     await store.set_status(tid, ThreadStatus.idle)
     body = (await client.get(f"/chat/threads/{tid}")).json()
     assert body["live_steps"] == []
+
+
+async def test_a_second_message_sent_straight_away_is_refused(client):
+    """Observed live: two quick messages both passed the working check,
+    because the worker had not picked the first one up yet, and two turns
+    ran on one conversation at once."""
+    tid = await _new_thread(client)
+    first = await client.post(f"/chat/threads/{tid}/messages", json={"text": "dune"})
+    second = await client.post(f"/chat/threads/{tid}/messages", json={"text": "and its sequel"})
+    assert first.status_code == 200
+    assert second.status_code == 409

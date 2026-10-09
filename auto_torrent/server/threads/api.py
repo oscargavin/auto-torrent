@@ -95,6 +95,10 @@ def build_router(
         message = await threads.append(
             thread_id, Message.new(thread_id, MessageKind.user, text=req.text)
         )
+        # Working from the moment the turn is accepted, not from when the worker
+        # picks it up: in that gap a second message passed the check above and
+        # two turns ran at once.
+        await threads.set_status(thread_id, ThreadStatus.working)
         await enqueue_turn(thread_id, req.text, None)
         return message
 
@@ -130,6 +134,10 @@ def build_router(
             thread_id,
             Message.new(thread_id, MessageKind.user, text=CHOICE_ECHO.format(title=title)),
         )
+
+        # Working from now, as in post_message: a message typed straight after
+        # the tap would otherwise start a second turn alongside this one.
+        await threads.set_status(thread_id, ThreadStatus.working)
 
         # The agent told us which question it asked, so this dispatches on that
         # rather than reconstructing it from whether the option happens to carry
