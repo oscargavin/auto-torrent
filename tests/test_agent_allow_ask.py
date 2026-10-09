@@ -237,7 +237,7 @@ async def test_search_narrates_from_inside_the_pipeline():
         return
         yield
 
-    def fake_pipeline(q, limit, on_step=None, attempt=1):
+    def fake_pipeline(q, limit, on_step=None, attempt=1, title="", author=""):
         if on_step:
             on_step("Found 3 copies — checking each…")
         return {"book": {}, "results": []}

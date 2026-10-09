@@ -111,20 +111,27 @@ title: "Project Hail Mary", author: "Andy Weir", series: null, narrator: null
 
 
 def _fan_out_search(book: BookMetadata, raw_query: str | None = None) -> list[SearchResult]:
-    queries = [book.title]
-    if raw_query and raw_query.lower() != book.title.lower():
-        queries.append(raw_query)
-    if book.series:
-        queries.append(book.series)
-    if book.author:
-        queries.append(book.author)
+    queries: list[str] = []
+    for q in (book.title, raw_query, book.series, book.author):
+        # The series is often the title itself ("Dune"), and the same listing
+        # fetched twice adds nothing.
+        if q and q.lower() not in {seen_q.lower() for seen_q in queries}:
+            queries.append(q)
+
+    if not queries:
+        return []
+    for q in queries:
+        _log(f'  Searching ABB: "{q}"')
+    # The listings are independent, so fetch them at once. map() keeps the
+    # query order, so the merged list is the same as a sequential run, and
+    # the first failing query still raises.
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        listings = list(pool.map(lambda q: abb.search(q, max_pages=1), queries))
 
     seen: set[str] = set()
     all_results: list[SearchResult] = []
-
-    for q in queries:
-        _log(f'  Searching ABB: "{q}"')
-        for result in abb.search(q, max_pages=1):
+    for listing in listings:
+        for result in listing:
             if result.link not in seen:
                 seen.add(result.link)
                 all_results.append(result)
@@ -289,7 +296,19 @@ def _scan_for_suspicious_files(directory: str) -> list[str]:
 
 # -- Seed probing --
 
-def _probe_seeds_batch(magnets: list[str], timeout: int = PROBE_TIMEOUT) -> dict[str, int]:
+def _probe_seeds_batch(
+    magnets: list[str],
+    timeout: int = PROBE_TIMEOUT,
+    *,
+    settle_s: float | None = None,
+) -> dict[str, int]:
+    """Peer counts per magnet.
+
+    By default this stops as soon as any magnet shows a peer. With `settle_s`,
+    it keeps polling that much longer after the first peer appears, so slower
+    candidates get a fair count too. It stops early once every magnet has a
+    peer, and never runs past `timeout`.
+    """
     ses = lt.session({
         "listen_interfaces": "0.0.0.0:6891",
         "enable_dht": True,
@@ -313,6 +332,7 @@ def _probe_seeds_batch(magnets: list[str], timeout: int = PROBE_TIMEOUT) -> dict
 
     results: dict[str, int] = {m: 0 for m in magnets}
     deadline = time.monotonic() + timeout
+    settling = False
 
     while time.monotonic() < deadline:
         ses.post_torrent_updates()
@@ -320,8 +340,14 @@ def _probe_seeds_batch(magnets: list[str], timeout: int = PROBE_TIMEOUT) -> dict
             peers = handle.status().num_peers
             if peers > results[magnet]:
                 results[magnet] = peers
-        if any(v > 0 for v in results.values()):
+        if settle_s is None:
+            if any(v > 0 for v in results.values()):
+                break
+        elif all(v > 0 for v in results.values()):
             break
+        elif not settling and any(v > 0 for v in results.values()):
+            settling = True
+            deadline = min(deadline, time.monotonic() + settle_s)
         time.sleep(0.5)
 
     for _, handle in handles:

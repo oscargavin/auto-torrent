@@ -1,9 +1,11 @@
 import re
+import threading
+import time
 from pathlib import Path
 
 import requests
+from rapidfuzz import fuzz
 
-from .config import GENERIC_SUBJECTS
 from .types import BookMetadata
 
 _ARTICLES = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
@@ -45,7 +47,7 @@ def _query_variations(query: str) -> list[str]:
     return variations
 
 
-_FIELDS = "title,author_name,subject,key,first_publish_year,cover_i"
+_FIELDS = "title,author_name,subject,series_name,key,first_publish_year,cover_i"
 _BY = re.compile(r"\s+by\s+", re.IGNORECASE)
 _NON_ALNUM = re.compile(r"[^a-z0-9 ]")
 
@@ -68,6 +70,10 @@ def _split_title_author(query: str) -> tuple[str, str]:
     return title, author
 
 
+# One session so repeat lookups reuse the TLS connection.
+_session = requests.Session()
+
+
 def _try_query(q: str = "", *, title: str = "", author: str = "") -> list[dict]:
     # 10, not 5: the single book is often outranked by editions and box sets,
     # and scoring can only choose between what it is given.
@@ -78,7 +84,7 @@ def _try_query(q: str = "", *, title: str = "", author: str = "") -> list[dict]:
         params["title"] = title
     if author:
         params["author"] = author
-    resp = requests.get(
+    resp = _session.get(
         "https://openlibrary.org/search.json", params=params, timeout=10
     )
     resp.raise_for_status()
@@ -149,6 +155,27 @@ def _collection_penalty(doc_title: str, want_title: str) -> int:
     return -60 if _COLLECTION.search(doc_title) else 0
 
 
+def _split_title_score(doc_title: str, want: str) -> int:
+    """_title_score that also tries each half of "Series: Title".
+
+    For "Mistborn: The Final Empire" the omnibus that lists every word scored
+    above "The Final Empire" itself. The part after the separator is usually
+    the book, the part before it the series, so each half scores a little
+    below a match on the whole.
+    """
+    score = _title_score(doc_title, want)
+    for sep in (":", " - ", " — "):
+        if sep in want:
+            before, _, after = want.partition(sep)
+            score = max(
+                score,
+                int(_title_score(doc_title, after) * 0.9),
+                int(_title_score(doc_title, before) * 0.85),
+            )
+            break
+    return score
+
+
 def _pick_best(docs: list[dict], want_title: str, want_author: str) -> dict:
     """Choose the doc that best matches the request.
 
@@ -161,7 +188,7 @@ def _pick_best(docs: list[dict], want_title: str, want_author: str) -> dict:
     for doc in docs:
         title = doc.get("title", "")
         score = (
-            _title_score(title, want_title)
+            _split_title_score(title, want_title)
             + _author_score(doc.get("author_name"), want_author)
             + _collection_penalty(title, want_title)
         )
@@ -170,7 +197,92 @@ def _pick_best(docs: list[dict], want_title: str, want_author: str) -> dict:
     return best
 
 
-def lookup_book(query: str) -> BookMetadata | None:
+def _strip_author(query: str, author: str) -> str | None:
+    """The title left over when `author` sits at the start or end of `query`.
+
+    "Dune Frank Herbert" has no " by ", so the whole sentence was scored as the
+    title, and "Dune Messiah" outscored "Dune" on shared words. The author names
+    on the returned docs tell us which words to drop. Initials may be written
+    as one token ("R.F." against "R. F."). Returns None when the author is not
+    at either end, or when nothing would be left.
+    """
+    pairs = [(raw, _norm(raw)) for raw in query.split()]
+    pairs = [(raw, low) for raw, low in pairs if low]
+    names = _norm(author).split()
+    if not names or len(pairs) < 2:
+        return None
+    initials = {n[0] for n in names}
+
+    def is_author(word: str) -> bool:
+        return word in names or (len(word) <= 3 and set(word) <= initials)
+
+    end = len(pairs)
+    while end > 0 and is_author(pairs[end - 1][1]):
+        end -= 1
+    if 0 < end < len(pairs) and names[-1] in {low for _, low in pairs[end:]}:
+        return " ".join(raw for raw, _ in pairs[:end])
+
+    start = 0
+    while start < len(pairs) and is_author(pairs[start][1]):
+        start += 1
+    if 0 < start < len(pairs) and names[-1] in {low for _, low in pairs[:start]}:
+        return " ".join(raw for raw, _ in pairs[start:])
+    return None
+
+
+def _infer_author(query: str, docs: list[dict]) -> tuple[str, str] | None:
+    # A doc titled with the whole query means the query is a title, even when
+    # some doc has an author that overlaps it ("A Game of Thrones" has a doc
+    # by "Book Of Thrones").
+    if any(_title_score(doc.get("title", ""), query) >= 95 for doc in docs):
+        return None
+    for doc in docs:
+        for name in doc.get("author_name") or []:
+            title = _strip_author(query, name)
+            # The rest must name a book by that author, or the author match
+            # is a coincidence.
+            if title and _words(title) <= _words(doc.get("title", "")):
+                return title, name
+    return None
+
+
+def _words(text: str) -> set[str]:
+    return set(_ARTICLES.sub("", _norm(text)).split())
+
+
+def _confident(doc_title: str, want_title: str) -> bool:
+    """Whether the chosen doc is plausibly the book that was asked for.
+
+    A wrong title is worse than none: the agent then searches for a book the
+    user never named. Callers fall back to the raw query on None.
+    """
+    a = _ARTICLES.sub("", _norm(doc_title)).strip()
+    b = _ARTICLES.sub("", _norm(want_title)).strip()
+    if not a or not b:
+        return False
+    if fuzz.ratio(a, b) >= 80:
+        return True
+    have, want = set(a.split()), set(b.split())
+    # The doc title is inside the query (a series prefix or subtitle was
+    # typed too), or the query is the doc title short of one word ("Hail
+    # Mary"). "The Worlds of Frank Herbert" for "Frank Herbert" is neither.
+    return have <= want or (want <= have and len(have - want) <= 1)
+
+
+def _series(doc: dict) -> str | None:
+    # Only real series data. Subjects are genres and places ("American
+    # Science fiction", "Dune (Imaginary place)"), and a genre searched as a
+    # series fills the fan-out with unrelated books.
+    names = doc.get("series_name") or []
+    if names:
+        return names[0]
+    for subj in doc.get("subject") or []:
+        if subj.startswith("franchise:"):
+            return subj.split(":", 1)[1].strip()
+    return None
+
+
+def _lookup(query: str) -> BookMetadata | None:
     want_title, want_author = _split_title_author(query)
 
     docs: list[dict] = []
@@ -190,25 +302,57 @@ def lookup_book(query: str) -> BookMetadata | None:
     if not docs:
         return None
 
+    inferred = None if want_author else _infer_author(_clean_query(want_title), docs)
+    if inferred:
+        want_title, want_author = inferred
+
     doc = _pick_best(docs, want_title, want_author)
 
-    series = None
-    for subj in doc.get("subject") or []:
-        low = subj.lower()
-        if low not in GENERIC_SUBJECTS and not subj.startswith("nyt:") and not subj.startswith("franchise:"):
-            series = subj
-            break
-        if subj.startswith("franchise:"):
-            series = subj.split(":", 1)[1].strip()
-            break
+    # The plain query can miss the single book entirely ("The Poppy War R.F.
+    # Kuang" returns only the omnibus), so ask again in the structured form.
+    if inferred and _title_score(doc.get("title", ""), want_title) < 95:
+        try:
+            extra = _try_query(title=want_title, author=want_author)
+        except requests.RequestException:
+            extra = []
+        if extra:
+            doc = _pick_best(extra + docs, want_title, want_author)
+
+    if not _confident(doc.get("title", ""), want_title):
+        return None
 
     return BookMetadata(
         title=doc.get("title", ""),
         author=(doc.get("author_name") or [""])[0],
         year=doc.get("first_publish_year"),
         cover_id=doc.get("cover_i"),
-        series=series,
+        series=_series(doc),
     )
+
+
+_CACHE_TTL = 600
+_CACHE_MAX = 256
+_cache: dict[str, tuple[float, BookMetadata | None]] = {}
+_cache_lock = threading.Lock()
+
+
+def lookup_book(query: str) -> BookMetadata | None:
+    # The agent often looks up the same query again within one chat, and a
+    # repeat round costs a full OpenLibrary call each time. Failures raise and
+    # are never cached.
+    key = " ".join(query.lower().split())
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _cache.get(key)
+    if hit and now - hit[0] < _CACHE_TTL:
+        return hit[1]
+
+    book = _lookup(query)
+    with _cache_lock:
+        if len(_cache) >= _CACHE_MAX:
+            _cache.pop(next(iter(_cache)))
+        _cache[key] = (now, book)
+    return book
 
 
 def download_cover(cover_id: int, dest: Path) -> Path | None:

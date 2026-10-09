@@ -49,3 +49,32 @@ class TestParseListing:
 
     def test_skips_a_post_it_cannot_decode(self):
         assert parse_listing('<div class="post re-ab">not base64 at all!</div>') == []
+
+
+class TestDetailDelay:
+    """The politeness pause is for the site. A page the local cache serves
+    never reaches it, so it should not wait."""
+
+    def _run(self, cached: bool) -> list[float]:
+        from unittest.mock import MagicMock, patch
+
+        from auto_torrent import abb
+        from auto_torrent.types import SearchResult
+
+        session = MagicMock()
+        session.cache.contains.return_value = cached
+        session.get.return_value.text = "<html></html>"
+        sleeps: list[float] = []
+        with (
+            patch.object(abb, "_get_session", return_value=session),
+            patch.object(abb.time, "sleep", sleeps.append),
+        ):
+            abb.get_details(SearchResult(title="t", link=f"{ABB_BASE_URL}/abss/t/"))
+        return sleeps
+
+    def test_a_network_fetch_waits_briefly(self):
+        sleeps = self._run(cached=False)
+        assert len(sleeps) == 1 and 0.15 <= sleeps[0] <= 0.4
+
+    def test_a_cached_page_does_not_wait(self):
+        assert self._run(cached=True) == []

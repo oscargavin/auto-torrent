@@ -8,7 +8,16 @@ intermittent rather than as a missing check.
 """
 from unittest.mock import patch
 
+import pytest
+
 from auto_torrent import openlibrary as ol
+
+
+@pytest.fixture(autouse=True)
+def _empty_lookup_cache():
+    ol._cache.clear()
+    yield
+    ol._cache.clear()
 
 
 def _doc(title, authors, **extra):
@@ -181,3 +190,173 @@ class TestCollections:
         sequel = ol._title_score("Dune Messiah", "Dune")
         omnibus = ol._title_score("Dune, Dune Messiah, Children of Dune", "Dune")
         assert exact > sequel > omnibus
+
+
+# The observed plain-query response for "Dune Frank Herbert", in the observed
+# order. lookup_book scored the whole sentence as the title, so "Dune Messiah"
+# won on shared words, and its subject "American Science fiction" became the
+# series that the fan-out then searched.
+DUNE_DOCS = [
+    _doc(
+        "Dune",
+        ["Frank Herbert"],
+        series_name=["Dune"],
+        subject=["Dune (Imaginary place)", "Fiction"],
+    ),
+    _doc(
+        "Dune Messiah",
+        ["Frank Herbert"],
+        series_name=["Dune"],
+        subject=["American Science fiction", "Dune (Imaginary place)"],
+    ),
+    _doc("Children of Dune", ["Frank Herbert"], series_name=["Dune"]),
+    _doc("Dune, Dune Messiah, Children of Dune", ["Frank Herbert"]),
+]
+
+
+def _plain_only(docs):
+    """A fake _try_query that answers the plain query and nothing else."""
+
+    def fake(q="", *, title="", author=""):
+        return docs if q else []
+
+    return fake
+
+
+class TestAuthorInTheQuery:
+    """Agents send "Title Author" with no " by " between them."""
+
+    def test_the_author_words_are_not_scored_as_title(self):
+        with patch.object(ol, "_try_query", _plain_only(DUNE_DOCS)):
+            book = ol.lookup_book("Dune Frank Herbert")
+        assert book.title == "Dune"
+        assert book.author == "Frank Herbert"
+
+    def test_the_author_may_come_first(self):
+        with patch.object(ol, "_try_query", _plain_only(DUNE_DOCS)):
+            assert ol.lookup_book("Frank Herbert Dune").title == "Dune"
+
+    def test_a_summary_does_not_beat_the_book(self):
+        docs = [
+            _doc("Summary of Project Hail Mary by Andy Weir", ["Antoine McCallan"]),
+            _doc("The Martian / Artemis / Project Hail Mary", ["Andy Weir"]),
+            _doc("Project Hail Mary", ["Andy Weir"]),
+        ]
+        with patch.object(ol, "_try_query", _plain_only(docs)):
+            book = ol.lookup_book("Project Hail Mary Andy Weir")
+        assert (book.title, book.author) == ("Project Hail Mary", "Andy Weir")
+
+    def test_apostrophes_and_initials_still_match(self):
+        docs = [_doc("Assassin’s Apprentice", ["Robin Hobb"])]
+        with patch.object(ol, "_try_query", _plain_only(docs)):
+            assert ol.lookup_book("Assassin's Apprentice Robin Hobb").author == "Robin Hobb"
+        assert ol._strip_author("The Poppy War R.F. Kuang", "R. F. Kuang") == "The Poppy War"
+
+    def test_asks_again_when_the_plain_query_misses_the_single_book(self):
+        calls = []
+
+        def fake(q="", *, title="", author=""):
+            calls.append((q, title, author))
+            if q:
+                return [_doc("The Poppy War / The Dragon Republic / The Burning God", ["R. F. Kuang"])]
+            return POPPY_WAR_DOCS
+
+        with patch.object(ol, "_try_query", fake):
+            book = ol.lookup_book("The Poppy War R.F. Kuang")
+        assert book.title == "The Poppy War"
+        assert ("", "The Poppy War", "R. F. Kuang") in calls
+
+    def test_a_whole_title_is_not_cut_by_a_stray_author(self):
+        # Observed: a doc credited to "Book Of Thrones" made "of thrones" look
+        # like an author at the end of the query.
+        docs = [
+            _doc("A Game of Thrones", ["George R. R. Martin"]),
+            _doc("Game of Thrones", ["Book Of Thrones"]),
+        ]
+        with patch.object(ol, "_try_query", _plain_only(docs)):
+            book = ol.lookup_book("A Game of Thrones")
+        assert (book.title, book.author) == ("A Game of Thrones", "George R. R. Martin")
+
+    def test_an_author_alone_is_not_a_title(self):
+        docs = [_doc("The Worlds of Frank Herbert", ["Frank Herbert"]), *DUNE_DOCS]
+        with patch.object(ol, "_try_query", _plain_only(docs)):
+            assert ol.lookup_book("Frank Herbert") is None
+
+
+class TestSeries:
+    def test_uses_series_name_never_a_subject(self):
+        with patch.object(ol, "_try_query", _plain_only(DUNE_DOCS)):
+            assert ol.lookup_book("Dune Frank Herbert").series == "Dune"
+
+    def test_no_series_when_openlibrary_has_none(self):
+        docs = [_doc("Project Hail Mary", ["Andy Weir"], subject=["hard science-fiction", "Fiction"])]
+        with patch.object(ol, "_try_query", _plain_only(docs)):
+            assert ol.lookup_book("Project Hail Mary").series is None
+
+    def test_a_franchise_subject_still_counts(self):
+        docs = [_doc("Star Wars: Heir to the Empire", ["Timothy Zahn"], subject=["Fiction", "franchise:Star Wars"])]
+        with patch.object(ol, "_try_query", _plain_only(docs)):
+            assert ol.lookup_book("Star Wars: Heir to the Empire").series == "Star Wars"
+
+
+class TestLookupCache:
+    def test_a_repeat_lookup_does_not_ask_again(self):
+        calls = []
+
+        def fake(q="", *, title="", author=""):
+            calls.append(q)
+            return DUNE_DOCS if q else []
+
+        with patch.object(ol, "_try_query", fake):
+            first = ol.lookup_book("Dune Frank Herbert")
+            n = len(calls)
+            assert ol.lookup_book("  dune frank HERBERT ") == first
+        assert len(calls) == n
+
+    def test_entries_expire(self):
+        calls = []
+
+        def fake(q="", *, title="", author=""):
+            calls.append(q)
+            return DUNE_DOCS if q else []
+
+        with patch.object(ol, "_try_query", fake):
+            ol.lookup_book("Dune Frank Herbert")
+            n = len(calls)
+            with patch.object(ol, "_CACHE_TTL", -1):
+                ol.lookup_book("Dune Frank Herbert")
+        assert len(calls) > n
+
+    def test_a_failure_is_not_cached(self):
+        import requests
+
+        def boom(*a, **k):
+            raise requests.RequestException("down")
+
+        with patch.object(ol, "_try_query", boom), pytest.raises(requests.RequestException):
+            ol.lookup_book("Dune")
+        with patch.object(ol, "_try_query", _plain_only(DUNE_DOCS)):
+            assert ol.lookup_book("Dune").title == "Dune"
+
+
+class TestSubtitledQueries:
+    def test_the_book_after_the_colon_beats_an_omnibus_listing_every_word(self):
+        docs = [
+            _doc("The Final Empire", ["Brandon Sanderson"]),
+            _doc("Mistborn", ["Brandon Sanderson"]),
+            _doc(
+                "Brandon Sanderson's Fantasy Firsts : (the Way of Kings, "
+                "Mistborn: the Final Empire, Rithmatist)",
+                ["Brandon Sanderson"],
+            ),
+        ]
+        with patch.object(ol, "_try_query", _plain_only(docs)):
+            assert ol.lookup_book("Mistborn: The Final Empire").title == "The Final Empire"
+
+    def test_a_whole_title_with_a_colon_still_wins(self):
+        best = ol._pick_best(
+            [_doc("Dune", ["Frank Herbert"]), _doc("Dune: Part One", ["Frank Herbert"])],
+            "Dune: Part One",
+            "",
+        )
+        assert best["title"] == "Dune: Part One"

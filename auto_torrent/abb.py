@@ -2,6 +2,7 @@ import base64
 import binascii
 import random
 import re
+import threading
 import time
 from dataclasses import replace
 from urllib.parse import quote
@@ -14,8 +15,15 @@ from urllib3.util import Retry
 from .config import ABB_BASE_URL, CACHE_DIR, DEFAULT_TRACKERS, HEADERS
 from .types import SearchResult
 
+# Listing page 2 keeps the long pause. Detail pages get a short jitter: the
+# old 1.5-3.0 s before every page made ten pages take ~8 s on four workers.
+# Concurrency stays at SCRAPE_WORKERS, and a 429/503 still goes through the
+# Retry backoff below.
 _REQUEST_DELAY = (1.5, 3.0)
-_REQUEST_TIMEOUT = 45
+_DETAIL_DELAY = (0.15, 0.4)
+# (connect, read). A reachable site connects in well under a second; when it is
+# down, a 45 s connect wait per request made every search hang before failing.
+_REQUEST_TIMEOUT = (10, 45)
 
 
 class ABBError(Exception):
@@ -52,6 +60,7 @@ def _build_session() -> requests.Session:
 
 
 _session: requests.Session | None = None
+_index_lock = threading.Lock()
 _proxy: str | None = None
 
 
@@ -70,8 +79,13 @@ def _get_session() -> requests.Session:
     return _session
 
 
-def _delay() -> None:
-    time.sleep(random.uniform(*_REQUEST_DELAY))
+def _delay(bounds: tuple[float, float] = _REQUEST_DELAY) -> None:
+    time.sleep(random.uniform(*bounds))
+
+
+def _is_cached(session: requests.Session, url: str) -> bool:
+    cache = getattr(session, "cache", None)
+    return cache is not None and cache.contains(url=url)
 
 
 def _decoded(post: Tag) -> Tag:
@@ -156,13 +170,19 @@ def search(query: str, max_pages: int = 2) -> list[SearchResult]:
     if not results:
         from . import abb_index
 
-        return abb_index.search(query)
+        # abb_index shares one sqlite connection, and the fan-out calls this
+        # from several threads at once. Concurrent queries on it returned
+        # rows from each other's cursors. The query takes milliseconds.
+        with _index_lock:
+            return abb_index.search(query)
     return results
 
 
 def get_details(result: SearchResult) -> SearchResult:
     session = _get_session()
-    _delay()
+    # A page served from the local cache never reaches the site.
+    if not _is_cached(session, result.link):
+        _delay(_DETAIL_DELAY)
     resp = session.get(result.link, timeout=_REQUEST_TIMEOUT)
     resp.raise_for_status()
 

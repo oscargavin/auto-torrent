@@ -64,7 +64,7 @@ NARRATOR_MATCH_THRESHOLD = 80
 MIN_SCORE = 60
 
 # Concurrency
-SCRAPE_WORKERS = 4
+SCRAPE_WORKERS = 5
 
 # TPB scoring
 TPB_SOURCE_SCORES = {"bluray": 25, "web-dl": 20, "webrip": 15, "hdrip": 10, "hdtv": 8, "cam": 0}

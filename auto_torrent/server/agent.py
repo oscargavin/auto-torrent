@@ -11,12 +11,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Awaitable, Callable, Literal
 
 from claude_agent_sdk import (
+    AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
+    TextBlock,
+    ToolUseBlock,
     create_sdk_mcp_server,
     query,
     tool,
@@ -49,15 +52,19 @@ AGENT_MODEL = "claude-haiku-5-5"
 # it converges, and running out of turns mid-search reads to the user as "not
 # found" rather than "gave up".
 AGENT_MAX_TURNS = 16
+# Candidates one probe_peers call checks at most, and how long it keeps looking
+# for the others once the first has a peer.
+PROBE_MAX = 4
+PROBE_SETTLE_S = 3.0
 
 SYSTEM_PROMPT = """You are a warm, concise audiobook concierge for a family's shared library. Someone asks for something to listen to; you work out what they mean, find the best copy, start the download, and confirm.
 
 Keep replies short and plain — one or two sentences, no markdown, no emoji. They appear on a small card or as an SMS, not in a chat window.
 
 Tools:
-- search_audiobookbay(query, limit=5): returns ranked ABB results.
+- search_audiobookbay(query, limit=5, title, author): returns ranked ABB results, already checked and scored. Once you know the book, pass its exact `title` and `author` too — the search then looks for that book rather than guessing from the query.
 - analyze_cover(cover_url): vision OCR. Returns {title, author, narrator} ONLY for what's printed on the image. Use to confirm narrator when the result's narrator field is empty.
-- probe_peers(magnet): live seeder count. Use to avoid dead torrents when you have a choice.
+- probe_peers(magnets): live seeder counts for one or more magnets, checked together. Pass every candidate you are weighing in ONE call rather than one call each.
 - send_sms(text): one short message to the user.
 - ask_user_to_pick(options): numbered list, ends the turn. Each option: {label, magnet, title, author, narrator}. Use only when truly ambiguous.
 - commit_download(primary, fallbacks): start the download and end. primary/fallbacks: {magnet, title, author, narrator, format}. Put narrator and format on `primary` whenever you know them — the user sees them and that is how they catch a wrong pick. Include 1–2 fallbacks whenever you have viable alternates; the polling layer uses them if the primary stalls.
@@ -71,7 +78,7 @@ People rarely type an exact title. Resolve the request to a specific book (or a 
 - Description without a title ("the one about the guy stranded on Mars", "that book where the bees talk") → identify it.
 - Vibe or occasion ("something funny for a long drive", "a gripping thriller", "something for my mum") → choose one specific well-regarded audiobook that fits, and say why in your announce.
 - Vague or open ("surprise me", "a good sci-fi book") → pick something genuinely good and widely liked. Commit to one; do not ask them to narrow it down.
-You may search more than once — a corrected spelling, "title author", or the title alone — when the first search is weak. Two or three searches is fine; do not grind.
+You may search more than once — a corrected spelling, "title author", or the title alone — when the first search is weak. Two or three searches is fine; do not grind. Each search takes several seconds while the user waits, so never repeat a search that already found the book, and never re-run it with a trivial rewording. If two searches have not found it, it is not on the site: say so.
 
 CHOOSING BETWEEN RESULTS.
 1. It must be the book they actually asked for. A different book by the same author is a miss.
@@ -295,6 +302,8 @@ def _search_pipeline_sync(
     limit: int,
     on_step: Callable[[str], None] | None = None,
     attempt: int = 1,
+    title: str = "",
+    author: str = "",
 ) -> dict:
     """Resolve a query to ranked candidates.
 
@@ -323,6 +332,14 @@ def _search_pipeline_sync(
 
     if book is None:
         book = BookMetadata(title=raw_query, author="")
+
+    # The agent has already worked out which book it wants, and it is usually
+    # right where the catalogue lookup guesses: "Dune Frank Herbert" resolved to
+    # Dune Messiah, and a whole search round went on the wrong book.
+    if title and _norm(book.title) != _norm(title):
+        book = BookMetadata(title=title, author=author or "")
+    elif title and author and not book.author:
+        book = replace(book, author=author)
 
     if book.title and book.title.lower() != raw_query.lower():
         step(f"Looks like “{book.title}”" + (f" by {book.author}" if book.author else "") + "…")
@@ -363,6 +380,10 @@ def _search_pipeline_sync(
         "book": _book_to_dict(book),
         "results": [_scored_to_payload(s, i) for i, s in enumerate(scored)],
     }
+
+
+def _norm(text: str) -> str:
+    return " ".join("".join(c for c in text.casefold() if c.isalnum() or c.isspace()).split())
 
 
 def _book_to_dict(book: BookMetadata) -> dict:
@@ -432,12 +453,13 @@ async def run_agent(
     None and behave exactly as before.
     """
     allow_ask = allow_ask or on_ask is not None
-    state: dict = {"outcome": None}
+    state: dict = {"outcome": None, "spoke": False}
     # The agent searches more than once when the first pass doesn't satisfy it.
     # Observed live: three rounds emitting "Found 10 copies — checking each…"
     # / "Ranking them…" verbatim each time, which reads as a stuck loop rather
     # than as three attempts. The round number lets the narration say which.
     search_attempts = {"n": 0}
+    search_cache: dict[tuple[str, int, str, str], str] = {}
 
     # ---- Tools ----
 
@@ -463,24 +485,46 @@ async def run_agent(
 
     @tool(
         name="search_audiobookbay",
-        description="Search AudiobookBay for an audiobook. Returns up to `limit` ranked results. Each result has index, title, author, narrator, format, size, score, magnet, cover_url, description excerpt.",
-        input_schema={"query": str, "limit": int},
+        description="Search AudiobookBay for an audiobook. Returns up to `limit` ranked results. Each result has index, title, author, narrator, format, size, score, magnet, cover_url, description excerpt. Pass `title` and `author` once you know exactly which book it is.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+                "title": {"type": "string", "description": "The exact book title, if known."},
+                "author": {"type": "string", "description": "Its author, if known."},
+            },
+            "required": ["query"],
+        },
     )
     async def search_audiobookbay(args: dict) -> dict:
         # Deliberately silent here: the job already opened with "Searching…"
         # and _search_pipeline_sync narrates the resolved title when it differs
         # from what was asked for, which is the only genuinely new information
         # at this point. Narrating the query again just repeated the headline.
+        query_text = args.get("query") or raw_query
+        limit = int(args.get("limit") or 5)
+        title = str(args.get("title") or "").strip()
+        author = str(args.get("author") or "").strip()
+        # A repeat of a search already run this turn costs ~10 s of page fetches
+        # for the same answer. Observed live: the same query three times.
+        key = (query_text.casefold().strip(), limit, title.casefold(), author.casefold())
+        if key in search_cache:
+            return {"content": [{"type": "text", "text": search_cache[key]}]}
         search_attempts["n"] += 1
         try:
             data = await asyncio.to_thread(
                 _search_pipeline_sync,
-                args.get("query") or raw_query,
-                int(args.get("limit") or 5),
+                query_text,
+                limit,
                 lambda msg: _narrate(sms, STAGE_SEARCHING, msg),
                 search_attempts["n"],
+                title,
+                author,
             )
-            return {"content": [{"type": "text", "text": json.dumps(data)}]}
+            text = json.dumps(data)
+            search_cache[key] = text
+            return {"content": [{"type": "text", "text": text}]}
         except Exception as e:
             logger.exception("search tool failed")
             return {"content": [{"type": "text", "text": json.dumps({"error": f"{type(e).__name__}: {e}"})}]}
@@ -500,17 +544,33 @@ async def run_agent(
 
     @tool(
         name="probe_peers",
-        description="Probe a magnet for live seeders via DHT (~10s). Returns {peers: int}. 0 means likely dead.",
-        input_schema={"magnet": str},
+        description="Probe magnets for live seeders via DHT, all at once (up to ~10s in total). Returns {peers: {magnet: int}}. 0 means likely dead. Pass every candidate you are comparing in one call.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "magnets": {"type": "array", "items": {"type": "string"}},
+                "magnet": {"type": "string", "description": "A single magnet; prefer `magnets`."},
+            },
+        },
     )
     async def probe_peers(args: dict) -> dict:
-        magnet = args.get("magnet", "")
+        # One call for all the candidates: the agent used to probe them one at
+        # a time, a model round trip plus up to 10 s each.
+        magnets = [m for m in (args.get("magnets") or []) if m]
+        if args.get("magnet"):
+            magnets.append(args["magnet"])
+        magnets = list(dict.fromkeys(magnets))[:PROBE_MAX]
         _narrate(sms, STAGE_SEARCHING, "Checking who's sharing it…")
         try:
-            counts = await asyncio.to_thread(_probe_seeds_batch, [magnet], 10)
-            return {"content": [{"type": "text", "text": json.dumps({"peers": counts.get(magnet, 0)})}]}
+            # settle_s: the probe stops when the first magnet shows a peer, so
+            # the others would read 0 when compared. It waits a few seconds
+            # more for them.
+            counts = await asyncio.to_thread(
+                _probe_seeds_batch, magnets, 10, settle_s=PROBE_SETTLE_S if len(magnets) > 1 else None
+            )
+            return {"content": [{"type": "text", "text": json.dumps({"peers": counts})}]}
         except Exception as e:
-            return {"content": [{"type": "text", "text": json.dumps({"error": str(e), "peers": 0})}]}
+            return {"content": [{"type": "text", "text": json.dumps({"error": str(e), "peers": {}})}]}
 
     @tool(
         name="send_sms",
@@ -523,6 +583,7 @@ async def run_agent(
             return {"content": [{"type": "text", "text": "ignored: empty"}]}
         try:
             await asyncio.to_thread(sms.send, phone, text)
+            state["spoke"] = True
             return {"content": [{"type": "text", "text": "sent"}]}
         except Exception as e:
             return {"content": [{"type": "text", "text": f"error: {e}"}]}
@@ -741,6 +802,8 @@ async def run_agent(
     # same bare "exit code 1" as a dead CLI. Remembered so the two get different
     # sentences: one is a search that needs a narrower request, the other is ours.
     ran_out = False
+    # The text the agent wrote after its last tool call, if any.
+    final_text = ""
     try:
         async for msg in query(
             prompt=user_prompt,
@@ -750,6 +813,12 @@ async def run_agent(
                 system_prompt=_system_prompt(allow_ask, on_ask is not None),
                 mcp_servers={"atb": server},
                 allowed_tools=allowed_tools,
+                # No built-in Claude Code tools (Bash, Read, …): the agent only
+                # uses its own, and their definitions were in every request.
+                tools=[],
+                # Load our tools up front. With tool search on, every turn
+                # started with a model round trip just to find them (1.5-3.5 s).
+                env={"ENABLE_TOOL_SEARCH": "false"},
                 # Without this the CLI's own error text is lost ("Check stderr
                 # output for details"), and an auth failure looks like any other.
                 stderr=lambda line: logger.warning("claude cli: %s", line.rstrip()),
@@ -757,6 +826,12 @@ async def run_agent(
         ):
             if isinstance(msg, ResultMessage) and msg.subtype == "error_max_turns":
                 ran_out = True
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, ToolUseBlock):
+                        final_text = ""
+                    elif isinstance(block, TextBlock) and block.text.strip():
+                        final_text = block.text.strip()
             if state["outcome"] is not None:
                 # Tool already terminated the agent's job.
                 continue
@@ -789,6 +864,16 @@ async def run_agent(
 
     if state["outcome"] is not None:
         return state["outcome"]
+
+    # The agent sometimes answers a question in plain text instead of calling
+    # `reply`. Observed live on "What is Piranesi about?": a good answer, which
+    # the user never saw — they got "Couldn't find that one" in its place.
+    if final_text and not state["spoke"]:
+        try:
+            await asyncio.to_thread(sms.send, phone, final_text)
+            return AgentOutcome(kind="replied", message=final_text)
+        except Exception:  # noqa: BLE001
+            logger.exception("sending the agent's final text failed")
 
     # Reached when the agent stops without committing — overwhelmingly "no
     # match found". The message is user-visible on the card, so it reads as an
