@@ -4,7 +4,7 @@ The app runs the same check before it creates a job, which catches the common
 case instantly and for free. This one is the authority: it runs after the agent
 has resolved a loose request ("something like Project Hail Mary") into a real
 title, which is the only point at which we know what is actually about to be
-downloaded — and it is the only check a second device, or an SMS request, goes
+downloaded — and it is the only check a request from a second device goes
 through at all.
 
 Deliberately strict, for the same reason as the client's copy: a false positive

@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
 import shutil
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Protocol
 
 from rapidfuzz import fuzz
 
@@ -31,12 +29,11 @@ from .event_types import (
     STAGE_STALLED,
 )
 from .settings import Settings
-from .sms import SMSClient
 
 logger = logging.getLogger("atb.worker")
 
 POLL_INTERVAL_S = 15
-POLL_TIMEOUT_S = 60 * 60       # 60 min per attempt (legacy callers, no job deadline)
+POLL_TIMEOUT_S = 60 * 60       # 60 min per attempt, when no job deadline is passed
 JOB_BUDGET_S = 60 * 60         # whole-job wall clock when a deadline is supplied
 STALL_GRACE_S = 3 * 60         # progress must move within 3 min or we declare stalled
 MAX_REDISCOVERY_ROUNDS = 2     # how many times to re-search when fallbacks run dry
@@ -83,10 +80,16 @@ def _matches_title(candidate: str, title: str) -> bool:
     return fuzz.partial_ratio(title.lower(), candidate.lower()) >= REDISCOVERY_MIN_TITLE_MATCH
 
 
+class MessageSink(Protocol):
+    """Where the poll sends its user-facing lines. The jobs and thread buses
+    both have this shape."""
+
+    def send(self, to: str, body: str) -> None: ...
+
+
 def _emit_event(sink: object, event: str, data: dict) -> None:
-    """Emit a structured SSE event through a sink that supports it (the chat /
-    jobs bus). The SMS sink only has `send` (string bodies) — for it this is a
-    no-op, so the shared poll path never pushes a dict at the SMS channel."""
+    """Emit a structured SSE event through a sink that supports it. A sink
+    with only `send` gets nothing, so a plain text sink is never handed a dict."""
     emit = getattr(sink, "emit", None)
     if callable(emit):
         emit(event, data)
@@ -301,9 +304,9 @@ async def poll_and_finalise(
     display: str,
     author: str,
     title: str,
-    phone: str,
+    session: str,
     settings: Settings,
-    sms: SMSClient,
+    sink: MessageSink,
     on_download_change: Callable[[str], Awaitable[None]] | None = None,
     query: str | None = None,
     deadline: float | None = None,
@@ -325,8 +328,8 @@ async def poll_and_finalise(
     resets on every fallback swap and grace extension — so the real worst case
     is unbounded, and arq's own 1h job timeout would kill the job mid-attempt
     and report it as "worker cancelled". Passing a deadline makes every
-    attempt, swap and extension draw from one budget. Left None for the SMS
-    and legacy /chat callers, which keep today's behaviour.
+    attempt, swap and extension draw from one budget. The jobs path always
+    passes one.
     """
     abs_client = ABSClient(settings)
     fallback_announced = False
@@ -353,7 +356,7 @@ async def poll_and_finalise(
             stale = _refresh_state(download_id)
             if stale:
                 await _kill_download_and_clean(stale)
-            sms.send(phone, f"{display} was taking too long, so I stopped it.")
+            sink.send(session, f"{display} was taking too long, so I stopped it.")
             raise DownloadTimedOutError(display)
         if outcome == "stalled" or outcome == "failed":
             # R14: on a stall (not a hard failure), check whether the torrent
@@ -365,19 +368,19 @@ async def poll_and_finalise(
                 # Say so as soon as the bytes stop, not when we eventually give
                 # up and swap magnets — that can be tens of minutes later, and
                 # until then a frozen download renders exactly like a slow one.
-                _emit_event(sms, EVENT_PROGRESS, {
+                _emit_event(sink, EVENT_PROGRESS, {
                     "stage": STAGE_STALLED,
                     "percent": int(float(cur_state.get("progress") or 0) * 100),
                     "peers": cur_state.get("peers"),
                     # Card frames never name the book — it is already the
-                    # headline. The SMS sends below still do; SMS has no card.
+                    # headline. The plain `send` lines below still do.
                     "text": "Stopped moving — looking for another source…",
                 })
                 if cur_magnet and cur_magnet not in grace_extended:
                     if await _reprobe_seeders(cur_magnet) > 0:
                         grace_extended.add(cur_magnet)
                         logger.info("Stall but %s still seeded — extending grace", display)
-                        _emit_event(sms, EVENT_PROGRESS, {
+                        _emit_event(sink, EVENT_PROGRESS, {
                             "stage": STAGE_RETRYING,
                             "text": "Slow, but still seeded — giving it longer…",
                         })
@@ -393,10 +396,10 @@ async def poll_and_finalise(
                     fallbacks.extend(f for f in found if _matches_title(f["title"], title))
                 if not fallbacks:
                     logger.info("No fallbacks left for %s", display)
-                    sms.send(phone, f"Couldn't get {display} tonight, sorry — try in the morning?")
+                    sink.send(session, f"Couldn't get {display} tonight, sorry — try in the morning?")
                     raise NoCandidatesLeftError(display)
             if not fallback_announced:
-                sms.send(phone, f"That one stalled — trying another version…")
+                sink.send(session, f"That one stalled — trying another version…")
                 fallback_announced = True
 
             stale = _refresh_state(download_id)
@@ -409,7 +412,7 @@ async def poll_and_finalise(
 
             next_fb = fallbacks.pop(0)
             tried_magnets.add(next_fb["magnet"])
-            _emit_event(sms, EVENT_PROGRESS, {
+            _emit_event(sink, EVENT_PROGRESS, {
                 "stage": STAGE_RETRYING,
                 "text": "Trying another copy…",
             })
@@ -431,18 +434,18 @@ async def poll_and_finalise(
             await asyncio.sleep(0)
             continue
         # Unknown outcome → bail.
-        sms.send(phone, f"Something odd happened with {display}. Try again?")
+        sink.send(session, f"Something odd happened with {display}. Try again?")
         raise UnknownDownloadOutcomeError(display)
 
     # The bytes are down; the user-visible work now is organise + ABS scan.
     # Surface that as a distinct stage so the chat/jobs UI shows "importing"
-    # rather than sitting at 100% "downloading". No-op for the SMS sink.
-    _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
-                                      "text": "Adding to your library…"})
+    # rather than sitting at 100% "downloading".
+    _emit_event(sink, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
+                                       "text": "Adding to your library…"})
 
     final = _refresh_state(download.get("id"))
     if not final:
-        sms.send(phone, f"Couldn't read the final state for {display}. The file may still be there.")
+        sink.send(session, f"Couldn't read the final state for {display}. The file may still be there.")
         raise DownloadStateLostError(display)
 
     download_path = final.get("path", "")
@@ -454,9 +457,9 @@ async def poll_and_finalise(
         logger.info("Organised %s → %s", display, dest)
     except Exception as e:
         logger.exception("organise failed")
-        sms.send(phone, f"{display} downloaded but I couldn't move it into the library. Try again?")
-        _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORT_FAILED, "percent": 100,
-                                          "text": "Downloaded, but couldn't be imported."})
+        sink.send(session, f"{display} downloaded but I couldn't move it into the library. Try again?")
+        _emit_event(sink, EVENT_PROGRESS, {"stage": STAGE_IMPORT_FAILED, "percent": 100,
+                                           "text": "Downloaded, but couldn't be imported."})
         raise ImportIncompleteError(display) from e
 
     # Before the scan, so the book appears with its artwork instead of showing
@@ -465,15 +468,15 @@ async def poll_and_finalise(
     # Never fatal: a missing cover is cosmetic, a failed import is not.
     # Import is up to a minute of separate steps behind one full bar. Naming
     # each one is what tells the user it is still moving.
-    _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
-                                      "text": "Finding the cover…"})
+    _emit_event(sink, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
+                                       "text": "Finding the cover…"})
     try:
         await asyncio.to_thread(ensure_local_cover, dest, title, author)
     except Exception:  # noqa: BLE001
         logger.exception("cover fetch failed for %s", display)
 
-    _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
-                                      "text": "Scanning your library…"})
+    _emit_event(sink, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
+                                       "text": "Scanning your library…"})
     try:
         await abs_client.scan_library(settings.abs_library_id)
     except Exception as e:
@@ -481,20 +484,20 @@ async def poll_and_finalise(
         # tell the user it's in the library — surface "downloaded, not yet
         # imported" instead and signal the caller to skip the success event.
         logger.exception("ABS scan failed; files are in place, will be picked up on next scan")
-        sms.send(phone, f"{display} downloaded — it'll appear after the next library scan.")
-        _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORT_FAILED, "percent": 100,
-                                          "text": "Downloaded — waiting for the next library scan."})
+        sink.send(session, f"{display} downloaded — it'll appear after the next library scan.")
+        _emit_event(sink, EVENT_PROGRESS, {"stage": STAGE_IMPORT_FAILED, "percent": 100,
+                                           "text": "Downloaded — waiting for the next library scan."})
         raise ImportIncompleteError(display) from e
 
     # Real chapter names, if the release didn't carry any. Strictly after the
     # scan, because the item has to exist before it can be given chapters, and
     # strictly non-fatal: the book is already in the library and a scrub bar
     # labelled 001–094 is a disappointment, not a failure.
-    _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
-                                      "text": "Naming the chapters…"})
-    await _name_chapters(abs_client, title, author, display)
+    _emit_event(sink, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
+                                       "text": "Naming the chapters…"})
+    await _name_chapters(abs_client, settings.abs_library_id, title, author, display)
 
-    sms.send(phone, f"✓ {display} is in your library.")
+    sink.send(session, f"✓ {display} is in your library.")
 
 
 # How long to wait for a scan to surface the item we just imported. The scan is
@@ -503,7 +506,9 @@ _SCAN_SETTLE_ATTEMPTS = 6
 _SCAN_SETTLE_DELAY_S = 5
 
 
-async def _name_chapters(abs_client, title: str, author: str, display: str) -> None:
+async def _name_chapters(
+    abs_client, library_id: str, title: str, author: str, display: str
+) -> None:
     """Give the freshly-imported book Audible's chapter names.
 
     Swallows everything. This runs after a successful import, so the only
@@ -513,7 +518,7 @@ async def _name_chapters(abs_client, title: str, author: str, display: str) -> N
     try:
         item = None
         for _ in range(_SCAN_SETTLE_ATTEMPTS):
-            items = await abs_client.list_items(settings.abs_library_id)
+            items = await abs_client.list_items(library_id)
             item = find_existing(items, title, author)
             if item:
                 break
@@ -567,29 +572,3 @@ async def _watch_until_done(download_id: str, *, deadline: float | None = None) 
             return "stalled"
 
     return "stalled"
-
-
-async def get_active_downloads(settings: Settings) -> list[dict]:
-    """For the SMS 'status' command. Returns active state dicts."""
-    result = await asyncio.to_thread(
-        _run_atb_status, settings.atb_cwd,
-    )
-    if not result:
-        return []
-    downloads = result.get("downloads", [])
-    return [d for d in downloads if d.get("status") == "downloading"]
-
-
-def _run_atb_status(cwd: str) -> dict | None:
-    uv = "/home/oscar/.local/bin/uv"
-    cmd = [uv, "run", "atb", "status", "--json"]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=cwd)
-    except subprocess.TimeoutExpired:
-        return None
-    if result.returncode != 0:
-        return None
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return None

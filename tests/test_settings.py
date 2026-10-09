@@ -2,9 +2,6 @@ from auto_torrent.server.settings import Settings
 
 
 def _setup_required_env(monkeypatch) -> None:
-    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "x")
-    monkeypatch.setenv("TWILIO_PHONE_NUMBER", "x")
-    monkeypatch.setenv("ALLOWED_NUMBERS", '["x"]')
     monkeypatch.setenv("ABS_API_TOKEN", "x")
     monkeypatch.setenv("ABS_LIBRARY_ID", "x")
     monkeypatch.setenv("ATB_CWD", "x")

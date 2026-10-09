@@ -1,12 +1,8 @@
 """Everything that happens after the agent stops talking.
 
-Its own module rather than a function in `jobs/worker.py` because both workers
-need it: the bare jobs path calls it with the job it started from, and the
-conversational path calls it with the job it creates once the agent commits.
-Sharing it from `jobs/worker.py` meant `threads/worker.py` importing from a
-module that imports `run_thread_turn` back — a cycle that had to be broken with
-a module-bottom import and a function-body import, neither of which a linter can
-check and both of which a test then had to explain.
+The thread worker calls it with the job it creates once the agent commits.
+It is its own module, not part of `jobs/worker.py`, because `jobs/worker.py`
+imports `run_thread_turn`. Sharing it from there made an import cycle.
 
 This is the half holding the cancel races, the library check and the poll
 budget: exactly the code that must not be forked.
@@ -19,13 +15,12 @@ import time
 from typing import Any
 
 from ..agent import AgentOutcome
-from ..app import _emit_download_and_poll  # re-uses the existing pump
 from ..audiobookshelf import ABSClient
 from ..library_match import find_existing
-from ..llm import clear_conversation
 from ..settings import Settings
 from ..worker import JOB_BUDGET_S, _kill_download_and_clean
 from ...cli import _read_state
+from .progress import _emit_download_and_poll
 from .store import JobStore
 from .types import FailureClass, Job, JobStatus
 
@@ -84,7 +79,6 @@ async def finish_agent_outcome(
         )
         return
 
-    clear_conversation(job.id)
     await store.set_picked_book(
         job.id,
         title=outcome.title,
@@ -159,9 +153,6 @@ async def finish_agent_outcome(
         session=job.id,
         on_download_change=_track_download_change,
         query=job.query,
-        # JobStore.update_status is the sole producer of terminal events on the
-        # jobs path — see U1 in the plan.
-        emit_terminal=False,
         # One budget for the whole job: attempts, grace extensions and fallback
         # swaps all draw from it, so arq's timeout stays a backstop instead of
         # the thing that actually ends the job.

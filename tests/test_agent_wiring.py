@@ -1,9 +1,5 @@
-"""U4: the jobs path can't carry an answer, so it must not generate a question.
-
-These deliberately assert the WIRING, not the model's behaviour. Asserting
-"the agent commits over an ambiguous fixture" would be asserting prompt
-compliance — non-deterministic, and it either flakes or needs a live call.
-"""
+"""The agent's wiring and prompt guards. These assert the WIRING, not the
+model's behaviour, which is non-deterministic and needs a live call."""
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -11,64 +7,7 @@ import pytest
 
 from auto_torrent.server import agent as agent_module
 
-
-async def _run(allow_ask: bool):
-    """Run the agent with the SDK stubbed out, and return the options it built."""
-    captured = {}
-
-    def fake_server(name, tools):
-        captured["tools"] = [getattr(t, "name", None) or t.__name__ for t in tools]
-        return object()
-
-    async def fake_query(prompt, options):
-        captured["options"] = options
-        return
-        yield  # make it an async generator
-
-    with (
-        patch.object(agent_module, "create_sdk_mcp_server", fake_server),
-        patch.object(agent_module, "query", fake_query),
-    ):
-        await agent_module.run_agent(
-            "dune", "session-1", object(), AsyncMock(), allow_ask=allow_ask
-        )
-    return captured
-
-
-async def test_jobs_path_has_no_ask_tool():
-    captured = await _run(allow_ask=False)
-    assert not any("ask_user_to_pick" in t for t in captured["tools"])
-    assert not any("ask_user_to_pick" in t for t in captured["options"].allowed_tools)
-
-
-async def test_reply_capable_callers_keep_the_ask_tool():
-    """SMS keys pending options by phone number, legacy /chat by session_id —
-    both can actually resolve a pick, so neither loses the capability."""
-    captured = await _run(allow_ask=True)
-    assert any("ask_user_to_pick" in t for t in captured["tools"])
-    assert any("ask_user_to_pick" in t for t in captured["options"].allowed_tools)
-
-
-async def test_no_ask_prompt_tells_the_model_to_resolve_by_ranking():
-    captured = await _run(allow_ask=False)
-    prompt = " ".join(captured["options"].system_prompt.split())
-    assert "no reply path" in prompt
-    # It must tell the model to decide for itself rather than ask.
-    assert "commit to the best candidate" in prompt
-
-
-async def test_ask_capable_prompt_is_unchanged():
-    captured = await _run(allow_ask=True)
-    assert captured["options"].system_prompt == agent_module.SYSTEM_PROMPT
-
-
-def test_allow_ask_defaults_to_true():
-    """A new caller must not silently lose disambiguation — opting out is
-    explicit."""
-    import inspect
-
-    sig = inspect.signature(agent_module.run_agent)
-    assert sig.parameters["allow_ask"].default is True
+from tests.sdk_fake import fake_client
 
 
 def test_outcome_carries_the_chosen_edition():
@@ -97,10 +36,10 @@ async def test_agent_crash_message_is_human_not_a_python_exception():
 
     with (
         patch.object(agent_module, "create_sdk_mcp_server", lambda name, tools: object()),
-        patch.object(agent_module, "query", boom),
+        patch.object(agent_module, "ClaudeSDKClient", fake_client(boom)),
     ):
         outcome = await agent_module.run_agent(
-            "dune", "s1", object(), AsyncMock(), allow_ask=False
+            "dune", "s1", object(), AsyncMock()
         )
 
     assert outcome.kind == "error"
@@ -144,12 +83,6 @@ def test_prompt_forbids_inventing_runtime_or_eta():
     assert "Never invent" in agent_module.SYSTEM_PROMPT
 
 
-def test_no_ask_clause_forbids_ending_on_a_question():
-    # Normalise: the clause is hard-wrapped, so the phrase spans a newline.
-    clause = " ".join(agent_module.NO_ASK_CLAUSE.split())
-    assert "Never end your turn with a question" in clause
-
-
 # --- narration during the agent phase ---------------------------------------
 #
 # Measured on a real run: 67 seconds between "Searching for X" and the agent's
@@ -168,16 +101,6 @@ class _RecordingBus:
 
     def send(self, _to, text):
         self.events.append(("send", {"text": text}))
-
-
-class _SmsOnlySink:
-    """SMS-shaped sink: send only, no emit."""
-
-    def __init__(self):
-        self.sent = []
-
-    def send(self, _to, text):
-        self.sent.append(text)
 
 
 def test_narrate_emits_a_progress_frame_on_a_chat_sink():
@@ -210,14 +133,6 @@ def test_narrate_lets_a_changed_frame_through_and_allows_a_later_repeat():
     ]
 
 
-def test_narrate_is_a_noop_for_the_sms_sink():
-    """The SMS client has no emit(); pushing a dict at it would be a crash or
-    a nonsense text message."""
-    sink = _SmsOnlySink()
-    agent_module._narrate(sink, "searching", "Looking for x…")
-    assert sink.sent == []
-
-
 async def test_search_narrates_from_inside_the_pipeline():
     """The search tool is the single longest step in the agent phase.
 
@@ -245,10 +160,10 @@ async def test_search_narrates_from_inside_the_pipeline():
     bus = _RecordingBus()
     with (
         patch.object(agent_module, "create_sdk_mcp_server", fake_server),
-        patch.object(agent_module, "query", fake_query),
+        patch.object(agent_module, "ClaudeSDKClient", fake_client(fake_query)),
         patch.object(agent_module, "_search_pipeline_sync", fake_pipeline),
     ):
-        await agent_module.run_agent("dune", "s1", object(), bus, allow_ask=False)
+        await agent_module.run_agent("dune", "s1", object(), bus)
         tool = captured["tools"]["search_audiobookbay"]
         handler = getattr(tool, "handler", None) or tool
         await handler({"query": "dune", "limit": 5})

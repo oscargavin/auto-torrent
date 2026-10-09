@@ -1,12 +1,12 @@
-"""FastAPI router for /chat/jobs*. Built via factory so tests can inject fakes."""
+"""FastAPI router for /chat/jobs*: read, list, stream and cancel. Jobs are
+created by the thread worker, not here. Built via factory so tests can inject
+fakes."""
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Awaitable, Callable
-
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
 from ..app import _require_bearer  # re-use the existing bearer check
@@ -14,32 +14,13 @@ from ..worker import _kill_download_and_clean
 from ...cli import _read_state
 from .events import EventLog
 from .store import JobStore
-from .types import TERMINAL_EVENT_TYPES, TERMINAL_STATUSES, CreateJobRequest, Job, JobStatus
+from .types import TERMINAL_EVENT_TYPES, TERMINAL_STATUSES, Job, JobStatus
 
 logger = logging.getLogger("atb.jobs.api")
 
 
-def build_router(
-    *,
-    store: JobStore,
-    log: EventLog,
-    enqueue: Callable[[str], Awaitable[None]],
-) -> APIRouter:
+def build_router(*, store: JobStore, log: EventLog) -> APIRouter:
     router = APIRouter()
-
-    @router.post("/chat/jobs", response_model=Job)
-    async def create_job(
-        req: CreateJobRequest,
-        response: Response,
-        _: None = Depends(_require_bearer),
-    ) -> Job:
-        job, created = await store.create(req)
-        if created:
-            await enqueue(job.id)
-            response.status_code = 201
-        else:
-            response.status_code = 200
-        return job
 
     @router.get("/chat/jobs/{job_id}", response_model=Job)
     async def get_job(job_id: str, _: None = Depends(_require_bearer)) -> Job:

@@ -1,4 +1,4 @@
-"""ChatEventBus-shaped adapter that publishes into an EventLog.
+"""Event bus that publishes into an EventLog. ThreadSink builds on it.
 
 The existing `agent.py` + `worker.py` code calls `bus.emit(...)`, `bus.send(...)`,
 `bus.system_progress(...)` from both async coroutines and sync threads
@@ -58,19 +58,17 @@ class StreamEventBus:
         self.messaged = True
 
     async def send_async(self, _phone: str, text: str) -> None:
-        # The agent calls bus.send(phone, text) — phone is the SMS API surface;
-        # for chat we surface the text as a "progress" event.
+        # The agent and the poll call bus.send(to, text). The first argument
+        # is ignored; the text goes out as a "progress" event.
         #
-        # `source: agent` marks this as free-form LLM prose rather than a
-        # lifecycle frame. It is written for SMS, so it re-states the book by
-        # name and runs to any length — which is why the card truncated it
-        # mid-word while showing the same title directly above. Card clients
-        # keep these out of the status line; the event stays in the log, and
-        # SMS (which has no card) is unaffected.
+        # `source: agent` marks this as free-form prose rather than a lifecycle
+        # frame. It re-states the book by name and runs to any length, which
+        # is why the card truncated it mid-word under the same title. Card
+        # clients keep these out of the status line; the event stays in the log.
         await self.emit_async("progress", {"text": text, "source": "agent"})
 
     async def system_progress_async(self, text: str) -> None:
-        # Does NOT set messaged — mirrors ChatEventBus.system_progress behaviour.
+        # Does NOT set messaged: a server-side frame is not the agent speaking.
         await self._log.publish(self.job_id, "progress", {"text": text})
 
     # --- sync wrappers (callable from threads) ---

@@ -13,6 +13,8 @@ import pytest
 
 from auto_torrent.server import agent as agent_mod
 
+from tests.sdk_fake import fake_client
+
 
 class _Sink:
     def __init__(self):
@@ -43,7 +45,7 @@ async def tools(monkeypatch):
             yield None
 
     monkeypatch.setattr(agent_mod, "create_sdk_mcp_server", fake_server)
-    monkeypatch.setattr(agent_mod, "query", fake_query)
+    monkeypatch.setattr(agent_mod, "ClaudeSDKClient", fake_client(fake_query))
     monkeypatch.setattr(agent_mod, "_execute_download_bg", lambda *a, **kw: {"id": "dl1"})
 
     asked: list = []
@@ -113,7 +115,7 @@ async def test_running_out_of_turns_gets_its_own_answer(monkeypatch):
         raise Exception("Command failed with exit code 1 (exit code: 1)")
 
     monkeypatch.setattr(agent_mod, "create_sdk_mcp_server", lambda name, tools: object())
-    monkeypatch.setattr(agent_mod, "query", fake_query)
+    monkeypatch.setattr(agent_mod, "ClaudeSDKClient", fake_client(fake_query))
 
     outcome = await agent_mod.run_agent("dune", "t1", agent_mod.Settings(), _Sink())
 

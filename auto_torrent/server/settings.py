@@ -1,16 +1,10 @@
-from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    model_config = {"env_file": ".env"}
-
-    twilio_account_sid: str
-    twilio_auth_token: str = ""
-    twilio_phone_number: str
-    twilio_api_key_sid: str = ""
-    twilio_api_key_secret: str = ""
-    allowed_numbers: list[str]
+    # "ignore", because the server's .env still holds the old Twilio keys. The
+    # default ("forbid") would refuse to start on them.
+    model_config = {"env_file": ".env", "extra": "ignore"}
 
     abs_url: str = "http://localhost:13378"
     abs_api_token: str
@@ -41,10 +35,3 @@ class Settings(BaseSettings):
     job_state_ttl_s: int = 7 * 24 * 3600
     # How long the dedup key lives so a re-request hits the same in-flight job.
     job_dedup_ttl_s: int = 3600
-
-    @field_validator("allowed_numbers", mode="before")
-    @classmethod
-    def parse_numbers(cls, v: str | list[str]) -> list[str]:
-        if isinstance(v, str):
-            return [n.strip() for n in v.split(",") if n.strip()]
-        return v

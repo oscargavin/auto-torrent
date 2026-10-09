@@ -11,24 +11,15 @@ from unittest.mock import patch
 
 import pytest
 
-# Settings() + SMSClient run at import time — patch env + Twilio first (mirrors
-# test_server_chat.py).
+# Settings() runs at import time — patch env first.
 _env = {
-    "TWILIO_ACCOUNT_SID": "test",
-    "TWILIO_AUTH_TOKEN": "test",
-    "TWILIO_PHONE_NUMBER": "+10000000000",
-    "ALLOWED_NUMBERS": '["+1234"]',
     "ABS_API_TOKEN": "test",
     "ABS_LIBRARY_ID": "test",
     "ATB_CWD": "/tmp",
     "ATB_API_TOKEN": "test-token",
 }
 
-with (
-    patch.dict(os.environ, _env),
-    patch("auto_torrent.server.sms.Client"),
-    patch("auto_torrent.server.sms.RequestValidator"),
-):
+with patch.dict(os.environ, _env):
     from auto_torrent.server import app as app_module
 
 

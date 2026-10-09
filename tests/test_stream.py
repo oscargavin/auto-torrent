@@ -179,17 +179,17 @@ class TestPrioritizeForStreaming:
 
 class TestFormatSpeed:
     def test_megabytes(self) -> None:
-        from auto_torrent.stream import _format_speed
+        from auto_torrent.torrent import format_speed as _format_speed
 
         assert _format_speed(5_242_880) == "5.0 MB/s"
 
     def test_kilobytes(self) -> None:
-        from auto_torrent.stream import _format_speed
+        from auto_torrent.torrent import format_speed as _format_speed
 
         assert _format_speed(51_200) == "50 KB/s"
 
     def test_bytes(self) -> None:
-        from auto_torrent.stream import _format_speed
+        from auto_torrent.torrent import format_speed as _format_speed
 
         assert _format_speed(500) == "500 B/s"
 

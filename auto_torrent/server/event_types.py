@@ -1,6 +1,6 @@
-"""Lifecycle event vocabulary shared across the /chat and /chat/jobs paths.
+"""Lifecycle event vocabulary shared across the /chat/threads and /chat/jobs streams.
 
-One source of truth so the SSE producers (app.py pump, worker.py poll) and the
+One source of truth so the SSE producers (jobs/progress.py pump, worker.py poll) and the
 Bookkeeper app's decoder agree on the strings. Discrete SSE events keep their
 existing names (`committed`/`completed`/`error`); finer-grained lifecycle is
 carried on `progress` events via the `stage` field so the vocabulary stays

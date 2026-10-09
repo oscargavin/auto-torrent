@@ -6,6 +6,8 @@ from unittest.mock import patch
 from auto_torrent.server import agent as agent_module
 from auto_torrent.types import BookMetadata
 
+from tests.sdk_fake import fake_client
+
 
 class _Bus:
     def emit(self, *_a, **_kw):
@@ -29,10 +31,14 @@ async def _tools(**patches):
 
     with (
         patch.object(agent_module, "create_sdk_mcp_server", fake_server),
-        patch.object(agent_module, "query", fake_query),
+        patch.object(agent_module, "ClaudeSDKClient", fake_client(fake_query)),
     ):
-        await agent_module.run_agent("dune", "s1", object(), _Bus(), allow_ask=False)
+        await agent_module.run_agent("dune", "s1", object(), _Bus(), on_ask=_no_ask)
     return captured
+
+
+async def _no_ask(*_a):
+    pass
 
 
 async def test_options_load_our_tools_up_front_and_drop_the_built_ins():
@@ -131,7 +137,7 @@ async def test_a_plain_text_answer_reaches_the_user():
 
     with (
         patch.object(agent_module, "create_sdk_mcp_server", lambda name, tools: object()),
-        patch.object(agent_module, "query", fake_query),
+        patch.object(agent_module, "ClaudeSDKClient", fake_client(fake_query)),
     ):
         outcome = await agent_module.run_agent("what is piranesi about", "s1", object(), Bus())
 

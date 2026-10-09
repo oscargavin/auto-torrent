@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 from urllib.parse import quote_plus
 
-from ..agent import run_agent
+from ..agent import SESSION_MAX_TURNS, AgentSession, run_agent
 from ..covers import find_card, find_cover_url
 from ..event_types import EVENT_PROGRESS, STAGE_FOUND
 from ..jobs.finish import finish_agent_outcome
@@ -36,6 +37,44 @@ from .types import (
 
 logger = logging.getLogger("atb.threads.worker")
 settings = Settings()
+
+# Open agent sessions, one per conversation. A session holds a claude CLI
+# (about 270 MB), so idle ones close and only a few stay open. "New
+# conversation" is a new thread id, so its old session closes when idle.
+SESSION_IDLE_S = 15 * 60
+SESSION_MAX = 4
+_sessions: dict[str, AgentSession] = {}
+
+
+async def _drop(thread_id: str) -> None:
+    session = _sessions.pop(thread_id, None)
+    if session is not None:
+        await session.close()
+
+
+async def close_idle_sessions() -> None:
+    now = time.monotonic()
+    for thread_id, session in list(_sessions.items()):
+        if now - session.last_used > SESSION_IDLE_S:
+            await _drop(thread_id)
+
+
+async def _session_for(thread_id: str) -> AgentSession:
+    await close_idle_sessions()
+    session = _sessions.get(thread_id)
+    if session is not None and (session.broken or session.turns >= SESSION_MAX_TURNS):
+        await _drop(thread_id)
+        session = None
+    if session is None:
+        while len(_sessions) >= SESSION_MAX:
+            await _drop(min(_sessions, key=lambda k: _sessions[k].last_used))
+        session = _sessions[thread_id] = AgentSession()
+    return session
+
+
+def _close_when_idle() -> None:
+    loop = asyncio.get_running_loop()
+    loop.call_later(SESSION_IDLE_S + 5, lambda: loop.create_task(close_idle_sessions()))
 
 def goodreads_search_url(title: str, author: str) -> str:
     """Where to send someone who wants the reviews.
@@ -183,7 +222,9 @@ async def run_thread_turn(
             pending_options=pending_options or None,
             on_ask=on_ask,
             history=history or None,
+            session=await _session_for(thread_id),
         )
+        _close_when_idle()
 
         if outcome.kind == "replied":
             # The answer already landed as an assistant message. Nothing to

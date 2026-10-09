@@ -1,50 +1,31 @@
-"""FastAPI app — Twilio SMS webhook → agentic worker → deterministic poll."""
+"""FastAPI app — the Bookkeeper chat, profiles, recaps and recommendations."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import hmac
-import json
 import logging
-import time
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Awaitable, Callable
+from typing import AsyncIterator
 
 import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, Form, Header, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel
 
-from .agent import AgentOutcome, run_agent
-from .event_types import EVENT_PROGRESS, STAGE_DOWNLOADING, STAGE_FOUND
-from .llm import clear_conversation, get_pending_options, get_pending_result
 from .profiles import ALLOWED_AVATAR_STYLES, ProfileStore, public_view
 from .recap import RECAP_CACHE_TTL_S, build_recap
 from .recommend import DEFAULT_N, RecCache, build_recommendations
 from .settings import Settings
-from .sms import SMSClient
 from .audiobookshelf import ABSClient
 from .covers import backfill_covers
-from .worker import (
-    DownloadNotFinishedError,
-    DownloadResult,
-    _refresh_state,
-    get_active_downloads,
-    poll_and_finalise,
-)
 
 logger = logging.getLogger("atb.server")
 
 settings = Settings()
-sms = SMSClient(settings)
 profile_store = ProfileStore(settings)
 rec_cache = RecCache(settings.rec_cache_path)
 recap_cache = RecCache(settings.recap_cache_path, ttl_s=RECAP_CACHE_TTL_S)
-
-# Strong references to detached /chat work tasks so they aren't garbage-collected
-# if the client disconnects mid-download (app backgrounded/closed).
-_background_tasks: set[asyncio.Task] = set()
 
 
 @asynccontextmanager
@@ -81,15 +62,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     thread_log = EventLog(redis, prefix="thread")
     threads = ThreadStore(redis, thread_log, state_ttl_s=settings.job_state_ttl_s)
 
-    async def enqueue(job_id: str) -> None:
-        await arq_pool.enqueue_job("run_chat_job", job_id)
-
     async def enqueue_turn(
         thread_id: str, text: str, pending: list[dict] | None
     ) -> None:
         await arq_pool.enqueue_job("run_thread_turn", thread_id, text, pending)
 
-    _app.include_router(build_router(store=store, log=log, enqueue=enqueue))
+    _app.include_router(build_router(store=store, log=log))
     _app.include_router(
         build_threads_router(threads=threads, log=thread_log, enqueue_turn=enqueue_turn)
     )
@@ -97,17 +75,6 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # Drain in-flight detached SSE-generator tasks (not the arq worker — that
-        # has its own lifecycle). 30s grace covers a normal stream close.
-        if _background_tasks:
-            logger.info("draining %d in-flight tasks…", len(_background_tasks))
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*_background_tasks, return_exceptions=True),
-                    timeout=30,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("drain timed out; %d still in flight", len(_background_tasks))
         await arq_pool.close()
         await redis.aclose()
 
@@ -126,153 +93,6 @@ async def security_headers(request: Request, call_next):  # type: ignore[no-unty
     if "server" in response.headers:
         del response.headers["server"]
     return response
-
-
-def _reconstruct_url(request: Request) -> str:
-    """Reconstruct the public URL Twilio signed against (behind Cloudflare tunnel)."""
-    proto = request.headers.get("x-forwarded-proto", "https")
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
-    return f"{proto}://{host}{request.url.path}"
-
-
-def _twiml_response(message: str) -> Response:
-    body = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        f"<Response><Message>{message}</Message></Response>"
-    )
-    return Response(content=body, media_type="application/xml")
-
-
-def _maybe_quick_pick(query: str, phone: str) -> dict | None:
-    """If query is a bare digit, resolve it against pending results."""
-    stripped = query.strip()
-    if not stripped.isdigit():
-        return None
-    return get_pending_result(phone, int(stripped))
-
-
-@app.post("/sms")
-async def sms_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    Body: str = Form(""),
-    From: str = Form(""),
-    x_twilio_signature: str = Header("", alias="X-Twilio-Signature"),
-) -> Response:
-    form_data = dict(await request.form())
-    url = _reconstruct_url(request)
-
-    if not sms.validate_request(url, {k: str(v) for k, v in form_data.items()}, x_twilio_signature):
-        logger.warning("Invalid Twilio signature from %s", From)
-        return Response(status_code=403)
-
-    if From not in settings.allowed_numbers:
-        logger.warning("Unauthorized number: %s", From)
-        return Response(status_code=403)
-
-    query = Body.strip()
-    logger.info("SMS from %s: %s", From, query)
-
-    if not query:
-        return _twiml_response("Send me a book title and I'll find it for you!")
-
-    lower = query.lower()
-    if lower == "help":
-        return _twiml_response(
-            "Text me a book title and I'll find the audiobook! "
-            'Send "status" to check active downloads.'
-        )
-
-    if lower == "status":
-        downloads = await get_active_downloads(settings)
-        if not downloads:
-            return _twiml_response("No active downloads.")
-        lines = []
-        for d in downloads:
-            pct = int(d.get("progress", 0) * 100)
-            lines.append(f'{d.get("title", "Unknown")} ({pct}%)')
-        return _twiml_response("Downloading:\n" + "\n".join(lines))
-
-    background_tasks.add_task(_handle_request, query, From)
-    return _twiml_response("Got it!")
-
-
-async def _handle_request(query: str, phone: str) -> None:
-    """Resolve a digit-pick if pending, else hand to the agent. Then poll."""
-    picked = _maybe_quick_pick(query, phone)
-
-    if picked:
-        clear_conversation(phone)
-        await _commit_and_poll_from_pick(picked, phone)
-        return
-
-    pending = get_pending_options(phone)
-    outcome = await run_agent(query, phone, settings, sms, pending_options=pending)
-
-    if outcome.kind == "committed":
-        clear_conversation(phone)
-        try:
-            await poll_and_finalise(
-                download=outcome.download,
-                fallbacks=outcome.fallbacks,
-                display=outcome.display,
-                author=outcome.author,
-                title=outcome.title,
-                phone=phone,
-                settings=settings,
-                sms=sms,
-            )
-        except Exception:
-            logger.exception("poll_and_finalise crashed")
-            sms.send(phone, "Something went wrong while downloading. Send the title again to retry?")
-    elif outcome.kind in ("asked", "no_results"):
-        # Agent already sent any user-facing SMS.
-        pass
-    else:
-        logger.warning("agent error outcome: %s", outcome.message)
-        sms.send(phone, "I had trouble with that — try again with the full title?")
-
-
-async def _commit_and_poll_from_pick(picked: dict, phone: str) -> None:
-    """User picked a number from a pending list. Start the download and poll."""
-    from ..cli import _execute_download_bg
-
-    title = picked.get("title") or "Unknown"
-    author = picked.get("author") or ""
-    magnet = picked.get("magnet") or ""
-    if not magnet:
-        sms.send(phone, "That option's gone stale, sorry — search again?")
-        return
-
-    bg_title = f"{title} - {author}" if author else title
-    try:
-        download = await asyncio.to_thread(_execute_download_bg, bg_title, magnet, None)
-    except Exception:
-        logger.exception("pick → BG start failed")
-        sms.send(phone, "Couldn't start that download. Try again?")
-        return
-
-    display = f"“{title}”" + (f" by {author}" if author else "")
-    narrator = picked.get("narrator")
-    if narrator:
-        sms.send(phone, f"Found {display}, narrated by {narrator}. Downloading now…")
-    else:
-        sms.send(phone, f"Found {display}. Downloading now…")
-
-    try:
-        await poll_and_finalise(
-            download=download,
-            fallbacks=[],
-            display=display,
-            author=author,
-            title=title,
-            phone=phone,
-            settings=settings,
-            sms=sms,
-        )
-    except Exception:
-        logger.exception("poll_and_finalise after pick crashed")
-        sms.send(phone, "Something went wrong while downloading. Send the title again to retry?")
 
 
 @app.get("/health")
@@ -307,57 +127,6 @@ async def github_webhook(request: Request) -> Response:
     return Response(status_code=200)
 
 
-class ChatEventBus:
-    """Duck-typed SMS sink that funnels agent/worker `sms.send(...)` calls into SSE.
-
-    Why: run_agent + poll_and_finalise both call `sms.send(phone, body)`. We don't
-    want to fork those paths for chat — we just hand them a bus that emits the
-    same messages as Server-Sent Events instead of SMS.
-    """
-
-    def __init__(self) -> None:
-        self.queue: asyncio.Queue[tuple[str, dict] | None] = asyncio.Queue()
-        # Constructed inside an async request handler, so the loop is running.
-        self._loop = asyncio.get_running_loop()
-        # Whether the agent has surfaced anything to the user via send(). Used
-        # by /chat to decide if an "agent ended without commit/ask" outcome is
-        # a real failure or just a graceful no-results that already messaged.
-        self.messaged = False
-
-    def send(self, to: str, body: str) -> None:
-        # `to` is the session id in chat mode — ignored, the SSE stream is the channel.
-        self.messaged = True
-        self._loop.call_soon_threadsafe(
-            self.queue.put_nowait, ("progress", {"text": body})
-        )
-
-    def system_progress(self, body: str) -> None:
-        """Server-emitted progress (e.g. "Searching…") that does NOT count as
-        the agent having messaged — so a subsequent agent crash with no output
-        still surfaces as an error rather than being suppressed."""
-        self._loop.call_soon_threadsafe(
-            self.queue.put_nowait, ("progress", {"text": body})
-        )
-
-    def emit(self, event: str, data: dict) -> None:
-        self._loop.call_soon_threadsafe(self.queue.put_nowait, (event, data))
-
-    def close(self) -> None:
-        self._loop.call_soon_threadsafe(self.queue.put_nowait, None)
-
-
-class ChatRequest(BaseModel):
-    query: str
-    session_id: str = "default"
-
-
-# How often the chat path polls download state and emits "Downloading… N%" as
-# a progress event so the bubble shows motion. Tests override.
-# 10s, down from 30s: the pump emits only on percent change, so a slow
-# download is unaffected while a fast one stops leaping ~40 points a frame.
-CHAT_PROGRESS_INTERVAL_S: float = 10.0
-
-
 def _require_bearer(authorization: str = Header("", alias="Authorization")) -> None:
     token = settings.atb_api_token
     if not token:
@@ -365,207 +134,6 @@ def _require_bearer(authorization: str = Header("", alias="Authorization")) -> N
     expected = f"Bearer {token}"
     if not hmac.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="unauthorized")
-
-
-# A frame at least this often while a download is live, even when the
-# whole-number percentage has not moved. On a slow swarm one percent can take
-# minutes, and a card that hears nothing for that long cannot tell a slow
-# download from a dead one — nor can its ETA, which is refreshed only by a frame.
-CHAT_PROGRESS_HEARTBEAT_S: float = 30.0
-# How long the rate may sit at zero before the card says so. Well under the
-# poll layer's STALL_GRACE_S (3 min): that is when the server gives up on a
-# copy, not when the user should first hear that nothing is arriving.
-CHAT_IDLE_NOTICE_S: float = 30.0
-
-
-async def _chat_progress_pump(
-    current: dict, bus: "ChatEventBus", stop: asyncio.Event
-) -> None:
-    """Emit a progress event whenever what the card should say changes.
-
-    Why: poll_and_finalise blocks for the entire download (minutes to hours)
-    without sending SMS — fine for SMS UX, dead silent for chat UX. The pump
-    fills the gap so the bubble shows motion.
-
-    `current` is a live `{"id", "copy"}` holder rather than a fixed id: a stall
-    swaps to a fallback copy under a new download id, and the old state file is
-    unlinked. A pump bound to the first id read nothing for the rest of the job,
-    so a fallback that downloaded to 100% did so with no progress on the card.
-    """
-    last_key: tuple | None = None
-    last_emit = 0.0
-    last_id: str | None = None
-    zero_since: float | None = None
-    while True:
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=CHAT_PROGRESS_INTERVAL_S)
-            return
-        except asyncio.TimeoutError:
-            pass
-        download_id = current["id"]
-        copy = current["copy"]
-        if download_id != last_id:
-            # A new copy starts from zero; nothing about the old one carries.
-            last_id, last_key, zero_since = download_id, None, None
-        state = _refresh_state(download_id)
-        if not state:
-            continue
-        progress = float(state.get("progress") or 0)
-        pct = int(progress * 100)
-        speed = int(state.get("speed_bytes_per_s") or 0)
-        eta = state.get("eta_s")
-        now = time.monotonic()
-
-        if pct >= 100 and last_key is not None and last_key[1] >= 100:
-            # The bytes are down and the card has been told. From here the
-            # import owns the card; a heartbeat re-sending "downloading 100%"
-            # would pull it back from "Adding to your library" a step.
-            continue
-
-        if pct == 0 and speed <= 0 and eta is None:
-            # Still fetching torrent metadata, or no peer has sent a byte yet.
-            # A determinate bar pinned at 0% reads as frozen for up to two
-            # minutes here, so this stays on the "found" step with honest words.
-            # A fallback copy is covered by the `retrying` frame that started it.
-            if copy > 1:
-                continue
-            frame = {
-                "stage": STAGE_FOUND,
-                "percent": 0,
-                "peers": state.get("peers"),
-                "text": "Connecting to people sharing it…",
-            }
-        else:
-            # A finished download has a zero rate too; that is not waiting.
-            zero_since = (zero_since or now) if speed <= 0 and pct < 100 else None
-            waiting = zero_since is not None and now - zero_since >= CHAT_IDLE_NOTICE_S
-            if waiting:
-                text = f"Waiting for data… {pct}%"
-            elif copy > 1:
-                text = f"Downloading another copy… {pct}%"
-            else:
-                text = f"Downloading… {pct}%"
-            frame = {
-                "percent": pct,
-                # Exact progress, for a slow swarm: there one whole percent
-                # takes minutes, and the heartbeat's fresh fraction is the only
-                # thing that visibly moves.
-                "fraction": round(progress, 4),
-                "speed_bytes_per_s": speed,
-                "peers": state.get("peers"),
-                # No ETA while nothing arrives: the last one assumed a rate
-                # that has gone, and the client extrapolates the bar from it.
-                "eta_s": None if waiting else eta,
-                "stage": STAGE_DOWNLOADING,
-                "text": text,
-            }
-            if copy > 1:
-                frame["copy"] = copy
-
-        key = (frame["stage"], pct, frame["text"])
-        # `text` is retained for back-compat (old consumers + the SSE test's
-        # %-check). Change-or-heartbeat keeps a multi-hour download to a few
-        # hundred events, clear of the Redis stream MAXLEN trim.
-        if key != last_key or now - last_emit >= CHAT_PROGRESS_HEARTBEAT_S:
-            bus.emit(EVENT_PROGRESS, frame)
-            last_key, last_emit = key, now
-
-
-async def _emit_download_and_poll(
-    bus: "ChatEventBus",
-    *,
-    download: dict,
-    fallbacks: list[dict],
-    display: str,
-    title: str,
-    author: str,
-    session: str,
-    on_download_change: Callable[[str], Awaitable[None]] | None = None,
-    query: str | None = None,
-    emit_terminal: bool = True,
-    deadline: float | None = None,
-    narrator: str = "",
-    file_format: str = "",
-) -> DownloadResult:
-    """Emit `committed`, run the poll with a progress pump, then `completed`.
-
-    Returns a DownloadResult. `ok` is true only when the book actually reached
-    the library; otherwise `failure_class` says why, which is what the jobs
-    layer renders user-facing copy from. This used to be a bool, and every
-    path that abandoned a download returned normally — so `completed` fired
-    and the user was told a book they never received was in their library.
-
-    `emit_terminal` controls whether this function publishes the terminal
-    `completed`/`error` frames itself. The jobs path passes False: there,
-    JobStore.update_status is the sole producer of terminal events, and a
-    second frame from here would race it (bus.emit is fire-and-forget via
-    call_soon_threadsafe, so ordering is nondeterministic) — the SSE stream
-    closes on whichever lands first, which could be the one without the
-    job's error detail. The legacy /chat and SMS callers have no JobStore
-    and keep emitting as they always have.
-
-    `on_download_change` forwards the per-fallback download_id update from
-    poll_and_finalise to the caller — the jobs worker uses it to keep
-    store.set_download_id current so cancel kills the right subprocess."""
-    download_id = download.get("id", "")
-    # The edition rides on `committed` so the card shows which copy this is the
-    # moment it is chosen, not on the next 30s snapshot poll.
-    bus.emit(
-        "committed",
-        {
-            "id": download_id, "title": title, "author": author, "display": display,
-            "narrator": narrator, "format": file_format,
-        },
-    )
-    # `committed` carries the book; this carries the lifecycle position, so the
-    # card can move off "searching" before the first byte-progress frame lands
-    # (which only fires on a percent change, and can be a while on a slow start).
-    bus.emit(EVENT_PROGRESS, {"stage": STAGE_FOUND, "percent": 0,
-                              "text": "Found it — starting the download…"})
-    stop = asyncio.Event()
-    current = {"id": download_id, "copy": 1}
-
-    async def _on_download_change(new_id: str) -> None:
-        current["id"] = new_id
-        current["copy"] += 1
-        if on_download_change is not None:
-            await on_download_change(new_id)
-
-    pump = asyncio.create_task(_chat_progress_pump(current, bus, stop))
-    try:
-        await poll_and_finalise(
-            download=download,
-            fallbacks=fallbacks,
-            display=display,
-            author=author,
-            title=title,
-            phone=session,
-            settings=settings,
-            sms=bus,
-            on_download_change=_on_download_change,
-            query=query,
-            deadline=deadline,
-        )
-        if emit_terminal:
-            bus.emit("completed", {"title": title, "author": author})
-        return DownloadResult.success()
-    except DownloadNotFinishedError as e:
-        # An abandoned or half-finished download. poll_and_finalise has already
-        # messaged the user and emitted the relevant stage; we only translate
-        # the reason for the caller. Never `completed`.
-        logger.info("download did not finish for %s: %s", display, type(e).__name__)
-        return DownloadResult.from_error(e)
-    except Exception as e:  # noqa: BLE001
-        logger.exception("chat poll_and_finalise crashed")
-        if emit_terminal:
-            bus.emit("error", {"message": f"download error: {e}"})
-        return DownloadResult.from_error(e)
-    finally:
-        stop.set()
-        try:
-            await pump
-        except Exception:  # noqa: BLE001
-            pass
 
 
 @app.post("/covers/backfill")
@@ -581,129 +149,6 @@ async def covers_backfill(
     """
     return await backfill_covers(
         ABSClient(settings), settings.abs_library_id, dry_run=dry_run
-    )
-
-
-@app.post("/chat")
-async def chat(req: ChatRequest, _: None = Depends(_require_bearer)) -> StreamingResponse:
-    bus = ChatEventBus()
-
-    async def run_chat() -> None:
-        try:
-            query = req.query.strip()
-            session = req.session_id.strip() or "default"
-
-            if not query:
-                bus.emit("error", {"message": "empty query"})
-                return
-
-            picked = _maybe_quick_pick(query, session)
-            if picked:
-                clear_conversation(session)
-                await _chat_commit_and_poll(picked, session, bus)
-                return
-
-            # Instant feedback. The agent's pre-commit phase (LLM parse →
-            # fan-out ABB search → enrich → score → rank → DHT probe) can run
-            # 60–90s before the first send_sms. Without this, the bubble sits
-            # on a static "Thinking…" spinner that looks frozen.
-            bus.system_progress(f"Searching for “{query}”…")
-
-            pending = get_pending_options(session)
-            outcome = await run_agent(query, session, settings, bus, pending_options=pending)
-
-            if outcome.kind == "committed":
-                clear_conversation(session)
-                await _emit_download_and_poll(
-                    bus,
-                    download=outcome.download or {},
-                    fallbacks=outcome.fallbacks,
-                    display=outcome.display,
-                    title=outcome.title,
-                    author=outcome.author,
-                    session=session,
-                    query=query,
-                )
-            elif outcome.kind in ("asked", "no_results"):
-                # Agent already pushed user-facing text via bus.send (→ progress events).
-                pass
-            elif bus.messaged:
-                # Agent ended in error but already informed the user (graceful
-                # no-results path returns kind="error" with no commit/ask).
-                # Suppress the phantom red bubble after a real message.
-                pass
-            else:
-                bus.emit("error", {"message": outcome.message or "agent error"})
-        except Exception as e:  # noqa: BLE001
-            logger.exception("chat task crashed")
-            bus.emit("error", {"message": f"{type(e).__name__}: {e}"})
-        finally:
-            bus.close()
-
-    # Run the work detached from the SSE response. If the client disconnects
-    # (app backgrounded or closed), the download AND the library organise/scan
-    # must still finish so the book lands in the library regardless — so this
-    # task is deliberately NOT cancelled when the stream closes.
-    task = asyncio.create_task(run_chat())
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-
-    async def event_stream() -> AsyncIterator[str]:
-        # Drain the bus while the client is connected. On disconnect this
-        # generator is closed, but `task` keeps running to completion.
-        while True:
-            try:
-                item = await asyncio.wait_for(bus.queue.get(), timeout=20.0)
-            except asyncio.TimeoutError:
-                yield ": keepalive\n\n"
-                continue
-            if item is None:
-                break
-            event, data = item
-            yield f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-async def _chat_commit_and_poll(picked: dict, session: str, bus: ChatEventBus) -> None:
-    """Mirror of _commit_and_poll_from_pick, emitting SSE instead of SMS."""
-    from ..cli import _execute_download_bg
-
-    title = picked.get("title") or "Unknown"
-    author = picked.get("author") or ""
-    magnet = picked.get("magnet") or ""
-    if not magnet:
-        bus.emit("error", {"message": "That option's gone stale — search again?"})
-        return
-
-    bg_title = f"{title} - {author}" if author else title
-    try:
-        download = await asyncio.to_thread(_execute_download_bg, bg_title, magnet, None)
-    except Exception as e:  # noqa: BLE001
-        logger.exception("chat pick → BG start failed")
-        bus.emit("error", {"message": f"Couldn't start that download: {e}"})
-        return
-
-    display = f"“{title}”" + (f" by {author}" if author else "")
-    narrator = picked.get("narrator")
-    line = (
-        f"Found {display}, narrated by {narrator}. Downloading now…"
-        if narrator
-        else f"Found {display}. Downloading now…"
-    )
-    bus.send(session, line)
-    await _emit_download_and_poll(
-        bus,
-        download=download,
-        fallbacks=[],
-        display=display,
-        title=title,
-        author=author,
-        session=session,
     )
 
 
@@ -810,7 +255,7 @@ async def sync_profiles(_: None = Depends(_require_profiles_secret)) -> dict:
 # Claude recommends audiobooks the profile doesn't own yet, hydrated server-side
 # into rich cards (square Audible covers) so the app just renders + offers a
 # "Request" that flows into the existing Get-a-book chat. Same atb_api_token
-# bearer the app already uses for /chat. See recommend.py.
+# bearer the app already uses for /chat/threads. See recommend.py.
 
 
 class FinishedBook(BaseModel):

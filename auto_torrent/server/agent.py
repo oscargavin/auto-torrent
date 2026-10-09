@@ -1,9 +1,10 @@
-"""Agentic SMS audiobook concierge using claude_agent_sdk (subscription auth).
+"""The audiobook concierge behind the app's chat, on claude_agent_sdk
+(subscription auth).
 
-Tools are closures that bind the per-request phone number, settings, and SMS
-client. The agent runs once per inbound SMS and exits via either
-`commit_download` (with prioritised fallbacks) or `ask_user_to_pick`. The
-deterministic poll/organise/scan layer lives in worker.py.
+An `AgentSession` is one conversation: a claude CLI kept open between turns, so
+a follow-up skips the 3-4 s start-up and the agent still has the results it saw
+last turn. Each turn ends via `commit_download`, `ask_user_to_pick` or `reply`.
+The deterministic poll/organise/scan layer lives in worker.py.
 """
 
 from __future__ import annotations
@@ -11,12 +12,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field, replace
 from typing import Awaitable, Callable, Literal
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     ResultMessage,
     TextBlock,
     ToolUseBlock,
@@ -39,9 +42,7 @@ from ..openlibrary import lookup_book
 from ..scoring import quick_score, score_and_sort
 from ..types import BookMetadata, ScoredResult, SearchResult
 from .event_types import EVENT_PROGRESS, STAGE_FOUND, STAGE_SEARCHING
-from .llm import store_pending_results
 from .settings import Settings
-from .sms import SMSClient
 from .vision import analyze_cover as _analyze_cover
 
 logger = logging.getLogger("atb.agent")
@@ -60,13 +61,13 @@ PROBE_TIMEOUT_S = 10.0
 
 SYSTEM_PROMPT = """You are a warm, concise audiobook concierge for a family's shared library. Someone asks for something to listen to; you work out what they mean, find the best copy, start the download, and confirm.
 
-Keep replies short and plain — one or two sentences, no markdown, no emoji. They appear on a small card or as an SMS, not in a chat window.
+Keep replies short and plain — one or two sentences, no markdown, no emoji. They appear in a chat on a phone.
 
 Tools:
 - search_audiobookbay(query, limit=5, title, author): returns ranked ABB results, already checked and scored. Once you know the book, pass its exact `title` and `author` too — the search then looks for that book rather than guessing from the query.
 - analyze_cover(cover_url): vision OCR. Returns {title, author, narrator} ONLY for what's printed on the image. Use to confirm narrator when the result's narrator field is empty.
 - probe_peers(magnets): live seeder counts for one or more magnets, checked together. Pass every candidate you are weighing in ONE call rather than one call each.
-- send_sms(text): one short message to the user.
+- say(text): one short line to the user, without ending the turn.
 - ask_user_to_pick(options): numbered list, ends the turn. Each option: {label, magnet, title, author, narrator}. Use only when truly ambiguous.
 - commit_download(primary, fallbacks): start the download and end. primary/fallbacks: {magnet, title, author, narrator, format}. Put narrator and format on `primary` whenever you know them — the user sees them and that is how they catch a wrong pick. Include 1–2 fallbacks whenever you have viable alternates; the polling layer uses them if the primary stalls.
 
@@ -89,7 +90,7 @@ CHOOSING BETWEEN RESULTS.
 5. Use probe_peers to break a tie or to avoid a copy that looks dead.
 
 COMMITTING.
-- send_sms a short announce, then commit_download.
+- say a short announce, then commit_download.
 - With a known narrator: Found "<title>" by <author>, narrated by <narrator>. Downloading now.
 - Without: Found "<title>" by <author>. Downloading now.
 - If you interpreted a loose request, say why in a few words: Grabbing "<title>" by <author> — funny, and it holds up over a long drive. Downloading now.
@@ -97,7 +98,7 @@ COMMITTING.
 - Never invent a narrator, runtime, or ETA. You do not know how long it will take.
 
 WHEN NOTHING MATCHES.
-- send_sms: Couldn't find <what they asked for>. Try the full title and author?
+- reply: Couldn't find <what they asked for>. Try the full title and author?
 - Then end without committing.
 
 Pending options:
@@ -118,28 +119,12 @@ offering suggestions so you don't recommend a book already on the shelf.
 End as soon as you have committed, asked, or replied. Don't keep tool-calling
 after."""
 
-# Appended when the caller has no way to deliver an answer back to the agent.
-# Without it the model still tries to ask, and the "question" lands as a
-# progress line nobody can reply to.
-NO_ASK_CLAUSE = """
-
-IMPORTANT — this channel has no reply path. You cannot ask the user anything:
-there is no ask_user_to_pick tool, and nothing you send will be answered. Never
-end your turn with a question.
-
-When the request is loose or the results are ambiguous, decide yourself using
-the CHOOSING rules and commit to the best candidate. Say in the announce what
-you picked and why, so they can see the call you made. Only skip committing
-when nothing plausibly matches."""
-
-# Appended for the in-app conversation, where the answer comes back as a tap on
-# a card rather than as a text message. Asking is cheap here, so the SMS-era
-# "only when truly ambiguous" is too conservative — but a question the user has
-# no basis to answer is worse than a decision, so the bar is "the options differ
-# in a way they can see", not "more than one result exists".
+# The answer comes back as a tap on a card, so asking is cheap — but a question
+# the user has no basis to answer is worse than a decision, so the bar is "the
+# options differ in a way they can see", not "more than one result exists".
 APP_ASK_CLAUSE = """
 
-THIS IS THE APP, NOT SMS.
+THE APP.
 The user sees your options as tappable cards with cover art, and answers with
 one tap. Asking costs them a second; downloading the wrong thing costs twenty
 minutes and clutters a shared family library. So when in doubt, ASK.
@@ -236,17 +221,6 @@ async def _search_library(settings: Settings, query: str) -> list[dict]:
             if len(out) >= LIBRARY_MATCH_LIMIT:
                 break
     return out
-
-
-def _system_prompt(allow_ask: bool, is_app: bool) -> str:
-    """One place that decides what the agent is allowed to do this turn.
-
-    Three channels, three shapes: the app can ask and gets the follow-up rules,
-    SMS can ask but only in text, and the bare jobs path cannot ask at all.
-    """
-    if is_app:
-        return SYSTEM_PROMPT + APP_ASK_CLAUSE
-    return SYSTEM_PROMPT if allow_ask else SYSTEM_PROMPT + NO_ASK_CLAUSE
 
 
 @dataclass
@@ -402,7 +376,7 @@ def _narrate(sink: object, stage: str, text: str) -> None:
     The progress pump only starts once a download commits, so everything
     before that — searching, checking seeders, reading a cover — was a single
     frame followed by a minute of silence on the card. Measured at 67s on a
-    real run. These are no-ops for the SMS sink, which has no `emit`.
+    real run.
     """
     emit = getattr(sink, "emit", None)
     if not callable(emit):
@@ -414,9 +388,9 @@ def _narrate(sink: object, stage: str, text: str) -> None:
     # time without us having to say anything new.
     #
     # The cursor is stashed on the sink, which is safe only because a sink is
-    # built per job (jobs/worker.py constructs a fresh StreamEventBus). A
-    # shared or pooled sink would leak one job's last line into the next and
-    # silently swallow its first frame.
+    # built per turn (threads/worker.py constructs a fresh ThreadSink). A
+    # shared sink would leak one turn's last line into the next and silently
+    # swallow its first frame.
     if getattr(sink, "_last_narration", None) == text:
         return
     try:
@@ -426,72 +400,37 @@ def _narrate(sink: object, stage: str, text: str) -> None:
     emit(EVENT_PROGRESS, {"stage": stage, "text": text})
 
 
-async def run_agent(
-    raw_query: str,
-    phone: str,
-    settings: Settings,
-    sms: SMSClient,
-    pending_options: list[dict] | None = None,
-    allow_ask: bool = True,
-    on_ask: Callable[[str, str, list[dict]], Awaitable[None]] | None = None,
-    history: list[tuple[str, str]] | None = None,
-) -> AgentOutcome:
-    """Run the concierge agent for one request.
+# A session restarts after this many turns. Each turn adds its search results
+# to the context, so a long conversation grows slower and dearer per message.
+SESSION_MAX_TURNS = 8
 
-    `allow_ask` is about the CALLER's ability to deliver an answer, not about
-    which channel it is — SMS keys pending options by a stable phone number and
-    the legacy /chat route by a client-supplied session_id, so both can resolve
-    a pick. The bare jobs worker passes a fresh uuid per job into a process-local
-    store in the wrong process, so `ask_user_to_pick` there wrote state nothing
-    would ever read and left the user a numbered list they could not answer.
 
-    `on_ask` is the modern answer to that: the thread worker passes a callback
-    that persists the options in Redis and appends a choice message, which the
-    app renders as tappable cards. Supplying it implies allow_ask.
-
-    `history` is (role, text) for the earlier turns of a conversation, oldest
-    first. Only the thread channel has any; SMS and the bare jobs path pass
-    None and behave exactly as before.
-    """
-    allow_ask = allow_ask or on_ask is not None
-    state: dict = {"outcome": None, "spoke": False}
-    # The agent searches more than once when the first pass doesn't satisfy it.
-    # Observed live: three rounds emitting "Found 10 copies — checking each…"
-    # / "Ranking them…" verbatim each time, which reads as a stuck loop rather
-    # than as three attempts. The round number lets the narration say which.
-    search_attempts = {"n": 0}
-    search_cache: dict[tuple[str, int, str, str], str] = {}
-    # Peer counts found this turn. The probe takes 5-10 s, so it starts in the
-    # background as soon as a search returns, while the model reads the
-    # results; the agent's own probe_peers call then finds the answer waiting.
-    # One probe at a time: each opens a libtorrent session on the same port.
-    peer_counts: dict[str, int] = {}
-    probe_lock = asyncio.Lock()
-    # magnet -> the background probe already looking for it.
-    probing: dict[str, asyncio.Task] = {}
+def _build_tools(t: "AgentSession") -> list:
+    """The agent's tools, bound once per session. Per-turn state lives on `t`
+    and is reset by `AgentSession.turn`, so the same tools serve every turn."""
 
     async def _probe(magnets: list[str], settle_s: float | None) -> dict[str, int]:
-        async with probe_lock:
-            missing = [m for m in magnets if m not in peer_counts]
+        async with t.probe_lock:
+            missing = [m for m in magnets if m not in t.peer_counts]
             if missing:
-                peer_counts.update(
+                t.peer_counts.update(
                     await asyncio.to_thread(_probe_seeds_batch, missing, 10, settle_s=settle_s)
                 )
-        return {m: peer_counts.get(m, 0) for m in magnets}
+        return {m: t.peer_counts.get(m, 0) for m in magnets}
 
     def _prefetch_peers(data: dict) -> None:
         magnets = [
             r["magnet"] for r in data.get("results") or [] if r.get("magnet")
         ][:PROBE_MAX]
-        magnets = [m for m in magnets if m not in peer_counts]
+        magnets = [m for m in magnets if m not in t.peer_counts]
         if not magnets:
             return
         # A full settle window: nobody waits on this probe, and a short one
         # would record 0 for a copy that is slow to find its peers.
         task = asyncio.create_task(_probe(magnets, PROBE_TIMEOUT_S))
         for m in magnets:
-            probing[m] = task
-        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            t.probing[m] = task
+        task.add_done_callback(lambda done: done.cancelled() or done.exception())
 
     # ---- Tools ----
 
@@ -504,7 +443,7 @@ async def run_agent(
         one anyway, and the user was shown a question that had already been
         answered for them by a download they never chose.
         """
-        if state["outcome"] is None:
+        if t.state["outcome"] is None:
             return None
         return {
             "content": [
@@ -534,28 +473,28 @@ async def run_agent(
         # and _search_pipeline_sync narrates the resolved title when it differs
         # from what was asked for, which is the only genuinely new information
         # at this point. Narrating the query again just repeated the headline.
-        query_text = args.get("query") or raw_query
+        query_text = args.get("query") or t.raw_query
         limit = int(args.get("limit") or 5)
         title = str(args.get("title") or "").strip()
         author = str(args.get("author") or "").strip()
         # A repeat of a search already run this turn costs ~10 s of page fetches
         # for the same answer. Observed live: the same query three times.
         key = (query_text.casefold().strip(), limit, title.casefold(), author.casefold())
-        if key in search_cache:
-            return {"content": [{"type": "text", "text": search_cache[key]}]}
-        search_attempts["n"] += 1
+        if key in t.search_cache:
+            return {"content": [{"type": "text", "text": t.search_cache[key]}]}
+        t.search_attempts += 1
         try:
             data = await asyncio.to_thread(
                 _search_pipeline_sync,
                 query_text,
                 limit,
-                lambda msg: _narrate(sms, STAGE_SEARCHING, msg),
-                search_attempts["n"],
+                lambda msg: _narrate(t.sms, STAGE_SEARCHING, msg),
+                t.search_attempts,
                 title,
                 author,
             )
             text = json.dumps(data)
-            search_cache[key] = text
+            t.search_cache[key] = text
             _prefetch_peers(data)
             return {"content": [{"type": "text", "text": text}]}
         except Exception as e:
@@ -568,7 +507,7 @@ async def run_agent(
         input_schema={"cover_url": str},
     )
     async def analyze_cover(args: dict) -> dict:
-        _narrate(sms, STAGE_SEARCHING, "Checking the cover for the narrator…")
+        _narrate(t.sms, STAGE_SEARCHING, "Checking the cover for the narrator…")
         try:
             data = await _analyze_cover(args.get("cover_url", ""))
             return {"content": [{"type": "text", "text": json.dumps(data)}]}
@@ -593,14 +532,14 @@ async def run_agent(
         if args.get("magnet"):
             magnets.append(args["magnet"])
         magnets = list(dict.fromkeys(magnets))[:PROBE_MAX]
-        _narrate(sms, STAGE_SEARCHING, "Checking who's sharing it…")
+        _narrate(t.sms, STAGE_SEARCHING, "Checking who's sharing it…")
         try:
             # settle_s: the probe stops when the first magnet shows a peer, so
             # the others would read 0 when compared. It waits a few seconds
             # more for them.
             # Wait for a background probe already looking for these, rather
             # than racing it into a second probe of the same magnets.
-            pending = {probing[m] for m in magnets if m in probing and not probing[m].done()}
+            pending = {t.probing[m] for m in magnets if m in t.probing and not t.probing[m].done()}
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
             counts = await _probe(magnets, PROBE_SETTLE_S if len(magnets) > 1 else None)
@@ -609,17 +548,17 @@ async def run_agent(
             return {"content": [{"type": "text", "text": json.dumps({"error": str(e), "peers": {}})}]}
 
     @tool(
-        name="send_sms",
-        description="Send a single SMS to the user. Keep under 160 chars where possible. No markdown.",
+        name="say",
+        description="Say one short line to the user in the chat, without ending the turn. No markdown.",
         input_schema={"text": str},
     )
-    async def send_sms(args: dict) -> dict:
+    async def say(args: dict) -> dict:
         text = (args.get("text") or "").strip()
         if not text:
             return {"content": [{"type": "text", "text": "ignored: empty"}]}
         try:
-            await asyncio.to_thread(sms.send, phone, text)
-            state["spoke"] = True
+            await asyncio.to_thread(t.sms.send, t.phone, text)
+            t.state["spoke"] = True
             return {"content": [{"type": "text", "text": "sent"}]}
         except Exception as e:
             return {"content": [{"type": "text", "text": f"error: {e}"}]}
@@ -656,37 +595,9 @@ async def run_agent(
         # user thought was cheap starts twenty minutes of work.
         kind = "book" if str(args.get("kind") or "").lower() == "book" else "edition"
 
-        # The app channel delivers the question as tappable cards and persists
-        # the magnets server-side, so it takes the whole payload. SMS can only
-        # send text, so it falls through to the numbered list below.
-        if on_ask is not None:
-            await on_ask(question, kind, options)
-            state["outcome"] = AgentOutcome(kind="asked", options=options)
-            return {"content": [{"type": "text", "text": "asked user; conversation ended"}]}
-
-        # Store as 'pending_results' so digit replies in app.py resolve them.
-        store_pending_results(phone, [
-            {
-                "title": o.get("title") or o.get("label", "Unknown"),
-                "author": o.get("author", ""),
-                "narrator": o.get("narrator", ""),
-                "magnet": o.get("magnet", ""),
-            }
-            for o in options
-        ])
-
-        lines = [question]
-        for i, o in enumerate(options[:4], 1):
-            label = o.get("label") or o.get("title", "Unknown")
-            extras = []
-            if o.get("narrator"):
-                extras.append(o["narrator"])
-            extra = f" ({', '.join(extras)})" if extras else ""
-            lines.append(f"{i}. {label}{extra}")
-        lines.append("\nReply with the number.")
-        await asyncio.to_thread(sms.send, phone, "\n".join(lines))
-
-        state["outcome"] = AgentOutcome(kind="asked", options=options)
+        # Shown as tappable cards; the magnets stay on the server.
+        await t.on_ask(question, kind, options)
+        t.state["outcome"] = AgentOutcome(kind="asked", options=options)
         return {"content": [{"type": "text", "text": "asked user; conversation ended"}]}
 
     @tool(
@@ -706,10 +617,10 @@ async def run_agent(
         if not text:
             return {"content": [{"type": "text", "text": "error: empty reply"}]}
         try:
-            await asyncio.to_thread(sms.send, phone, text)
+            await asyncio.to_thread(t.sms.send, t.phone, text)
         except Exception as e:  # noqa: BLE001
             return {"content": [{"type": "text", "text": f"error: {e}"}]}
-        state["outcome"] = AgentOutcome(kind="replied", message=text)
+        t.state["outcome"] = AgentOutcome(kind="replied", message=text)
         return {"content": [{"type": "text", "text": "replied; conversation ended"}]}
 
     @tool(
@@ -727,7 +638,7 @@ async def run_agent(
         if not query:
             return {"content": [{"type": "text", "text": json.dumps({"matches": []})}]}
         try:
-            matches = await _search_library(settings, query)
+            matches = await _search_library(t.settings, query)
         except Exception as e:  # noqa: BLE001
             # A library that can't be reached must not fail the turn — the
             # answer degrades to "I can't see your shelf right now", which is
@@ -760,7 +671,7 @@ async def run_agent(
             return {"content": [{"type": "text", "text": "error: primary.magnet required"}]}
 
         bg_title = f"{title} - {author}" if author else title
-        _narrate(sms, STAGE_FOUND, f"Starting “{title}”…")
+        _narrate(t.sms, STAGE_FOUND, f"Starting “{title}”…")
         try:
             download = await asyncio.to_thread(_execute_download_bg, bg_title, magnet, None)
         except Exception as e:
@@ -778,7 +689,7 @@ async def run_agent(
         ]
 
         display = f"“{title}”" + (f" by {author}" if author else "")
-        state["outcome"] = AgentOutcome(
+        t.state["outcome"] = AgentOutcome(
             kind="committed",
             download=download,
             fallbacks=clean_fallbacks,
@@ -790,134 +701,248 @@ async def run_agent(
         )
         return {"content": [{"type": "text", "text": json.dumps({"id": download.get("id"), "started": True})}]}
 
-    tools = [
+    return [
         search_audiobookbay,
         analyze_cover,
         probe_peers,
-        send_sms,
+        say,
+        ask_user_to_pick,
         reply,
         search_library,
         commit_download,
     ]
-    if allow_ask:
-        tools.insert(4, ask_user_to_pick)
 
-    server = create_sdk_mcp_server(name="atb", tools=tools)
 
-    user_prompt_parts: list[str] = []
+def _options() -> ClaudeAgentOptions:
+    return ClaudeAgentOptions(
+        model=AGENT_MODEL,
+        max_turns=AGENT_MAX_TURNS,
+        system_prompt=SYSTEM_PROMPT + APP_ASK_CLAUSE,
+        allowed_tools=[f"mcp__atb__{name}" for name in TOOL_NAMES],
+        # No built-in Claude Code tools (Bash, Read, …): the agent only uses its
+        # own, and their definitions were in every request.
+        tools=[],
+        # Load our tools up front. With tool search on, every turn started with
+        # a model round trip just to find them (1.5-3.5 s).
+        env={"ENABLE_TOOL_SEARCH": "false"},
+        # Without this the CLI's own error text is lost ("Check stderr output
+        # for details"), and an auth failure looks like any other.
+        stderr=lambda line: logger.warning("claude cli: %s", line.rstrip()),
+    )
+
+
+TOOL_NAMES = (
+    "search_audiobookbay",
+    "analyze_cover",
+    "probe_peers",
+    "say",
+    "ask_user_to_pick",
+    "reply",
+    "search_library",
+    "commit_download",
+)
+
+
+class AgentSession:
+    """One conversation with the agent, kept open between turns.
+
+    Starting the claude CLI costs 3-4 s, and a fresh process also forgets the
+    copies it looked at last turn, so a follow-up ("the same narrator") searched
+    again from a text summary. A session pays the start-up once and keeps that
+    context. It is not shared: one session per conversation, one turn at a time.
+    """
+
+    def __init__(self) -> None:
+        self.turns = 0
+        # Set when a turn fails. The CLI may be dead, so the owner drops it.
+        self.broken = False
+        self.last_used = time.monotonic()
+        # Kept across turns: a follow-up often re-checks the same copies.
+        self.search_cache: dict[tuple[str, int, str, str], str] = {}
+        self.peer_counts: dict[str, int] = {}
+        # One probe at a time: each opens a libtorrent session on one port.
+        self.probe_lock = asyncio.Lock()
+        self.probing: dict[str, asyncio.Task] = {}
+        self._new_turn("", "", None, None, None)
+        self._client: ClaudeSDKClient | None = None
+        self._server = create_sdk_mcp_server(name="atb", tools=_build_tools(self))
+
+    def _new_turn(self, raw_query, phone, settings, sms, on_ask) -> None:
+        self.raw_query = raw_query
+        self.phone = phone
+        self.settings = settings
+        self.sms = sms
+        self.on_ask = on_ask
+        self.state: dict = {"outcome": None, "spoke": False}
+        # The round number lets repeated searches say "Searching again".
+        self.search_attempts = 0
+
+    async def turn(
+        self,
+        raw_query: str,
+        phone: str,
+        settings: Settings,
+        sms,
+        *,
+        on_ask: Callable[[str, str, list[dict]], Awaitable[None]],
+        pending_options: list[dict] | None = None,
+        history: list[tuple[str, str]] | None = None,
+    ) -> AgentOutcome:
+        """Run one request. `history` is used only on the session's first turn:
+        after that the session remembers the conversation itself."""
+        self._new_turn(raw_query, phone, settings, sms, on_ask)
+        self.last_used = time.monotonic()
+        prompt = _prompt(raw_query, pending_options, history if self.turns == 0 else None)
+        self.turns += 1
+        try:
+            return await self._run(prompt)
+        finally:
+            self.last_used = time.monotonic()
+
+    async def _run(self, prompt: str) -> AgentOutcome:
+        state = self.state
+        # The SDK reports running out of turns as a result message, then raises
+        # the same bare "exit code 1" as a dead CLI. Remembered so the two get
+        # different sentences.
+        ran_out = False
+        # The text the agent wrote after its last tool call, if any.
+        final_text = ""
+        try:
+            if self._client is None:
+                options = _options()
+                options.mcp_servers = {"atb": self._server}
+                self._client = ClaudeSDKClient(options=options)
+                await self._client.connect()
+            await self._client.query(prompt)
+            async for msg in self._client.receive_response():
+                if isinstance(msg, ResultMessage):
+                    ran_out = msg.subtype == "error_max_turns"
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, ToolUseBlock):
+                            final_text = ""
+                        elif isinstance(block, TextBlock) and block.text.strip():
+                            final_text = block.text.strip()
+        except Exception:
+            self.broken = True
+            if state["outcome"] is not None:
+                # A tool had already settled the turn; the CLI dying afterwards
+                # changes nothing the user needs to hear about.
+                logger.warning("agent loop ended with an error after the outcome was set")
+                return state["outcome"]
+            if ran_out:
+                return _out_of_turns()
+            # Typically the claude CLI dying — an expired subscription token
+            # surfaces as a bare "Command failed with exit code 1".
+            logger.exception("agent loop crashed")
+            return AgentOutcome(
+                kind="error",
+                crashed=True,
+                message="Couldn't reach the book finder just now. Try again shortly.",
+            )
+
+        if state["outcome"] is not None:
+            return state["outcome"]
+        if ran_out:
+            # The session survives this, but its context is the long search
+            # that ran out, which is no help to the next turn.
+            self.broken = True
+            return _out_of_turns()
+
+        # The agent sometimes answers a question in plain text instead of
+        # calling `reply`. Observed live on "What is Piranesi about?": a good
+        # answer, which the user never saw — they got "Couldn't find that one".
+        if final_text and not state["spoke"]:
+            try:
+                await asyncio.to_thread(self.sms.send, self.phone, final_text)
+                return AgentOutcome(kind="replied", message=final_text)
+            except Exception:  # noqa: BLE001
+                logger.exception("sending the agent's final text failed")
+
+        # Reached when the agent stops without committing — overwhelmingly "no
+        # match found". The message is user-visible, so it reads as an
+        # explanation rather than as a description of our control flow.
+        return AgentOutcome(
+            kind="error",
+            message="Couldn't find that one — try the full title and author.",
+        )
+
+    async def close(self) -> None:
+        client, self._client = self._client, None
+        if client is None:
+            return
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            logger.warning("closing an agent session failed", exc_info=True)
+
+
+def _out_of_turns() -> AgentOutcome:
+    logger.warning("agent ran out of turns (%d)", AGENT_MAX_TURNS)
+    return AgentOutcome(
+        kind="error",
+        crashed=True,
+        message=(
+            "I searched for a while but couldn't pin down the right copy. "
+            "Try the exact title and author, or name the narrator."
+        ),
+    )
+
+
+def _prompt(
+    raw_query: str,
+    pending_options: list[dict] | None,
+    history: list[tuple[str, str]] | None,
+) -> str:
+    parts: list[str] = []
     if history:
         # Oldest first, so the last line before the new request is the most
         # recent thing that happened — which is what a follow-up refers to.
         rendered = "\n".join(f"{role}: {text}" for role, text in history)
-        user_prompt_parts.append(f"Earlier in this conversation:\n{rendered}\n")
-    user_prompt_parts.append(f"User said: {raw_query!r}")
+        parts.append(f"Earlier in this conversation:\n{rendered}\n")
+    parts.append(f"User said: {raw_query!r}")
     if pending_options:
         formatted = "\n".join(
             f"{i+1}. {o.get('title','?')} (narrator: {o.get('narrator','?')}, author: {o.get('author','?')})"
             for i, o in enumerate(pending_options)
         )
-        user_prompt_parts.append(f"\nPending options from earlier conversation (still valid):\n{formatted}")
-    user_prompt_parts.append(
-        "\nResolve this. Use tools as needed. Exit via commit_download or ask_user_to_pick."
+        parts.append(f"\nPending options from earlier conversation (still valid):\n{formatted}")
+    parts.append(
+        "\nResolve this. Use tools as needed. End via commit_download, ask_user_to_pick or reply."
     )
-    user_prompt = "\n".join(user_prompt_parts)
+    return "\n".join(parts)
 
-    allowed_tools = [
-        "mcp__atb__search_audiobookbay",
-        "mcp__atb__analyze_cover",
-        "mcp__atb__probe_peers",
-        "mcp__atb__send_sms",
-        "mcp__atb__reply",
-        "mcp__atb__search_library",
-        "mcp__atb__commit_download",
-    ]
-    if allow_ask:
-        allowed_tools.append("mcp__atb__ask_user_to_pick")
 
-    # The SDK reports running out of turns as a result message, then raises the
-    # same bare "exit code 1" as a dead CLI. Remembered so the two get different
-    # sentences: one is a search that needs a narrower request, the other is ours.
-    ran_out = False
-    # The text the agent wrote after its last tool call, if any.
-    final_text = ""
+async def run_agent(
+    raw_query: str,
+    phone: str,
+    settings: Settings,
+    sms,
+    pending_options: list[dict] | None = None,
+    on_ask: Callable[[str, str, list[dict]], Awaitable[None]] | None = None,
+    history: list[tuple[str, str]] | None = None,
+    session: AgentSession | None = None,
+) -> AgentOutcome:
+    """Run one request, in `session` if given, else in a session of its own."""
+    own = session is None
+    session = session or AgentSession()
     try:
-        async for msg in query(
-            prompt=user_prompt,
-            options=ClaudeAgentOptions(
-                model=AGENT_MODEL,
-                max_turns=AGENT_MAX_TURNS,
-                system_prompt=_system_prompt(allow_ask, on_ask is not None),
-                mcp_servers={"atb": server},
-                allowed_tools=allowed_tools,
-                # No built-in Claude Code tools (Bash, Read, …): the agent only
-                # uses its own, and their definitions were in every request.
-                tools=[],
-                # Load our tools up front. With tool search on, every turn
-                # started with a model round trip just to find them (1.5-3.5 s).
-                env={"ENABLE_TOOL_SEARCH": "false"},
-                # Without this the CLI's own error text is lost ("Check stderr
-                # output for details"), and an auth failure looks like any other.
-                stderr=lambda line: logger.warning("claude cli: %s", line.rstrip()),
-            ),
-        ):
-            if isinstance(msg, ResultMessage) and msg.subtype == "error_max_turns":
-                ran_out = True
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, ToolUseBlock):
-                        final_text = ""
-                    elif isinstance(block, TextBlock) and block.text.strip():
-                        final_text = block.text.strip()
-            if state["outcome"] is not None:
-                # Tool already terminated the agent's job.
-                continue
-    except Exception:
-        if state["outcome"] is not None:
-            # A tool had already settled the turn; the CLI dying afterwards
-            # changes nothing the user needs to hear about.
-            logger.warning("agent loop ended with an error after the outcome was set")
-            return state["outcome"]
-        if ran_out:
-            logger.warning("agent ran out of turns (%d)", AGENT_MAX_TURNS)
-            return AgentOutcome(
-                kind="error",
-                crashed=True,
-                message=(
-                    "I searched for a while but couldn't pin down the right copy. "
-                    "Try the exact title and author, or name the narrator."
-                ),
-            )
-        # Typically the claude CLI subprocess dying — an expired subscription
-        # token surfaces here as a bare "Command failed with exit code 1".
-        # The traceback goes to the log for us; the card gets a sentence that
-        # tells the user what to do, since there is nothing they can fix.
-        logger.exception("agent loop crashed")
-        return AgentOutcome(
-            kind="error",
-            crashed=True,
-            message="Couldn't reach the book finder just now. Try again shortly.",
+        return await session.turn(
+            raw_query,
+            phone,
+            settings,
+            sms,
+            on_ask=on_ask or _cannot_ask,
+            pending_options=pending_options,
+            history=history,
         )
-
-    if state["outcome"] is not None:
-        return state["outcome"]
-
-    # The agent sometimes answers a question in plain text instead of calling
-    # `reply`. Observed live on "What is Piranesi about?": a good answer, which
-    # the user never saw — they got "Couldn't find that one" in its place.
-    if final_text and not state["spoke"]:
-        try:
-            await asyncio.to_thread(sms.send, phone, final_text)
-            return AgentOutcome(kind="replied", message=final_text)
-        except Exception:  # noqa: BLE001
-            logger.exception("sending the agent's final text failed")
-
-    # Reached when the agent stops without committing — overwhelmingly "no
-    # match found". The message is user-visible on the card, so it reads as an
-    # explanation rather than as a description of our control flow.
-    return AgentOutcome(
-        kind="error",
-        message="Couldn't find that one — try the full title and author.",
-    )
+    finally:
+        if own:
+            await session.close()
 
 
-__all__ = ["run_agent", "AgentOutcome"]
+async def _cannot_ask(*_a) -> None:
+    raise RuntimeError("this caller cannot ask the user anything")
+
+
+__all__ = ["run_agent", "AgentOutcome", "AgentSession"]

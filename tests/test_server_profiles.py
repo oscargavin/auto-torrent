@@ -13,13 +13,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-# Settings() runs at import time — patch env (incl. the profiles secret) and the
-# Twilio client/validator before the app module loads.
+# Settings() runs at import time — patch env (incl. the profiles secret) before
+# the app module loads.
 _env = {
-    "TWILIO_ACCOUNT_SID": "test",
-    "TWILIO_AUTH_TOKEN": "test",
-    "TWILIO_PHONE_NUMBER": "+10000000000",
-    "ALLOWED_NUMBERS": '["+1234"]',
     "ABS_API_TOKEN": "test",
     "ABS_LIBRARY_ID": "test",
     "ATB_CWD": "/tmp",
@@ -27,11 +23,7 @@ _env = {
     "PROFILES_APP_SECRET": "profiles-secret",
 }
 
-with (
-    patch.dict(os.environ, _env),
-    patch("auto_torrent.server.sms.Client"),
-    patch("auto_torrent.server.sms.RequestValidator"),
-):
+with patch.dict(os.environ, _env):
     from auto_torrent.server import app as app_module
     from auto_torrent.server.profiles import ProfileStore
 

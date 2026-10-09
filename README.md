@@ -1,6 +1,6 @@
 # auto-torrent
 
-CLI and SMS server for finding and downloading audiobooks and streaming video via BitTorrent. Uses LLMs to parse freeform queries, disambiguate results, and handle conversational requests over SMS.
+CLI and chat server for finding and downloading audiobooks and streaming video via BitTorrent. Uses LLMs to parse freeform queries, disambiguate results, and handle conversational requests from the Bookkeeper app.
 
 ## Install
 
@@ -73,25 +73,27 @@ atb status              # list all downloads
 atb status a1b2c3d4     # check a specific download
 ```
 
-## SMS Server
+## Chat server
 
-A FastAPI server that turns SMS messages into audiobook downloads. Text a book title (even misspelled) and it searches, downloads, organizes the files into Audiobookshelf, and texts back when ready.
+A FastAPI server that turns chat messages from the Bookkeeper app into audiobook downloads. Send a book title (even misspelled) and it searches, downloads, organises the files into Audiobookshelf, and reports progress on the chat card.
 
 ### How it works
 
-1. **Twilio webhook** receives SMS, returns instant TwiML acknowledgment
-2. **Opus classifies** the message in a background worker (search / suggest / reply)
-3. **Search pipeline** runs `atb search --auto --bg` to find and download
-4. **File organizer** moves files into `Author/Title/` structure for ABS
+1. **`POST /chat/threads/{id}/messages`** stores the message and queues a turn on the arq worker
+2. **The agent** reads the conversation, searches, and either asks a question or commits to a book
+3. **The download poll** watches the torrent and falls back to another copy on a stall
+4. **File organiser** moves files into `Author/Title/` structure for ABS
 5. **ABS library scan** triggers so the book appears in the app
-6. **SMS notification** tells the user it's ready
+6. **Server-sent events** on `/chat/threads/{id}/events` and `/chat/jobs/{id}/events` report each step
+
+`GET /chat/jobs*` reads and lists the download jobs, and `DELETE /chat/jobs/{id}` cancels one.
 
 ### Conversation features
 
 - Corrects misspellings: "hairy potter" -> searches "Harry Potter and the Philosopher's Stone"
 - Resolves vague descriptions: "man stuck on mars" -> "The Martian"
-- Suggests similar books: "something like Project Hail Mary" -> 3 numbered options
-- Handles follow-ups: reply "2" to pick the second suggestion
+- Suggests similar books: "something like Project Hail Mary" -> options to choose from
+- Handles follow-ups in the same thread
 
 ### Server setup
 
@@ -106,7 +108,7 @@ cp .env.example .env
 uv run atb-server
 ```
 
-Requires: Twilio account, Audiobookshelf instance, Claude CLI (`claude` in PATH).
+Requires: Redis, Audiobookshelf instance, Claude CLI (`claude` in PATH). Run the worker with `uv run arq auto_torrent.server.jobs.worker.WorkerSettings`.
 
 ## How it works
 

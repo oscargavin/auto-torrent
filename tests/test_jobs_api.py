@@ -5,6 +5,7 @@ from httpx import ASGITransport, AsyncClient
 from auto_torrent.server.jobs.api import build_router
 from auto_torrent.server.jobs.store import JobStore
 from auto_torrent.server.jobs.events import EventLog
+from auto_torrent.server.jobs.types import CreateJobRequest
 
 
 @pytest.fixture
@@ -19,14 +20,9 @@ def app(redis, monkeypatch):
 
     log = EventLog(redis)
     store = JobStore(redis, log, state_ttl_s=3600, dedup_ttl_s=600)
-    enqueued: list[str] = []
-
-    async def fake_enqueue(job_id: str) -> None:
-        enqueued.append(job_id)
 
     app = FastAPI()
-    app.include_router(build_router(store=store, log=log, enqueue=fake_enqueue))
-    app.state.enqueued = enqueued
+    app.include_router(build_router(store=store, log=log))
     app.state.store = store  # tests reach in to mutate Redis-backed state
     return app
 
@@ -37,31 +33,19 @@ async def client(app):
         yield c
 
 
-async def test_post_creates_job_and_enqueues(app, client):
+async def _create(app, query: str = "dune", profile_id: str = "p1") -> str:
+    """Seed a job the way the thread worker does. The API no longer creates them."""
+    job, _ = await app.state.store.create(CreateJobRequest(profile_id=profile_id, query=query))
+    return job.id
+
+
+async def test_post_is_gone(client):
     r = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
-    assert r.status_code == 201
-    body = r.json()
-    assert body["status"] == "pending"
-    assert app.state.enqueued == [body["id"]]
+    assert r.status_code == 405
 
 
-async def test_post_is_idempotent(app, client):
-    a = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
-    b = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "DUNE  "})
-    assert a.json()["id"] == b.json()["id"]
-    # Second request returns 200 (not 201) and does NOT re-enqueue.
-    assert b.status_code == 200
-    assert app.state.enqueued == [a.json()["id"]]
-
-
-async def test_post_rejects_empty_query(client):
-    r = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "   "})
-    assert r.status_code == 422
-
-
-async def test_get_job_returns_state(client):
-    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
-    job_id = create.json()["id"]
+async def test_get_job_returns_state(app, client):
+    job_id = await _create(app)
 
     r = await client.get(f"/chat/jobs/{job_id}")
     assert r.status_code == 200
@@ -73,10 +57,10 @@ async def test_get_job_404_for_missing(client):
     assert r.status_code == 404
 
 
-async def test_list_filters_by_profile(client):
-    await client.post("/chat/jobs", json={"profile_id": "p1", "query": "a"})
-    await client.post("/chat/jobs", json={"profile_id": "p1", "query": "b"})
-    await client.post("/chat/jobs", json={"profile_id": "p2", "query": "c"})
+async def test_list_filters_by_profile(app, client):
+    await _create(app, "a", "p1")
+    await _create(app, "b", "p1")
+    await _create(app, "c", "p2")
 
     r = await client.get("/chat/jobs?profile_id=p1")
     assert r.status_code == 200
@@ -89,8 +73,7 @@ async def test_sse_streams_events_then_keepalive(app, client, redis):
     from auto_torrent.server.jobs.events import EventLog
 
     log = EventLog(redis)
-    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
-    job_id = create.json()["id"]
+    job_id = await _create(app)
 
     await log.publish(job_id, "progress", {"text": "hello"})
     await log.publish(job_id, "completed", {"title": "Dune"})
@@ -128,8 +111,7 @@ async def test_delete_kills_subprocess_and_cleans(app, client, monkeypatch, tmp_
 
     # Seed the job + register a download_id (simulates the worker's
     # post-commit registration step).
-    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
-    job_id = create.json()["id"]
+    job_id = await _create(app)
     await app.state.store.set_download_id(job_id, "abc12345")
 
     r = await client.delete(f"/chat/jobs/{job_id}")
@@ -155,17 +137,15 @@ async def test_delete_without_download_id_does_not_call_killer(app, client, monk
 
     monkeypatch.setattr(api_mod, "_kill_subprocess_and_clean", _record)
 
-    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
-    job_id = create.json()["id"]
+    job_id = await _create(app)
 
     r = await client.delete(f"/chat/jobs/{job_id}")
     assert r.status_code == 200
     assert calls == []  # download_id is None — kill helper never invoked
 
 
-async def test_delete_marks_cancelled(client):
-    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
-    job_id = create.json()["id"]
+async def test_delete_marks_cancelled(app, client):
+    job_id = await _create(app)
 
     r = await client.delete(f"/chat/jobs/{job_id}")
     assert r.status_code == 200
@@ -177,13 +157,12 @@ async def test_delete_marks_cancelled(client):
 # --- U1: cancel publishes exactly one frame --------------------------------
 
 
-async def test_delete_publishes_exactly_one_cancelled_event(client, redis):
+async def test_delete_publishes_exactly_one_cancelled_event(app, client, redis):
     """The handler used to publish `cancelled` itself right after
     update_status. Now the store publishes on the transition — a second frame
     from the handler would be dropped by the stream terminator anyway, but the
     duplicate is the bug."""
-    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
-    job_id = create.json()["id"]
+    job_id = await _create(app)
 
     await client.delete(f"/chat/jobs/{job_id}")
 
@@ -191,9 +170,8 @@ async def test_delete_publishes_exactly_one_cancelled_event(client, redis):
     assert [f["type"] for _id, f in entries] == ["cancelled"]
 
 
-async def test_second_delete_publishes_no_further_event(client, redis):
-    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
-    job_id = create.json()["id"]
+async def test_second_delete_publishes_no_further_event(app, client, redis):
+    job_id = await _create(app)
 
     await client.delete(f"/chat/jobs/{job_id}")
     r2 = await client.delete(f"/chat/jobs/{job_id}")
@@ -206,8 +184,7 @@ async def test_second_delete_publishes_no_further_event(client, redis):
 async def test_stream_terminates_on_the_store_published_event(app, client, redis):
     """End-to-end on the contract U1 exists for: a failed job's terminal frame
     reaches a subscriber and closes the stream."""
-    create = await client.post("/chat/jobs", json={"profile_id": "p1", "query": "dune"})
-    job_id = create.json()["id"]
+    job_id = await _create(app)
 
     from auto_torrent.server.jobs.types import JobStatus
 

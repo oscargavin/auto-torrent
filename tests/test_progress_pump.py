@@ -1,11 +1,11 @@
-"""The chat/jobs progress pump: what the card hears while bytes move."""
+"""The jobs progress pump: what the card hears while bytes move."""
 
 import asyncio
 from unittest.mock import patch
 
 import pytest
 
-from auto_torrent.server import app as app_module
+from auto_torrent.server.jobs import progress as progress_module
 
 
 class _Bus:
@@ -31,12 +31,12 @@ async def _run_pump(states, *, current=None, ticks=6, heartbeat=3600.0, idle=360
 
     stop = asyncio.Event()
     with (
-        patch.object(app_module, "_refresh_state", refresh),
-        patch.object(app_module, "CHAT_PROGRESS_INTERVAL_S", 0.01),
-        patch.object(app_module, "CHAT_PROGRESS_HEARTBEAT_S", heartbeat),
-        patch.object(app_module, "CHAT_IDLE_NOTICE_S", idle),
+        patch.object(progress_module, "_refresh_state", refresh),
+        patch.object(progress_module, "CHAT_PROGRESS_INTERVAL_S", 0.01),
+        patch.object(progress_module, "CHAT_PROGRESS_HEARTBEAT_S", heartbeat),
+        patch.object(progress_module, "CHAT_IDLE_NOTICE_S", idle),
     ):
-        task = asyncio.create_task(app_module._chat_progress_pump(current, bus, stop))
+        task = asyncio.create_task(progress_module._chat_progress_pump(current, bus, stop))
         for _ in range(ticks):
             await asyncio.sleep(0.012)
             yield_point = current.get("_on_tick")
@@ -126,10 +126,10 @@ async def test_committed_carries_the_edition():
         return None
 
     with (
-        patch.object(app_module, "poll_and_finalise", fake_poll),
-        patch.object(app_module, "_refresh_state", lambda _id: None),
+        patch.object(progress_module, "poll_and_finalise", fake_poll),
+        patch.object(progress_module, "_refresh_state", lambda _id: None),
     ):
-        await app_module._emit_download_and_poll(
+        await progress_module._emit_download_and_poll(
             bus, download={"id": "dl1"}, fallbacks=[], display="“Dune”",
             title="Dune", author="Frank Herbert", session="s",
             narrator="Scott Brick", file_format="M4B",
@@ -152,10 +152,10 @@ async def test_a_swap_is_still_reported_to_the_caller():
         await kw["on_download_change"]("dl2")
 
     with (
-        patch.object(app_module, "poll_and_finalise", fake_poll),
-        patch.object(app_module, "_refresh_state", lambda _id: None),
+        patch.object(progress_module, "poll_and_finalise", fake_poll),
+        patch.object(progress_module, "_refresh_state", lambda _id: None),
     ):
-        await app_module._emit_download_and_poll(
+        await progress_module._emit_download_and_poll(
             _Bus(), download={"id": "dl1"}, fallbacks=[], display="“Dune”",
             title="Dune", author="Frank Herbert", session="s",
             on_download_change=track,
@@ -174,3 +174,28 @@ async def test_no_heartbeat_once_the_bytes_are_down():
     hundred = [d for _t, d in frames if d.get("percent") == 100]
     assert len(hundred) == 1
     assert hundred[0]["text"] == "Downloading… 100%"
+
+
+@pytest.mark.anyio
+async def test_never_publishes_a_terminal_frame():
+    """JobStore.update_status is the only producer of terminal events. A second
+    `completed` or `error` from here would race it."""
+    bus = _Bus()
+
+    async def fake_poll(**_kw):
+        raise RuntimeError("boom")
+
+    for poll in (fake_poll, lambda **_kw: _done()):
+        with (
+            patch.object(progress_module, "poll_and_finalise", poll),
+            patch.object(progress_module, "_refresh_state", lambda _id: None),
+        ):
+            await progress_module._emit_download_and_poll(
+                bus, download={"id": "dl1"}, fallbacks=[], display="“Dune”",
+                title="Dune", author="Frank Herbert", session="s",
+            )
+    assert not [t for t, _d in bus.frames if t in ("completed", "error")]
+
+
+async def _done() -> None:
+    return None
