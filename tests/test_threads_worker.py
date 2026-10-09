@@ -7,6 +7,7 @@ status in it, and the reaper eventually fails a job that never started.
 """
 
 import asyncio
+import json
 
 import pytest
 
@@ -94,7 +95,7 @@ async def test_no_results_says_something_and_creates_no_job(ctx, monkeypatch):
     assert await ctx["store"].list_for_profile("p1") == []
 
 
-async def test_commit_creates_a_job_and_links_it_into_the_thread(ctx, monkeypatch):
+async def test_commit_creates_a_job_and_links_it_into_the_thread(ctx, redis, monkeypatch):
     finished: dict = {}
 
     async def fake_finish(*, store, bus, job, outcome):
@@ -120,6 +121,12 @@ async def test_commit_creates_a_job_and_links_it_into_the_thread(ctx, monkeypatc
     # The sink switched from thread-activity to the job's own stream, which is
     # what keeps the existing progress rail working unchanged.
     assert finished["bound"] == job_id == finished["job_id"]
+    # The card mounts on the job message and replays the job stream. Its first
+    # frame must say the search is over, before the cover and library lookups.
+    entries = await redis.xrange(f"job:{job_id}:events")
+    first = json.loads(entries[0][1]["data"])
+    assert entries[0][1]["type"] == "progress"
+    assert first["stage"] == "found"
 
 
 async def test_history_excludes_the_message_being_answered(ctx, monkeypatch):

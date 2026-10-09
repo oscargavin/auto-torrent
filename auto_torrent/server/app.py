@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Awaitable, Callable
 
@@ -366,39 +367,108 @@ def _require_bearer(authorization: str = Header("", alias="Authorization")) -> N
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
+# A frame at least this often while a download is live, even when the
+# whole-number percentage has not moved. On a slow swarm one percent can take
+# minutes, and a card that hears nothing for that long cannot tell a slow
+# download from a dead one — nor can its ETA, which is refreshed only by a frame.
+CHAT_PROGRESS_HEARTBEAT_S: float = 30.0
+# How long the rate may sit at zero before the card says so. Well under the
+# poll layer's STALL_GRACE_S (3 min): that is when the server gives up on a
+# copy, not when the user should first hear that nothing is arriving.
+CHAT_IDLE_NOTICE_S: float = 30.0
+
+
 async def _chat_progress_pump(
-    download_id: str, bus: "ChatEventBus", stop: asyncio.Event
+    current: dict, bus: "ChatEventBus", stop: asyncio.Event
 ) -> None:
-    """Emit a progress event whenever the download's percentage changes.
+    """Emit a progress event whenever what the card should say changes.
 
     Why: poll_and_finalise blocks for the entire download (minutes to hours)
     without sending SMS — fine for SMS UX, dead silent for chat UX. The pump
     fills the gap so the bubble shows motion.
+
+    `current` is a live `{"id", "copy"}` holder rather than a fixed id: a stall
+    swaps to a fallback copy under a new download id, and the old state file is
+    unlinked. A pump bound to the first id read nothing for the rest of the job,
+    so a fallback that downloaded to 100% did so with no progress on the card.
     """
-    last_pct = -1
+    last_key: tuple | None = None
+    last_emit = 0.0
+    last_id: str | None = None
+    zero_since: float | None = None
     while True:
         try:
             await asyncio.wait_for(stop.wait(), timeout=CHAT_PROGRESS_INTERVAL_S)
             return
         except asyncio.TimeoutError:
             pass
+        download_id = current["id"]
+        copy = current["copy"]
+        if download_id != last_id:
+            # A new copy starts from zero; nothing about the old one carries.
+            last_id, last_key, zero_since = download_id, None, None
         state = _refresh_state(download_id)
         if not state:
             continue
-        pct = int(float(state.get("progress") or 0) * 100)
-        # Emit on change only — a multi-hour download produces tens of events,
-        # not hundreds, keeping clear of the Redis stream MAXLEN trim. `text`
-        # is retained for back-compat (old consumers + the SSE test's %-check).
-        if pct != last_pct:
-            bus.emit(EVENT_PROGRESS, {
-                "percent": pct,
-                "speed_bytes_per_s": state.get("speed_bytes_per_s"),
+        progress = float(state.get("progress") or 0)
+        pct = int(progress * 100)
+        speed = int(state.get("speed_bytes_per_s") or 0)
+        eta = state.get("eta_s")
+        now = time.monotonic()
+
+        if pct >= 100 and last_key is not None and last_key[1] >= 100:
+            # The bytes are down and the card has been told. From here the
+            # import owns the card; a heartbeat re-sending "downloading 100%"
+            # would pull it back from "Adding to your library" a step.
+            continue
+
+        if pct == 0 and speed <= 0 and eta is None:
+            # Still fetching torrent metadata, or no peer has sent a byte yet.
+            # A determinate bar pinned at 0% reads as frozen for up to two
+            # minutes here, so this stays on the "found" step with honest words.
+            # A fallback copy is covered by the `retrying` frame that started it.
+            if copy > 1:
+                continue
+            frame = {
+                "stage": STAGE_FOUND,
+                "percent": 0,
                 "peers": state.get("peers"),
-                "eta_s": state.get("eta_s"),
+                "text": "Connecting to people sharing it…",
+            }
+        else:
+            # A finished download has a zero rate too; that is not waiting.
+            zero_since = (zero_since or now) if speed <= 0 and pct < 100 else None
+            waiting = zero_since is not None and now - zero_since >= CHAT_IDLE_NOTICE_S
+            if waiting:
+                text = f"Waiting for data… {pct}%"
+            elif copy > 1:
+                text = f"Downloading another copy… {pct}%"
+            else:
+                text = f"Downloading… {pct}%"
+            frame = {
+                "percent": pct,
+                # Exact progress, for a slow swarm: there one whole percent
+                # takes minutes, and the heartbeat's fresh fraction is the only
+                # thing that visibly moves.
+                "fraction": round(progress, 4),
+                "speed_bytes_per_s": speed,
+                "peers": state.get("peers"),
+                # No ETA while nothing arrives: the last one assumed a rate
+                # that has gone, and the client extrapolates the bar from it.
+                "eta_s": None if waiting else eta,
                 "stage": STAGE_DOWNLOADING,
-                "text": f"Downloading… {pct}%",
-            })
-            last_pct = pct
+                "text": text,
+            }
+            if copy > 1:
+                frame["copy"] = copy
+
+        key = (frame["stage"], pct, frame["text"])
+        # `text` is retained for back-compat (old consumers + the SSE test's
+        # %-check). Change-or-heartbeat keeps a multi-hour download to a few
+        # hundred events, clear of the Redis stream MAXLEN trim.
+        if key != last_key or now - last_emit >= CHAT_PROGRESS_HEARTBEAT_S:
+            bus.emit(EVENT_PROGRESS, frame)
+            last_key, last_emit = key, now
 
 
 async def _emit_download_and_poll(
@@ -414,6 +484,8 @@ async def _emit_download_and_poll(
     query: str | None = None,
     emit_terminal: bool = True,
     deadline: float | None = None,
+    narrator: str = "",
+    file_format: str = "",
 ) -> DownloadResult:
     """Emit `committed`, run the poll with a progress pump, then `completed`.
 
@@ -436,9 +508,14 @@ async def _emit_download_and_poll(
     poll_and_finalise to the caller — the jobs worker uses it to keep
     store.set_download_id current so cancel kills the right subprocess."""
     download_id = download.get("id", "")
+    # The edition rides on `committed` so the card shows which copy this is the
+    # moment it is chosen, not on the next 30s snapshot poll.
     bus.emit(
         "committed",
-        {"id": download_id, "title": title, "author": author, "display": display},
+        {
+            "id": download_id, "title": title, "author": author, "display": display,
+            "narrator": narrator, "format": file_format,
+        },
     )
     # `committed` carries the book; this carries the lifecycle position, so the
     # card can move off "searching" before the first byte-progress frame lands
@@ -446,7 +523,15 @@ async def _emit_download_and_poll(
     bus.emit(EVENT_PROGRESS, {"stage": STAGE_FOUND, "percent": 0,
                               "text": "Found it — starting the download…"})
     stop = asyncio.Event()
-    pump = asyncio.create_task(_chat_progress_pump(download_id, bus, stop))
+    current = {"id": download_id, "copy": 1}
+
+    async def _on_download_change(new_id: str) -> None:
+        current["id"] = new_id
+        current["copy"] += 1
+        if on_download_change is not None:
+            await on_download_change(new_id)
+
+    pump = asyncio.create_task(_chat_progress_pump(current, bus, stop))
     try:
         await poll_and_finalise(
             download=download,
@@ -457,7 +542,7 @@ async def _emit_download_and_poll(
             phone=session,
             settings=settings,
             sms=bus,
-            on_download_change=on_download_change,
+            on_download_change=_on_download_change,
             query=query,
             deadline=deadline,
         )

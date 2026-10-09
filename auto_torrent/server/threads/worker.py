@@ -18,6 +18,7 @@ from urllib.parse import quote_plus
 
 from ..agent import run_agent
 from ..covers import find_card, find_cover_url
+from ..event_types import EVENT_PROGRESS, STAGE_FOUND
 from ..jobs.finish import finish_agent_outcome
 from ..jobs.store import JobStore
 from ..settings import Settings
@@ -202,6 +203,15 @@ async def run_thread_turn(
             await sink.drain()
             await sink.flush_steps()
             job = await jobs.create_direct(thread.profile_id, outcome.title or text)
+            # Bound now, not after the cover lookup: the card mounts on the job
+            # message below and replays this stream, and its first frame has to
+            # say the search is over. With no frame it read "Downloading…" over
+            # a checklist still on "Searching" for the length of the lookups.
+            sink.bind_job(job.id)
+            await sink.emit_async(
+                EVENT_PROGRESS,
+                {"stage": STAGE_FOUND, "text": "Found it — getting it ready…"},
+            )
             # The cover is already known in the common case — the user tapped a
             # row that had one — so the download card shows the same book they
             # chose rather than a generic glyph. Falling back to a lookup keeps
@@ -215,10 +225,8 @@ async def run_thread_turn(
                 thread_id,
                 Message.new(thread_id, MessageKind.job, job_id=job.id),
             )
-            # From here the download is a job like any other, and its progress
-            # belongs on the job's own stream where the card is already
-            # listening.
-            sink.bind_job(job.id)
+            # From here the download is a job like any other: its progress
+            # belongs on the job's own stream, where the card is listening.
             await threads.set_status(thread_id, ThreadStatus.idle)
             await finish_agent_outcome(store=jobs, bus=sink, job=job, outcome=outcome)
             return

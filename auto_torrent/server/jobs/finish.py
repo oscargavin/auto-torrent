@@ -111,8 +111,10 @@ async def finish_agent_outcome(
             outcome.title,
         )
         # The agent has already spawned the download; stop it and clean the
-        # partial, exactly as a user cancel would.
-        _kill_if_running(download_id)
+        # partial, exactly as a user cancel would. Awaited: without it the
+        # coroutine never ran, and a second copy downloaded in the background
+        # behind a card that said "Already in your library".
+        await _kill_if_running(download_id)
         await store.update_status(
             job.id,
             JobStatus.succeeded,
@@ -164,6 +166,8 @@ async def finish_agent_outcome(
         # swaps all draw from it, so arq's timeout stays a backstop instead of
         # the thing that actually ends the job.
         deadline=time.monotonic() + JOB_BUDGET_S,
+        narrator=outcome.narrator or "",
+        file_format=outcome.file_format or "",
     )
 
     # If cancel fired during the poll, update_status here is a no-op against the

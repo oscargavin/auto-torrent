@@ -300,3 +300,53 @@ async def test_finished_download_still_reports_success(redis, store, log, monkey
 
     assert (await store.get(job.id)).status == JobStatus.succeeded
     assert len([e for e in await _events(redis, job.id) if e[0] == "completed"]) == 1
+
+
+async def test_already_in_library_stops_the_spawned_download(redis, store, log, monkeypatch):
+    """The agent spawns the download before the library check. When the book is
+    already on the shelf, that download must actually be killed — the call was
+    once left un-awaited, so the coroutine never ran and a second copy
+    downloaded behind a card that said "Already in your library"."""
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    monkeypatch.setattr(
+        "auto_torrent.server.jobs.worker.run_agent",
+        AsyncMock(return_value=_outcome(
+            kind="committed", download={"id": "dl1"}, display="“Dune”",
+            title="Dune", author="Frank Herbert", message=None,
+        )),
+    )
+    monkeypatch.setattr(
+        "auto_torrent.server.jobs.finish.already_in_library", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(
+        "auto_torrent.server.jobs.finish._read_state", lambda _id: {"id": _id, "pid": 1}
+    )
+    kill = AsyncMock()
+    monkeypatch.setattr("auto_torrent.server.jobs.finish._kill_download_and_clean", kill)
+
+    await run_chat_job({"redis": redis, "store": store, "log": log}, job.id)
+
+    kill.assert_awaited_once_with({"id": "dl1", "pid": 1})
+    completed = [e for e in await _events(redis, job.id) if e[0] == "completed"]
+    assert completed[0][1]["already_had"] is True
+
+
+async def test_the_chosen_edition_reaches_the_download_pump(redis, store, log, monkeypatch):
+    """Narrator and format travel on `committed`, so the card shows which copy
+    this is at once rather than on the next snapshot poll."""
+    job, _ = await store.create(CreateJobRequest(profile_id="p1", query="dune"))
+    monkeypatch.setattr(
+        "auto_torrent.server.jobs.worker.run_agent",
+        AsyncMock(return_value=_outcome(
+            kind="committed", download={"id": "dl1"}, display="“Dune”",
+            title="Dune", author="Frank Herbert", message=None,
+            narrator="Scott Brick", file_format="M4B",
+        )),
+    )
+    emit = AsyncMock()
+    monkeypatch.setattr("auto_torrent.server.jobs.finish._emit_download_and_poll", emit)
+
+    await run_chat_job({"redis": redis, "store": store, "log": log}, job.id)
+
+    assert emit.await_args.kwargs["narrator"] == "Scott Brick"
+    assert emit.await_args.kwargs["file_format"] == "M4B"

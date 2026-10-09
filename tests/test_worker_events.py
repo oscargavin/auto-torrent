@@ -87,7 +87,7 @@ class _FakeABS:
 
 
 @pytest.mark.anyio
-async def test_importing_emitted_once_before_success(tmp_path, monkeypatch):
+async def test_importing_names_each_step_once_before_success(tmp_path, monkeypatch):
     monkeypatch.setattr(worker_module, "ABSClient", _FakeABS)
 
     async def fake_watch(_id, **_kw):
@@ -111,7 +111,16 @@ async def test_importing_emitted_once_before_success(tmp_path, monkeypatch):
     )
 
     importing = [d for ev, d in sink.emitted if ev == EVENT_PROGRESS and d.get("stage") == STAGE_IMPORTING]
-    assert len(importing) == 1, f"expected exactly one importing event, got {sink.emitted}"
+    # One frame per import step, in order, and never the same step twice: a
+    # repeated line reads as a stuck card.
+    assert [d["text"] for d in importing] == [
+        "Adding to your library…",
+        "Finding the cover…",
+        "Scanning your library…",
+        "Naming the chapters…",
+    ], f"unexpected importing frames: {sink.emitted}"
+    # The bar stays full through every step: the bytes are all down.
+    assert all(d["percent"] == 100 for d in importing)
     # The success line still goes out as a plain string on the send channel.
     assert any("library" in s for s in sink.sent)
     # No structured dict ever reached the send channel.

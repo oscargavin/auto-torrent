@@ -463,11 +463,17 @@ async def poll_and_finalise(
     # up blank and changing under the user a moment later. Plenty of releases
     # ship no cover, and ABS only derives one from what the download contained.
     # Never fatal: a missing cover is cosmetic, a failed import is not.
+    # Import is up to a minute of separate steps behind one full bar. Naming
+    # each one is what tells the user it is still moving.
+    _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
+                                      "text": "Finding the cover…"})
     try:
         await asyncio.to_thread(ensure_local_cover, dest, title, author)
     except Exception:  # noqa: BLE001
         logger.exception("cover fetch failed for %s", display)
 
+    _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
+                                      "text": "Scanning your library…"})
     try:
         await abs_client.scan_library(settings.abs_library_id)
     except Exception as e:
@@ -484,6 +490,8 @@ async def poll_and_finalise(
     # scan, because the item has to exist before it can be given chapters, and
     # strictly non-fatal: the book is already in the library and a scrub bar
     # labelled 001–094 is a disappointment, not a failure.
+    _emit_event(sms, EVENT_PROGRESS, {"stage": STAGE_IMPORTING, "percent": 100,
+                                      "text": "Naming the chapters…"})
     await _name_chapters(abs_client, title, author, display)
 
     sms.send(phone, f"✓ {display} is in your library.")
