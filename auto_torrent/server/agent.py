@@ -47,7 +47,11 @@ from .vision import analyze_cover as _analyze_cover
 
 logger = logging.getLogger("atb.agent")
 
-AGENT_MODEL = "claude-haiku-5-5"
+# Sonnet over Haiku, chosen 9 October 2026 on 15 real requests run twice each:
+# about as fast (median 15.3 s vs 17.7 s) and steadier, asking before an
+# ambiguous edition rather than picking one. Recaps, recommendations and cover
+# reading stay on Haiku.
+AGENT_MODEL = "claude-sonnet-5-5"
 # Raised from 12 with the interpretation step: a vague request ("something
 # funny for a long drive") legitimately costs a couple of extra searches before
 # it converges, and running out of turns mid-search reads to the user as "not
