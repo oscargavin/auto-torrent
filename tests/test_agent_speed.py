@@ -137,3 +137,46 @@ async def test_a_plain_text_answer_reaches_the_user():
 
     assert outcome.kind == "replied"
     assert sent == ["Piranesi is a strange, lovely novel."]
+
+
+async def test_peers_are_probed_while_the_model_reads_the_results():
+    """The probe starts as soon as a search returns, so the agent's own
+    probe_peers call finds the counts waiting instead of starting a 10 s wait."""
+    import asyncio
+
+    probes: list = []
+
+    def fake_pipeline(q, limit, on_step=None, attempt=1, title="", author=""):
+        return {"book": {}, "results": [{"magnet": "m1"}, {"magnet": "m2"}, {"title": "no magnet"}]}
+
+    def fake_probe(magnets, timeout, settle_s=None):
+        probes.append((list(magnets), settle_s))
+        return {m: 5 for m in magnets}
+
+    with (
+        patch.object(agent_module, "_search_pipeline_sync", fake_pipeline),
+        patch.object(agent_module, "_probe_seeds_batch", fake_probe),
+    ):
+        tools = await _tools()
+        await tools["search_audiobookbay"]({"query": "Dune"})
+        out = await tools["probe_peers"]({"magnets": ["m1", "m2"]})
+        await asyncio.sleep(0)
+
+    # One probe only — the background one, with the full settle window so a
+    # slow copy is not recorded as dead.
+    assert probes == [(["m1", "m2"], agent_module.PROBE_TIMEOUT_S)]
+    assert '"m1": 5' in out["content"][0]["text"]
+
+
+async def test_a_magnet_the_search_did_not_return_is_still_probed():
+    probes: list = []
+
+    def fake_probe(magnets, timeout, settle_s=None):
+        probes.append(list(magnets))
+        return {m: 1 for m in magnets}
+
+    with patch.object(agent_module, "_probe_seeds_batch", fake_probe):
+        tools = await _tools()
+        await tools["probe_peers"]({"magnet": "m9"})
+
+    assert probes == [["m9"]]

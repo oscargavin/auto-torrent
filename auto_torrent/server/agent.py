@@ -56,6 +56,7 @@ AGENT_MAX_TURNS = 16
 # for the others once the first has a peer.
 PROBE_MAX = 4
 PROBE_SETTLE_S = 3.0
+PROBE_TIMEOUT_S = 10.0
 
 SYSTEM_PROMPT = """You are a warm, concise audiobook concierge for a family's shared library. Someone asks for something to listen to; you work out what they mean, find the best copy, start the download, and confirm.
 
@@ -460,6 +461,37 @@ async def run_agent(
     # than as three attempts. The round number lets the narration say which.
     search_attempts = {"n": 0}
     search_cache: dict[tuple[str, int, str, str], str] = {}
+    # Peer counts found this turn. The probe takes 5-10 s, so it starts in the
+    # background as soon as a search returns, while the model reads the
+    # results; the agent's own probe_peers call then finds the answer waiting.
+    # One probe at a time: each opens a libtorrent session on the same port.
+    peer_counts: dict[str, int] = {}
+    probe_lock = asyncio.Lock()
+    # magnet -> the background probe already looking for it.
+    probing: dict[str, asyncio.Task] = {}
+
+    async def _probe(magnets: list[str], settle_s: float | None) -> dict[str, int]:
+        async with probe_lock:
+            missing = [m for m in magnets if m not in peer_counts]
+            if missing:
+                peer_counts.update(
+                    await asyncio.to_thread(_probe_seeds_batch, missing, 10, settle_s=settle_s)
+                )
+        return {m: peer_counts.get(m, 0) for m in magnets}
+
+    def _prefetch_peers(data: dict) -> None:
+        magnets = [
+            r["magnet"] for r in data.get("results") or [] if r.get("magnet")
+        ][:PROBE_MAX]
+        magnets = [m for m in magnets if m not in peer_counts]
+        if not magnets:
+            return
+        # A full settle window: nobody waits on this probe, and a short one
+        # would record 0 for a copy that is slow to find its peers.
+        task = asyncio.create_task(_probe(magnets, PROBE_TIMEOUT_S))
+        for m in magnets:
+            probing[m] = task
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
 
     # ---- Tools ----
 
@@ -524,6 +556,7 @@ async def run_agent(
             )
             text = json.dumps(data)
             search_cache[key] = text
+            _prefetch_peers(data)
             return {"content": [{"type": "text", "text": text}]}
         except Exception as e:
             logger.exception("search tool failed")
@@ -565,9 +598,12 @@ async def run_agent(
             # settle_s: the probe stops when the first magnet shows a peer, so
             # the others would read 0 when compared. It waits a few seconds
             # more for them.
-            counts = await asyncio.to_thread(
-                _probe_seeds_batch, magnets, 10, settle_s=PROBE_SETTLE_S if len(magnets) > 1 else None
-            )
+            # Wait for a background probe already looking for these, rather
+            # than racing it into a second probe of the same magnets.
+            pending = {probing[m] for m in magnets if m in probing and not probing[m].done()}
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            counts = await _probe(magnets, PROBE_SETTLE_S if len(magnets) > 1 else None)
             return {"content": [{"type": "text", "text": json.dumps({"peers": counts})}]}
         except Exception as e:
             return {"content": [{"type": "text", "text": json.dumps({"error": str(e), "peers": {}})}]}
