@@ -37,7 +37,7 @@ from .vision import analyze_cover as _analyze_cover
 
 logger = logging.getLogger("atb.agent")
 
-AGENT_MODEL = "claude-sonnet-4-6"
+AGENT_MODEL = "claude-haiku-5-5"
 # Raised from 12 with the interpretation step: a vague request ("something
 # funny for a long drive") legitimately costs a couple of extra searches before
 # it converges, and running out of turns mid-search reads to the user as "not

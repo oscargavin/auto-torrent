@@ -581,7 +581,7 @@ def _llm_pick_tpb(
     candidates: list[TPBResult],
     n: int = PROBE_CANDIDATES,
 ) -> tuple[list[int], str]:
-    """Ask Sonnet to rank the top N TPB results. Returns (indices, reason)."""
+    """Ask the model to rank the top N TPB results. Returns (indices, reason)."""
     results_xml = []
     for i, r in enumerate(candidates):
         fields = [f"    <title>{r.title}</title>"]
@@ -777,7 +777,7 @@ def _llm_pick_top(
     narrator_pref: str | None = None,
     n: int = PROBE_CANDIDATES,
 ) -> tuple[list[int], str]:
-    """Ask Sonnet to rank the top N results from all candidates. Returns (indices, reason)."""
+    """Ask the model to rank the top N results from all candidates. Returns (indices, reason)."""
     prompt = _build_llm_prompt(query, candidates, narrator_pref, n)
 
     schema = json.dumps({

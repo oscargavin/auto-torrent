@@ -1,4 +1,4 @@
-"""Cover-image OCR via Sonnet vision (claude_agent_sdk, subscription auth)."""
+"""Cover-image OCR via Claude vision (claude_agent_sdk, subscription auth)."""
 
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ async def _query_vision(b64: str, media_type: str) -> str:
     result = ""
     async for msg in query(
         prompt=stream(),
-        options=ClaudeAgentOptions(model="claude-sonnet-4-6", max_turns=1),
+        options=ClaudeAgentOptions(model="claude-haiku-5-5", max_turns=1),
     ):
         if getattr(msg, "subtype", None) == "success":
             result = msg.result or ""

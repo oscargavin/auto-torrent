@@ -26,7 +26,7 @@ from .recommend import RecCache
 
 logger = logging.getLogger("atb.recap")
 
-RECAP_MODEL = "claude-sonnet-4-6"
+RECAP_MODEL = "claude-haiku-5-5"
 # Recaps describe the published book, which does not change — cache ~forever.
 RECAP_CACHE_TTL_S = 365 * 24 * 3600
 RECAP_MAX_TURNS = 6

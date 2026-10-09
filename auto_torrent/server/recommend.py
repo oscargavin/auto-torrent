@@ -29,7 +29,7 @@ from ..types import BookCard
 
 logger = logging.getLogger("atb.recommend")
 
-REC_MODEL = "claude-sonnet-4-6"
+REC_MODEL = "claude-haiku-5-5"
 DEFAULT_N = 12
 CACHE_TTL_S = 7 * 24 * 3600  # re-generate weekly even if history is unchanged
 # Structured output needs a few turns (generate → coerce to JSON); 1 hits

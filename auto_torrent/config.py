@@ -41,7 +41,7 @@ PROBE_TIMEOUT = 15
 PROBE_CANDIDATES = 3
 
 # LLM selection
-LLM_MODEL = "sonnet"
+LLM_MODEL = "haiku"
 LLM_TIMEOUT = 90
 
 # Download progress
