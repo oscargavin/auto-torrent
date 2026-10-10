@@ -68,3 +68,25 @@ async def test_inspect_reads_the_cover_only_when_no_narrator_is_recorded(monkeyp
     known = await agent_module._inspect_book(SETTINGS, "a1")
     assert "cover_says" not in known
     assert covers == ["o1"]
+
+
+async def test_the_shelf_guard_refuses_a_set_whose_books_are_all_owned(monkeypatch):
+    """Observed live: "Get the tawny man trilogy" started an omnibus download
+    with all three books on the shelf. A prompt rule did not stop it."""
+    shelf = [
+        _item("t1", "The Tawny Man Trilogy 01 - Fool's Errand", "James Langton"),
+        _item("t2", "The Tawny Man Trilogy 02 - Golden Fool", "James Langton"),
+        _item("a1", "The Farseer Trilogy 01 - Assassin's Apprentice", "Paul Boehmer"),
+    ]
+
+    async def items(settings):
+        return shelf
+
+    monkeypatch.setattr(agent_module, "_library_items", items)
+
+    owned = await agent_module._owned(SETTINGS, "The Tawny Man Trilogy", "Robin Hobb")
+    assert [r["id"] for r in owned] == ["t1", "t2"]
+    # One owned book of a set is not the set.
+    assert await agent_module._owned(SETTINGS, "The Farseer Trilogy", "Robin Hobb") == []
+    # A book not on the shelf goes through.
+    assert await agent_module._owned(SETTINGS, "Ship of Magic", "Robin Hobb") == []

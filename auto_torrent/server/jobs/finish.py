@@ -145,20 +145,13 @@ async def finish_agent_outcome(
     # failure rather than sliding through as success.
     result = await _emit_download_and_poll(
         bus,
-        download=outcome.download or {},
-        fallbacks=outcome.fallbacks,
-        display=outcome.display,
-        title=outcome.title,
-        author=outcome.author,
-        session=job.id,
+        outcome,
         on_download_change=_track_download_change,
         query=job.query,
         # One budget for the whole job: attempts, grace extensions and fallback
         # swaps all draw from it, so arq's timeout stays a backstop instead of
         # the thing that actually ends the job.
         deadline=time.monotonic() + JOB_BUDGET_S,
-        narrator=outcome.narrator or "",
-        file_format=outcome.file_format or "",
     )
 
     # If cancel fired during the poll, update_status here is a no-op against the

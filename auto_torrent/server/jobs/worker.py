@@ -9,8 +9,6 @@ from arq.connections import RedisSettings
 from ..settings import Settings
 from ..threads.worker import run_thread_turn
 from ..worker import JOB_BUDGET_S
-from .events import EventLog
-from .store import JobStore
 
 settings = Settings()
 
@@ -34,23 +32,15 @@ class WorkerSettings:
     async def on_startup(ctx: dict[str, Any]) -> None:
         from redis.asyncio import Redis
 
-        from ..threads.store import ThreadStore
+        from ..runtime import build_stores
 
         redis = Redis.from_url(settings.redis_url, decode_responses=True)
-        log = EventLog(redis)
-        thread_log = EventLog(redis, prefix="thread")
+        stores = build_stores(redis, settings)
         ctx["redis"] = redis
-        ctx["log"] = log
-        ctx["thread_log"] = thread_log
-        ctx["store"] = JobStore(
-            redis,
-            log,
-            state_ttl_s=settings.job_state_ttl_s,
-            dedup_ttl_s=settings.job_dedup_ttl_s,
-        )
-        ctx["threads"] = ThreadStore(
-            redis, thread_log, state_ttl_s=settings.job_state_ttl_s
-        )
+        ctx["log"] = stores.log
+        ctx["thread_log"] = stores.thread_log
+        ctx["store"] = stores.jobs
+        ctx["threads"] = stores.threads
 
     @staticmethod
     async def on_shutdown(ctx: dict[str, Any]) -> None:

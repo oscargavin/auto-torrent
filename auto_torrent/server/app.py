@@ -30,15 +30,11 @@ recap_cache = RecCache(settings.recap_cache_path, ttl_s=RECAP_CACHE_TTL_S)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    from arq import create_pool
-    from arq.connections import RedisSettings
     from redis.asyncio import Redis
 
     from .jobs.api import build_router
-    from .jobs.events import EventLog
-    from .jobs.store import JobStore
+    from .runtime import build_stores, turn_queue
     from .threads.api import build_router as build_threads_router
-    from .threads.store import ThreadStore
 
     logging.basicConfig(
         level=logging.INFO,
@@ -47,29 +43,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     logger.info("atb-server starting on port %d", settings.port)
 
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
-    arq_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
-    log = EventLog(redis)
-    store = JobStore(
-        redis,
-        log,
-        state_ttl_s=settings.job_state_ttl_s,
-        dedup_ttl_s=settings.job_dedup_ttl_s,
-    )
+    arq_pool, enqueue_turn = await turn_queue(settings)
+    stores = build_stores(redis, settings)
 
-    # Separate key prefix, not a shared stream: a thread outlives the jobs
-    # inside it, so sharing would expire the conversation on the first job's
-    # terminal event.
-    thread_log = EventLog(redis, prefix="thread")
-    threads = ThreadStore(redis, thread_log, state_ttl_s=settings.job_state_ttl_s)
-
-    async def enqueue_turn(
-        thread_id: str, text: str, pending: list[dict] | None
-    ) -> None:
-        await arq_pool.enqueue_job("run_thread_turn", thread_id, text, pending)
-
-    _app.include_router(build_router(store=store, log=log))
+    _app.include_router(build_router(store=stores.jobs, log=stores.log))
     _app.include_router(
-        build_threads_router(threads=threads, log=thread_log, enqueue_turn=enqueue_turn)
+        build_threads_router(
+            threads=stores.threads, log=stores.thread_log, enqueue_turn=enqueue_turn
+        )
     )
 
     try:

@@ -1,6 +1,5 @@
 import os as _os
 
-import pytest
 import pytest_asyncio
 from fakeredis import aioredis as fakeredis_aio
 

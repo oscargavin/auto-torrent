@@ -6,6 +6,7 @@ from pathlib import Path
 import requests
 from rapidfuzz import fuzz
 
+from .server.library_match import fold
 from .types import BookMetadata
 
 _ARTICLES = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
@@ -92,7 +93,8 @@ def _try_query(q: str = "", *, title: str = "", author: str = "") -> list[dict]:
 
 
 def _norm(text: str) -> str:
-    return _NON_ALNUM.sub("", text.lower()).strip()
+    # Punctuation is deleted, not spaced, so "R.F." is one word as "rf".
+    return _NON_ALNUM.sub("", fold(text)).strip()
 
 
 def _title_score(doc_title: str, want: str) -> int:

@@ -265,5 +265,5 @@ async def test_the_chosen_edition_reaches_the_download_pump(redis, store, log, m
 
     await _finish(store, log, job, outcome)
 
-    assert emit.await_args.kwargs["narrator"] == "Scott Brick"
-    assert emit.await_args.kwargs["file_format"] == "M4B"
+    # The pump reads the edition off the outcome itself.
+    assert emit.await_args.args[1] is outcome

@@ -15,6 +15,7 @@ containment — "Dune" must not match "Dune Messiah".
 from __future__ import annotations
 
 import re
+import unicodedata
 
 # Library titles carry subtitles nobody types; the part before the separator is
 # the book.
@@ -24,10 +25,20 @@ _NOISE = re.compile(
 )
 _ARTICLE = re.compile(r"^(the|a|an)\s+")
 _NON_WORD = re.compile(r"[^\w\s]", re.UNICODE)
+_APOSTROPHE = re.compile(r"['‘’`´]")
+
+
+def fold(raw: str) -> str:
+    """Lower case, with accents and apostrophes removed, so "Fool’s Errand",
+    "Fool's Errand" and "fools errand" agree, and "é" is "e". The one step that
+    every title matcher shares; each adds its own rules on top."""
+    text = unicodedata.normalize("NFKD", (raw or "").casefold())
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return _APOSTROPHE.sub("", text)
 
 
 def normalise(raw: str) -> str:
-    text = _NOISE.sub("", (raw or "").lower())
+    text = _NOISE.sub("", fold(raw))
     text = _NON_WORD.sub(" ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return _ARTICLE.sub("", text).strip()

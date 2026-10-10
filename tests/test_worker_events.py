@@ -52,7 +52,7 @@ class BusSink:
         self.sent: list[str] = []
         self.emitted: list[tuple[str, dict]] = []
 
-    def send(self, _to: str, body: str) -> None:
+    def send(self, body: str) -> None:
         assert isinstance(body, str), "send() must only ever receive a string"
         self.sent.append(body)
 
@@ -66,7 +66,7 @@ class SendOnlySink:
     def __init__(self) -> None:
         self.sent: list[str] = []
 
-    def send(self, _to: str, body: str) -> None:
+    def send(self, body: str) -> None:
         assert isinstance(body, str)
         self.sent.append(body)
 
@@ -107,7 +107,7 @@ async def test_importing_names_each_step_once_before_success(tmp_path, monkeypat
 
     await poll_and_finalise(
         download={"id": "d1"}, fallbacks=[], display="“The Book”",
-        author="Author", title="The Book", session="s1", settings=settings, sink=sink,
+        author="Author", title="The Book", settings=settings, sink=sink,
     )
 
     importing = [d for ev, d in sink.emitted if ev == EVENT_PROGRESS and d.get("stage") == STAGE_IMPORTING]
@@ -156,7 +156,7 @@ async def test_scan_failure_raises_import_incomplete(tmp_path, monkeypatch):
     with pytest.raises(ImportIncompleteError):
         await poll_and_finalise(
             download={"id": "d1"}, fallbacks=[], display="“The Book”",
-            author="Author", title="The Book", session="s1", settings=settings, sink=sink,
+            author="Author", title="The Book", settings=settings, sink=sink,
         )
 
     # User must NOT be told it's in the library.
@@ -194,7 +194,7 @@ async def test_stall_with_seeders_extends_grace_once(tmp_path, monkeypatch):
     settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
     await poll_and_finalise(
         download={"id": "d1", "magnet": "magnet:seeded"}, fallbacks=[],
-        display="“Book”", author="A", title="Book", session="s", settings=settings, sink=sink,
+        display="“Book”", author="A", title="Book", settings=settings, sink=sink,
     )
 
     assert any(d.get("stage") == STAGE_RETRYING for _, d in sink.emitted)
@@ -233,7 +233,7 @@ async def test_rediscovery_when_fallbacks_empty(tmp_path, monkeypatch):
     settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
     await poll_and_finalise(
         download={"id": "d1", "magnet": "magnet:dead"}, fallbacks=[],
-        display="“Book”", author="A", title="Book", session="s", settings=settings,
+        display="“Book”", author="A", title="Book", settings=settings,
         sink=sink, query="the book",
     )
 
@@ -276,7 +276,7 @@ async def test_rediscovery_capped(tmp_path, monkeypatch):
     with pytest.raises(worker_module.NoCandidatesLeftError):
         await poll_and_finalise(
             download={"id": "d1", "magnet": "magnet:dead"}, fallbacks=[],
-            display="“Book”", author="A", title="Book", session="s", settings=settings,
+            display="“Book”", author="A", title="Book", settings=settings,
             sink=sink, query="the book",
         )
 
@@ -313,7 +313,7 @@ async def test_rediscovery_skips_candidates_for_other_books(tmp_path, monkeypatc
         await poll_and_finalise(
             download={"id": "d1", "magnet": "magnet:dead"}, fallbacks=[],
             display="“The Late Lord Thorpe”", author="Peter Grainger",
-            title="The Late Lord Thorpe", session="s", settings=settings,
+            title="The Late Lord Thorpe", settings=settings,
             sink=BusSink(), query="The late lord thorpe",
         )
     assert started == []
@@ -363,7 +363,7 @@ async def test_no_candidates_left_raises_with_no_seeders_class(tmp_path, monkeyp
     with pytest.raises(worker_module.NoCandidatesLeftError) as exc:
         await poll_and_finalise(
             download={"id": "d1", "magnet": "magnet:dead"}, fallbacks=[],
-            display="“Book”", author="A", title="Book", session="s",
+            display="“Book”", author="A", title="Book",
             settings=settings, sink=BusSink(), query="the book",
         )
     assert exc.value.failure_class == "no_seeders"
@@ -377,7 +377,7 @@ async def test_unknown_poll_outcome_raises(tmp_path, monkeypatch):
     with pytest.raises(worker_module.UnknownDownloadOutcomeError):
         await poll_and_finalise(
             download={"id": "d1", "magnet": "m"}, fallbacks=[],
-            display="“Book”", author="A", title="Book", session="s",
+            display="“Book”", author="A", title="Book",
             settings=settings, sink=BusSink(),
         )
 
@@ -391,7 +391,7 @@ async def test_lost_state_file_after_completion_raises(tmp_path, monkeypatch):
     with pytest.raises(worker_module.DownloadStateLostError):
         await poll_and_finalise(
             download={"id": "d1", "magnet": "m"}, fallbacks=[],
-            display="“Book”", author="A", title="Book", session="s",
+            display="“Book”", author="A", title="Book",
             settings=settings, sink=BusSink(),
         )
 
@@ -439,7 +439,7 @@ async def test_expired_deadline_times_out_rather_than_polling(tmp_path, monkeypa
     with pytest.raises(worker_module.DownloadTimedOutError) as exc:
         await poll_and_finalise(
             download={"id": "d1", "magnet": "m"}, fallbacks=[],
-            display="“Book”", author="A", title="Book", session="s",
+            display="“Book”", author="A", title="Book",
             settings=settings, sink=sink,
             deadline=time.monotonic() - 1,  # already expired
         )
@@ -520,7 +520,7 @@ async def test_stall_emits_stalled_before_any_fallback_swap(tmp_path, monkeypatc
     settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
     await poll_and_finalise(
         download={"id": "d1", "magnet": "magnet:seeded"}, fallbacks=[],
-        display="“Book”", author="A", title="Book", session="s",
+        display="“Book”", author="A", title="Book",
         settings=settings, sink=sink,
     )
 
@@ -552,7 +552,7 @@ async def test_stalled_frame_carries_percent_and_peers(tmp_path, monkeypatch):
     settings = SimpleNamespace(abs_library_path=str(tmp_path), abs_library_id="lib")
     await poll_and_finalise(
         download={"id": "d1", "magnet": "m"}, fallbacks=[],
-        display="“Book”", author="A", title="Book", session="s",
+        display="“Book”", author="A", title="Book",
         settings=settings, sink=sink,
     )
 

@@ -53,3 +53,8 @@ def test_title_too_short_is_not_evidence():
 
 def test_empty_library():
     assert find_existing([], "Dune") is None
+
+
+def test_apostrophes_and_accents_do_not_matter():
+    assert normalise_title("Fool’s Errand") == normalise_title("Fool's Errand") == "fools errand"
+    assert normalise_title("Les Misérables") == normalise_title("Les Miserables")

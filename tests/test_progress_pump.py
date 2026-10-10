@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
+from auto_torrent.server.agent import AgentOutcome
 from auto_torrent.server.jobs import progress as progress_module
 
 
@@ -130,9 +131,7 @@ async def test_committed_carries_the_edition():
         patch.object(progress_module, "_refresh_state", lambda _id: None),
     ):
         await progress_module._emit_download_and_poll(
-            bus, download={"id": "dl1"}, fallbacks=[], display="“Dune”",
-            title="Dune", author="Frank Herbert", session="s",
-            narrator="Scott Brick", file_format="M4B",
+            bus, _dune(narrator="Scott Brick", file_format="M4B"),
         )
     committed = [d for t, d in bus.frames if t == "committed"]
     assert committed[0]["narrator"] == "Scott Brick"
@@ -156,9 +155,7 @@ async def test_a_swap_is_still_reported_to_the_caller():
         patch.object(progress_module, "_refresh_state", lambda _id: None),
     ):
         await progress_module._emit_download_and_poll(
-            _Bus(), download={"id": "dl1"}, fallbacks=[], display="“Dune”",
-            title="Dune", author="Frank Herbert", session="s",
-            on_download_change=track,
+            _Bus(), _dune(), on_download_change=track,
         )
     assert seen == ["dl2"]
 
@@ -191,11 +188,17 @@ async def test_never_publishes_a_terminal_frame():
             patch.object(progress_module, "_refresh_state", lambda _id: None),
         ):
             await progress_module._emit_download_and_poll(
-                bus, download={"id": "dl1"}, fallbacks=[], display="“Dune”",
-                title="Dune", author="Frank Herbert", session="s",
+                bus, _dune(),
             )
     assert not [t for t, _d in bus.frames if t in ("completed", "error")]
 
 
 async def _done() -> None:
     return None
+
+
+def _dune(**kw) -> AgentOutcome:
+    return AgentOutcome(
+        kind="committed", download={"id": "dl1"}, display="“Dune”",
+        title="Dune", author="Frank Herbert", **kw,
+    )

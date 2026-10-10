@@ -7,7 +7,6 @@ are mocked; the JSON store writes to a tmp file.
 
 from __future__ import annotations
 
-import asyncio
 import os
 from unittest.mock import AsyncMock, patch
 

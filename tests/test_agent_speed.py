@@ -6,7 +6,7 @@ from unittest.mock import patch
 from auto_torrent.server import agent as agent_module
 from auto_torrent.types import BookMetadata
 
-from tests.sdk_fake import fake_client
+from tests.sdk_fake import fake_client, one_turn
 
 
 class _Bus:
@@ -33,7 +33,7 @@ async def _tools(**patches):
         patch.object(agent_module, "create_sdk_mcp_server", fake_server),
         patch.object(agent_module, "ClaudeSDKClient", fake_client(fake_query)),
     ):
-        await agent_module.run_agent("dune", "s1", object(), _Bus(), on_ask=_no_ask)
+        await one_turn("dune", "s1", object(), _Bus(), on_ask=_no_ask)
     return captured
 
 
@@ -129,7 +129,7 @@ async def test_a_plain_text_answer_reaches_the_user():
     sent: list = []
 
     class Bus(_Bus):
-        def send(self, _phone, text):
+        def send(self, text):
             sent.append(text)
 
     async def fake_query(prompt, options):
@@ -139,7 +139,7 @@ async def test_a_plain_text_answer_reaches_the_user():
         patch.object(agent_module, "create_sdk_mcp_server", lambda name, tools: object()),
         patch.object(agent_module, "ClaudeSDKClient", fake_client(fake_query)),
     ):
-        outcome = await agent_module.run_agent("what is piranesi about", "s1", object(), Bus())
+        outcome = await one_turn("what is piranesi about", "s1", object(), Bus())
 
     assert outcome.kind == "replied"
     assert sent == ["Piranesi is a strange, lovely novel."]

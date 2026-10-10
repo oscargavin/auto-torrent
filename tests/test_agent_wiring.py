@@ -3,11 +3,10 @@ model's behaviour, which is non-deterministic and needs a live call."""
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import pytest
 
 from auto_torrent.server import agent as agent_module
 
-from tests.sdk_fake import fake_client
+from tests.sdk_fake import bound_tools, fake_client, one_turn
 
 
 def test_outcome_carries_the_chosen_edition():
@@ -38,7 +37,7 @@ async def test_agent_crash_message_is_human_not_a_python_exception():
         patch.object(agent_module, "create_sdk_mcp_server", lambda name, tools: object()),
         patch.object(agent_module, "ClaudeSDKClient", fake_client(boom)),
     ):
-        outcome = await agent_module.run_agent(
+        outcome = await one_turn(
             "dune", "s1", object(), AsyncMock()
         )
 
@@ -99,7 +98,7 @@ class _RecordingBus:
     def emit(self, event, data):
         self.events.append((event, data))
 
-    def send(self, _to, text):
+    def send(self, text):
         self.events.append(("send", {"text": text}))
 
 
@@ -142,31 +141,15 @@ async def test_search_narrates_from_inside_the_pipeline():
     candidate count, ranking) are the ones that carry new information, so this
     pins the wiring that gets them out of the worker thread and onto the bus.
     """
-    captured = {}
-
-    def fake_server(name, tools):
-        captured["tools"] = {getattr(t, "name", None) or t.__name__: t for t in tools}
-        return object()
-
-    async def fake_query(prompt, options):
-        return
-        yield
-
     def fake_pipeline(q, limit, on_step=None, attempt=1, title="", author=""):
         if on_step:
             on_step("Found 3 copies — checking each…")
         return {"book": {}, "results": []}
 
     bus = _RecordingBus()
-    with (
-        patch.object(agent_module, "create_sdk_mcp_server", fake_server),
-        patch.object(agent_module, "ClaudeSDKClient", fake_client(fake_query)),
-        patch.object(agent_module, "_search_pipeline_sync", fake_pipeline),
-    ):
-        await agent_module.run_agent("dune", "s1", object(), bus)
-        tool = captured["tools"]["search_audiobookbay"]
-        handler = getattr(tool, "handler", None) or tool
-        await handler({"query": "dune", "limit": 5})
+    with patch.object(agent_module, "_search_pipeline_sync", fake_pipeline):
+        _, tools = bound_tools(bus)
+        await tools["search_audiobookbay"]({"query": "dune", "limit": 5})
 
     progress = [d for e, d in bus.events if e == "progress"]
     assert [d.get("stage") for d in progress] == ["searching"]

@@ -7,7 +7,7 @@ import pytest
 from auto_torrent.server import agent as agent_module
 from auto_torrent.server.threads import worker as worker_mod
 
-from tests.sdk_fake import fake_client
+from tests.sdk_fake import fake_client, one_turn
 
 
 class _Bus:
@@ -33,7 +33,7 @@ async def test_one_cli_serves_every_turn_and_history_goes_in_once():
         session = agent_module.AgentSession()
         history = [("user", "something like Dune"), ("assistant", "Try Hyperion.")]
         for text in ("dune", "the second one"):
-            await agent_module.run_agent(
+            await one_turn(
                 text, "t1", object(), _Bus(), on_ask=_no_ask, history=history, session=session
             )
         await session.close()
@@ -50,7 +50,7 @@ async def test_one_cli_serves_every_turn_and_history_goes_in_once():
 async def test_a_one_off_request_closes_its_session():
     client = fake_client(_silent)
     with patch.object(agent_module, "ClaudeSDKClient", client):
-        await agent_module.run_agent("dune", "t1", object(), _Bus(), on_ask=_no_ask)
+        await one_turn("dune", "t1", object(), _Bus(), on_ask=_no_ask)
     assert client.instances[0].connected is False
 
 
@@ -61,7 +61,7 @@ async def test_a_failed_turn_marks_the_session_broken():
 
     with patch.object(agent_module, "ClaudeSDKClient", fake_client(boom)):
         session = agent_module.AgentSession()
-        outcome = await agent_module.run_agent(
+        outcome = await one_turn(
             "dune", "t1", object(), _Bus(), on_ask=_no_ask, session=session
         )
     assert outcome.kind == "error"
@@ -117,7 +117,48 @@ async def test_two_turns_on_one_session_run_one_after_the_other():
     with patch.object(agent_module, "ClaudeSDKClient", fake_client(slow)):
         session = agent_module.AgentSession()
         await asyncio.gather(
-            agent_module.run_agent("one", "t1", object(), _Bus(), on_ask=_no_ask, session=session),
-            agent_module.run_agent("two", "t1", object(), _Bus(), on_ask=_no_ask, session=session),
+            one_turn("one", "t1", object(), _Bus(), on_ask=_no_ask, session=session),
+            one_turn("two", "t1", object(), _Bus(), on_ask=_no_ask, session=session),
         )
     assert order == [("start", "one"), ("end", "one"), ("start", "two"), ("end", "two")]
+
+
+async def test_an_event_is_not_presented_as_the_user_speaking():
+    client = fake_client(_silent)
+    with patch.object(agent_module, "ClaudeSDKClient", client):
+        await one_turn("", "t1", object(), _Bus(), event="Dune just appeared on the site.")
+    prompt = client.instances[0].prompts[0]
+    assert "Something happened (this is not the user speaking): Dune just appeared" in prompt
+    assert "User said" not in prompt
+
+
+async def test_an_open_session_hears_only_what_changed(redis):
+    """A download that finished between turns reaches the next turn; the
+    messages the session already saw do not come again."""
+    from types import SimpleNamespace
+
+    from auto_torrent.server.jobs.events import EventLog
+    from auto_torrent.server.threads.store import ThreadStore
+    from auto_torrent.server.threads.types import Message, MessageKind
+
+    threads = ThreadStore(redis, EventLog(redis, prefix="thread"), state_ttl_s=3600)
+    job = SimpleNamespace(
+        id="j1", query="dune", picked_title="Dune", picked_narrator="", picked_format="",
+        status="running", already_had=False, error=None,
+    )
+
+    class Jobs:
+        async def get(self, job_id):
+            return job if job_id == "j1" else None
+
+    t = await threads.create("p1")
+    await threads.append(t.id, Message.new(t.id, MessageKind.user, text="dune"))
+    await threads.append(t.id, Message.new(t.id, MessageKind.job, job_id="j1"))
+    session = agent_module.AgentSession()
+    session.turns = 1
+    await worker_mod._remember(session, threads, Jobs(), t.id)
+
+    await threads.append(t.id, Message.new(t.id, MessageKind.user, text="is it done?"))
+    job.status = "succeeded"
+    news = await worker_mod._history_for(session, threads, Jobs(), t.id, "is it done?")
+    assert news == [("assistant", "[download] “Dune” — done, in the library")]

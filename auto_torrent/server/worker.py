@@ -84,7 +84,7 @@ class MessageSink(Protocol):
     """Where the poll sends its user-facing lines. The jobs and thread buses
     both have this shape."""
 
-    def send(self, to: str, body: str) -> None: ...
+    def send(self, body: str) -> None: ...
 
 
 def _emit_event(sink: object, event: str, data: dict) -> None:
@@ -304,7 +304,6 @@ async def poll_and_finalise(
     display: str,
     author: str,
     title: str,
-    session: str,
     settings: Settings,
     sink: MessageSink,
     on_download_change: Callable[[str], Awaitable[None]] | None = None,
@@ -356,7 +355,7 @@ async def poll_and_finalise(
             stale = _refresh_state(download_id)
             if stale:
                 await _kill_download_and_clean(stale)
-            sink.send(session, f"{display} was taking too long, so I stopped it.")
+            sink.send(f"{display} was taking too long, so I stopped it.")
             raise DownloadTimedOutError(display)
         if outcome == "stalled" or outcome == "failed":
             # R14: on a stall (not a hard failure), check whether the torrent
@@ -396,10 +395,10 @@ async def poll_and_finalise(
                     fallbacks.extend(f for f in found if _matches_title(f["title"], title))
                 if not fallbacks:
                     logger.info("No fallbacks left for %s", display)
-                    sink.send(session, f"Couldn't get {display} tonight, sorry — try in the morning?")
+                    sink.send(f"Couldn't get {display} tonight, sorry — try in the morning?")
                     raise NoCandidatesLeftError(display)
             if not fallback_announced:
-                sink.send(session, f"That one stalled — trying another version…")
+                sink.send("That one stalled — trying another version…")
                 fallback_announced = True
 
             stale = _refresh_state(download_id)
@@ -434,7 +433,7 @@ async def poll_and_finalise(
             await asyncio.sleep(0)
             continue
         # Unknown outcome → bail.
-        sink.send(session, f"Something odd happened with {display}. Try again?")
+        sink.send(f"Something odd happened with {display}. Try again?")
         raise UnknownDownloadOutcomeError(display)
 
     # The bytes are down; the user-visible work now is organise + ABS scan.
@@ -445,7 +444,7 @@ async def poll_and_finalise(
 
     final = _refresh_state(download.get("id"))
     if not final:
-        sink.send(session, f"Couldn't read the final state for {display}. The file may still be there.")
+        sink.send(f"Couldn't read the final state for {display}. The file may still be there.")
         raise DownloadStateLostError(display)
 
     download_path = final.get("path", "")
@@ -457,7 +456,7 @@ async def poll_and_finalise(
         logger.info("Organised %s → %s", display, dest)
     except Exception as e:
         logger.exception("organise failed")
-        sink.send(session, f"{display} downloaded but I couldn't move it into the library. Try again?")
+        sink.send(f"{display} downloaded but I couldn't move it into the library. Try again?")
         _emit_event(sink, EVENT_PROGRESS, {"stage": STAGE_IMPORT_FAILED, "percent": 100,
                                            "text": "Downloaded, but couldn't be imported."})
         raise ImportIncompleteError(display) from e
@@ -484,7 +483,7 @@ async def poll_and_finalise(
         # tell the user it's in the library — surface "downloaded, not yet
         # imported" instead and signal the caller to skip the success event.
         logger.exception("ABS scan failed; files are in place, will be picked up on next scan")
-        sink.send(session, f"{display} downloaded — it'll appear after the next library scan.")
+        sink.send(f"{display} downloaded — it'll appear after the next library scan.")
         _emit_event(sink, EVENT_PROGRESS, {"stage": STAGE_IMPORT_FAILED, "percent": 100,
                                            "text": "Downloaded — waiting for the next library scan."})
         raise ImportIncompleteError(display) from e
@@ -497,7 +496,7 @@ async def poll_and_finalise(
                                        "text": "Naming the chapters…"})
     await _name_chapters(abs_client, settings.abs_library_id, title, author, display)
 
-    sink.send(session, f"✓ {display} is in your library.")
+    sink.send(f"✓ {display} is in your library.")
 
 
 # How long to wait for a scan to surface the item we just imported. The scan is

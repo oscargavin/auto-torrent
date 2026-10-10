@@ -79,27 +79,14 @@ def build_router(
         req: PostMessageRequest,
         _: None = Depends(_require_bearer),
     ) -> Message:
-        thread = await _require_thread(thread_id)
+        await _require_thread(thread_id)
+        message = Message.new(thread_id, MessageKind.user, text=req.text)
         # A turn already running would be talked over: the agent has its history
         # from before this message and would answer the wrong question. 409 is
         # the honest answer; the client disables the composer on `working` so
         # this is a race guard, not a user-facing state.
-        if thread.status is ThreadStatus.working:
+        if not await threads.start_turn(thread_id, message, enqueue_turn, req.text):
             raise HTTPException(status_code=409, detail="still working on the last one")
-
-        # A new message supersedes an unanswered question — the user typed
-        # instead of tapping, which is itself an answer ("none of those").
-        if thread.status is ThreadStatus.awaiting_choice:
-            await threads.clear_pending(thread_id)
-
-        message = await threads.append(
-            thread_id, Message.new(thread_id, MessageKind.user, text=req.text)
-        )
-        # Working from the moment the turn is accepted, not from when the worker
-        # picks it up: in that gap a second message passed the check above and
-        # two turns ran at once.
-        await threads.set_status(thread_id, ThreadStatus.working)
-        await enqueue_turn(thread_id, req.text, None)
         return message
 
     @router.post("/chat/threads/{thread_id}/choose", response_model=Message)
@@ -130,14 +117,7 @@ def build_router(
         title = option.title if option else (chosen.get("title") or "that one")
         # Echoed as a user message so the transcript reads as a conversation
         # rather than as a card that silently changed state.
-        await threads.append(
-            thread_id,
-            Message.new(thread_id, MessageKind.user, text=CHOICE_ECHO.format(title=title)),
-        )
-
-        # Working from now, as in post_message: a message typed straight after
-        # the tap would otherwise start a second turn alongside this one.
-        await threads.set_status(thread_id, ThreadStatus.working)
+        echo = Message.new(thread_id, MessageKind.user, text=CHOICE_ECHO.format(title=title))
 
         # The agent told us which question it asked, so this dispatches on that
         # rather than reconstructing it from whether the option happens to carry
@@ -150,14 +130,15 @@ def build_router(
         # Only the chosen option goes back — handing the agent the whole list
         # again would let it re-decide what the user already decided.
         if kind is ChoiceKind.edition and chosen.get("magnet"):
-            await enqueue_turn(thread_id, f"Download {title}", [chosen])
+            request, pending = f"Download {title}", [chosen]
         else:
             # A book the agent named without searching ("something like Name of
             # the Wind" means naming books, not torrents). Nothing to commit —
             # the next turn searches for the one they picked.
             author = (chosen.get("author") or "").strip()
-            request = f"{title} by {author}" if author else title
-            await enqueue_turn(thread_id, request, None)
+            request, pending = (f"{title} by {author}" if author else title), None
+        if not await threads.start_turn(thread_id, echo, enqueue_turn, request, pending):
+            raise HTTPException(status_code=409, detail="still working on the last one")
         return resolved
 
     @router.get("/chat/threads/{thread_id}/events")

@@ -32,6 +32,15 @@ def ctx(redis):
     }
 
 
+def _agent(monkeypatch, fake):
+    """Stand in for the agent: AgentSession.turn calls `fake` with the same
+    arguments the old run_agent took."""
+    async def turn(self, text, settings, sink, **kw):
+        return await fake(text, "t", settings, sink, **kw)
+
+    monkeypatch.setattr(worker_mod.AgentSession, "turn", turn)
+
+
 def _agent_returning(outcome: AgentOutcome, *, calls: list | None = None, kind: str = "edition"):
     async def fake_run_agent(raw_query, phone, settings, sms, **kw):
         if calls is not None:
@@ -50,10 +59,7 @@ async def test_question_parks_the_thread_and_creates_no_job(ctx, monkeypatch, re
         {"title": "Dune", "narrator": "Simon Vance", "magnet": "magnet:?xt=a"},
         {"title": "Dune", "narrator": "Scott Brick", "magnet": "magnet:?xt=b"},
     ]
-    monkeypatch.setattr(
-        worker_mod,
-        "run_agent",
-        _agent_returning(
+    _agent(monkeypatch, _agent_returning(
             AgentOutcome(
                 kind="asked", options=options, message="Two narrators — which?"
             )
@@ -79,10 +85,7 @@ async def test_question_parks_the_thread_and_creates_no_job(ctx, monkeypatch, re
 
 
 async def test_no_results_says_something_and_creates_no_job(ctx, monkeypatch):
-    monkeypatch.setattr(
-        worker_mod,
-        "run_agent",
-        _agent_returning(AgentOutcome(kind="error", message="Couldn't find that one.")),
+    _agent(monkeypatch, _agent_returning(AgentOutcome(kind="error", message="Couldn't find that one.")),
     )
     thread = await ctx["threads"].create("p1")
 
@@ -103,10 +106,7 @@ async def test_commit_creates_a_job_and_links_it_into_the_thread(ctx, redis, mon
         finished["bound"] = bus.job_id
 
     monkeypatch.setattr(worker_mod, "finish_agent_outcome", fake_finish)
-    monkeypatch.setattr(
-        worker_mod,
-        "run_agent",
-        _agent_returning(
+    _agent(monkeypatch, _agent_returning(
             AgentOutcome(kind="committed", title="Dune", author="Frank Herbert")
         ),
     )
@@ -131,10 +131,7 @@ async def test_commit_creates_a_job_and_links_it_into_the_thread(ctx, redis, mon
 
 async def test_history_excludes_the_message_being_answered(ctx, monkeypatch):
     calls: list = []
-    monkeypatch.setattr(
-        worker_mod,
-        "run_agent",
-        _agent_returning(AgentOutcome(kind="error", message="nope"), calls=calls),
+    _agent(monkeypatch, _agent_returning(AgentOutcome(kind="error", message="nope"), calls=calls),
     )
     thread = await ctx["threads"].create("p1")
     await ctx["threads"].append(
@@ -158,7 +155,7 @@ async def test_crash_unlocks_the_thread_and_says_so(ctx, monkeypatch):
     async def boom(*a, **kw):
         raise RuntimeError("agent exploded")
 
-    monkeypatch.setattr(worker_mod, "run_agent", boom)
+    _agent(monkeypatch, boom)
     thread = await ctx["threads"].create("p1")
 
     await worker_mod.run_thread_turn(ctx, thread.id, "dune")
@@ -181,10 +178,7 @@ async def test_suggested_books_get_cover_art(ctx, monkeypatch):
             description="blurb", rating=4.6, rating_count=1200, runtime_min=610,
         ),
     )
-    monkeypatch.setattr(
-        worker_mod,
-        "run_agent",
-        _agent_returning(
+    _agent(monkeypatch, _agent_returning(
             AgentOutcome(
                 kind="asked",
                 message="Which?",
@@ -213,10 +207,7 @@ async def test_search_results_keep_their_own_cover(ctx, monkeypatch):
         return BookCard(title=title, author=author, cover_url="https://img/other.jpg")
 
     monkeypatch.setattr(worker_mod, "find_card", _spy)
-    monkeypatch.setattr(
-        worker_mod,
-        "run_agent",
-        _agent_returning(
+    _agent(monkeypatch, _agent_returning(
             AgentOutcome(
                 kind="asked",
                 message="Which?",
@@ -237,10 +228,7 @@ async def test_a_failed_cover_lookup_never_costs_the_question(ctx, monkeypatch):
         raise RuntimeError("audible down")
 
     monkeypatch.setattr(worker_mod, "find_card", _boom)
-    monkeypatch.setattr(
-        worker_mod,
-        "run_agent",
-        _agent_returning(
+    _agent(monkeypatch, _agent_returning(
             AgentOutcome(kind="asked", message="Which?", options=[{"title": "Elantris"}])
         ),
     )
@@ -260,10 +248,10 @@ async def test_a_question_is_answered_not_searched_for(ctx, monkeypatch):
     fell through to the not-found fallback, so a good question got a nonsense
     answer about a book the agent had just recommended."""
     async def fake_run_agent(raw_query, phone, settings, sms, **kw):
-        await asyncio.to_thread(sms.send, phone, "A man in an endless house of statues.")
+        await asyncio.to_thread(sms.send, "A man in an endless house of statues.")
         return AgentOutcome(kind="replied", message="A man in an endless house of statues.")
 
-    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    _agent(monkeypatch, fake_run_agent)
     thread = await ctx["threads"].create("p1")
 
     await worker_mod.run_thread_turn(ctx, thread.id, "whats piranesi about?")
@@ -283,10 +271,10 @@ async def test_tool_calls_persist_as_a_group_above_the_reply(ctx, monkeypatch):
     async def fake_run_agent(raw_query, phone, settings, sms, **kw):
         await sms.emit_async("progress", {"stage": "searching", "text": "Searching…"})
         await sms.emit_async("progress", {"stage": "searching", "text": "Found 8 copies…"})
-        await asyncio.to_thread(sms.send, phone, "Found it. Downloading now.")
+        await asyncio.to_thread(sms.send, "Found it. Downloading now.")
         return AgentOutcome(kind="replied", message="Found it. Downloading now.")
 
-    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    _agent(monkeypatch, fake_run_agent)
     thread = await ctx["threads"].create("p1")
 
     await worker_mod.run_thread_turn(ctx, thread.id, "dune")
@@ -302,10 +290,10 @@ async def test_a_repeated_narration_is_one_step(ctx, monkeypatch):
     async def fake_run_agent(raw_query, phone, settings, sms, **kw):
         for _ in range(3):
             await sms.emit_async("progress", {"text": "Checking who's sharing it…"})
-        await asyncio.to_thread(sms.send, phone, "Done.")
+        await asyncio.to_thread(sms.send, "Done.")
         return AgentOutcome(kind="replied", message="Done.")
 
-    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    _agent(monkeypatch, fake_run_agent)
     thread = await ctx["threads"].create("p1")
 
     await worker_mod.run_thread_turn(ctx, thread.id, "dune")
@@ -318,12 +306,12 @@ async def test_text_between_tool_calls_starts_a_new_group(ctx, monkeypatch):
     """The chain-of-thought boundary rule: assistant text breaks the run."""
     async def fake_run_agent(raw_query, phone, settings, sms, **kw):
         await sms.emit_async("progress", {"text": "Searching…"})
-        await asyncio.to_thread(sms.send, phone, "Two versions of this one.")
+        await asyncio.to_thread(sms.send, "Two versions of this one.")
         await sms.emit_async("progress", {"text": "Checking the covers…"})
-        await asyncio.to_thread(sms.send, phone, "Got it.")
+        await asyncio.to_thread(sms.send, "Got it.")
         return AgentOutcome(kind="replied", message="Got it.")
 
-    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    _agent(monkeypatch, fake_run_agent)
     thread = await ctx["threads"].create("p1")
 
     await worker_mod.run_thread_turn(ctx, thread.id, "dune")
@@ -346,7 +334,7 @@ async def test_steps_land_above_the_options_they_produced(ctx, monkeypatch):
         return AgentOutcome(kind="asked", message="Which?", options=[{"title": "A"}])
 
     monkeypatch.setattr(worker_mod, "find_card", lambda t, a: None)
-    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    _agent(monkeypatch, fake_run_agent)
     thread = await ctx["threads"].create("p1")
 
     await worker_mod.run_thread_turn(ctx, thread.id, "dune")
@@ -360,7 +348,7 @@ async def test_a_crash_still_shows_how_far_it_got(ctx, monkeypatch):
         await sms.emit_async("progress", {"text": "Searching…"})
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    _agent(monkeypatch, fake_run_agent)
     thread = await ctx["threads"].create("p1")
 
     await worker_mod.run_thread_turn(ctx, thread.id, "dune")
@@ -382,10 +370,7 @@ async def test_options_carry_what_the_expanded_view_needs(ctx, monkeypatch):
             rating_count=9100, runtime_min=395, year=2020,
         ),
     )
-    monkeypatch.setattr(
-        worker_mod,
-        "run_agent",
-        _agent_returning(
+    _agent(monkeypatch, _agent_returning(
             AgentOutcome(kind="asked", message="Which?", options=[{"title": "Piranesi"}])
         ),
     )
@@ -408,10 +393,7 @@ async def test_the_download_card_gets_the_cover_they_chose(ctx, monkeypatch):
         pass
 
     monkeypatch.setattr(worker_mod, "finish_agent_outcome", fake_finish)
-    monkeypatch.setattr(
-        worker_mod,
-        "run_agent",
-        _agent_returning(AgentOutcome(kind="committed", title="Dune", author="Frank Herbert")),
+    _agent(monkeypatch, _agent_returning(AgentOutcome(kind="committed", title="Dune", author="Frank Herbert")),
     )
     thread = await ctx["threads"].create("p1")
 
@@ -431,10 +413,7 @@ async def test_a_download_with_no_chosen_row_still_finds_a_cover(ctx, monkeypatc
     monkeypatch.setattr(
         worker_mod, "find_cover_url", lambda title, author: "https://img/looked-up.jpg"
     )
-    monkeypatch.setattr(
-        worker_mod,
-        "run_agent",
-        _agent_returning(AgentOutcome(kind="committed", title="Dune", author="Frank Herbert")),
+    _agent(monkeypatch, _agent_returning(AgentOutcome(kind="committed", title="Dune", author="Frank Herbert")),
     )
     thread = await ctx["threads"].create("p1")
 
@@ -455,10 +434,7 @@ async def test_one_lookup_per_book_not_per_option(ctx, monkeypatch):
         return BookCard(title=title, author=author, rating=4.5)
 
     monkeypatch.setattr(worker_mod, "find_card", _spy)
-    monkeypatch.setattr(
-        worker_mod,
-        "run_agent",
-        _agent_returning(
+    _agent(monkeypatch, _agent_returning(
             AgentOutcome(
                 kind="asked",
                 message="Which narrator?",
@@ -487,7 +463,7 @@ async def test_a_failed_search_after_narration_still_answers(ctx, monkeypatch):
         await sms.emit_async("progress", {"text": "Searching…"})
         return AgentOutcome(kind="no_results", message="I couldn't find that one.")
 
-    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    _agent(monkeypatch, fake_run_agent)
     thread = await ctx["threads"].create("p1")
 
     await worker_mod.run_thread_turn(ctx, thread.id, "dune")
@@ -501,10 +477,10 @@ async def test_a_crash_after_the_agent_spoke_still_answers(ctx, monkeypatch):
     """Running out of turns mid-search: what the agent said was narration
     ("Let me check the omnibus"), not an answer."""
     async def fake_run_agent(raw_query, phone, settings, sms, **kw):
-        await asyncio.to_thread(sms.send, phone, "Let me check the omnibus.")
+        await asyncio.to_thread(sms.send, "Let me check the omnibus.")
         return AgentOutcome(kind="error", crashed=True, message="Try the exact title.")
 
-    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    _agent(monkeypatch, fake_run_agent)
     thread = await ctx["threads"].create("p1")
 
     await worker_mod.run_thread_turn(ctx, thread.id, "dune")
@@ -522,14 +498,14 @@ async def test_running_steps_are_in_the_snapshot_until_the_turn_ends(ctx, monkey
         await sms.emit_async("progress", {"text": "Searching…"})
         await sms.emit_async("progress", {"text": "Found 8 copies…"})
         seen["mid"] = [s.text for s in await ctx["threads"].live_steps(thread.id)]
-        await asyncio.to_thread(sms.send, phone, "Two editions.")
+        await asyncio.to_thread(sms.send, "Two editions.")
         await sms.drain()
         seen["after_reply"] = await ctx["threads"].live_steps(thread.id)
         await sms.emit_async("progress", {"text": "Checking covers…"})
         seen["next_group"] = [s.text for s in await ctx["threads"].live_steps(thread.id)]
         return AgentOutcome(kind="replied", message="Two editions.")
 
-    monkeypatch.setattr(worker_mod, "run_agent", fake_run_agent)
+    _agent(monkeypatch, fake_run_agent)
     thread = await ctx["threads"].create("p1")
 
     await worker_mod.run_thread_turn(ctx, thread.id, "dune")

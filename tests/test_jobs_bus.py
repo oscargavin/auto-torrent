@@ -23,8 +23,9 @@ async def test_emit_writes_to_stream(redis, log):
 
 async def test_send_emits_progress(log):
     bus = StreamEventBus("j1", log)
-    await bus.send_async("ignored", "downloading 50%")
-    assert bus.messaged is True
+    await bus.send_async("downloading 50%")
+    _, fields = (await bus._log._r.xrange("job:j1:events"))[0]
+    assert fields["type"] == "progress"
 
 
 async def test_sync_emit_from_thread_uses_loop_bridge(log):
@@ -36,5 +37,4 @@ async def test_sync_emit_from_thread_uses_loop_bridge(log):
     bus = StreamEventBus("j1", log)
     assert callable(bus.emit)
     assert callable(bus.send)
-    assert callable(bus.system_progress)
     assert callable(bus.close)

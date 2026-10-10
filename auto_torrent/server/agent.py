@@ -3,7 +3,8 @@
 
 An `AgentSession` is one conversation: a claude CLI kept open between turns, so
 a follow-up skips the 3-4 s start-up and the agent still has the results it saw
-last turn. Each turn ends via `commit_download`, `ask_user_to_pick` or `reply`.
+last turn. A turn ends with `commit_download`, `ask_user_to_pick`, or the
+agent's own final text, which is its reply.
 The deterministic poll/organise/scan layer lives in worker.py.
 """
 
@@ -12,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field, replace
 from typing import Awaitable, Callable, Literal
@@ -24,7 +26,6 @@ from claude_agent_sdk import (
     TextBlock,
     ToolUseBlock,
     create_sdk_mcp_server,
-    query,
     tool,
 )
 
@@ -34,14 +35,14 @@ from ..cli import (
     _execute_download_bg,
     _fan_out_search,
     _probe_seeds_batch,
-    _read_state,
-    _resolve_status,
 )
 from ..config import MIN_SCORE, get_proxy
 from ..openlibrary import lookup_book
 from ..scoring import quick_score, score_and_sort
-from ..types import BookMetadata, ScoredResult, SearchResult
+from ..types import BookMetadata, ScoredResult
+from .covers import item_title_author
 from .event_types import EVENT_PROGRESS, STAGE_FOUND, STAGE_SEARCHING
+from .library_match import find_existing, normalise_title
 from .settings import Settings
 from .vision import analyze_cover as _analyze_cover
 
@@ -71,7 +72,7 @@ Tools:
 - search_audiobookbay(query, limit=5, title, author): returns ranked ABB results, already checked and scored. Once you know the book, pass its exact `title` and `author` too — the search then looks for that book rather than guessing from the query.
 - analyze_cover(cover_url): vision OCR. Returns {title, author, narrator} ONLY for what's printed on the image. Use to confirm narrator when the result's narrator field is empty.
 - probe_peers(magnets): live seeder counts for one or more magnets, checked together. Pass every candidate you are weighing in ONE call rather than one call each.
-- say(text): one short line to the user, without ending the turn.
+- say(text): one short line to the user mid-turn, before a long step. Your final message is your reply; you do not need a tool to answer.
 - ask_user_to_pick(options): numbered list, ends the turn. Each option: {label, magnet, title, author, narrator}. Use only when truly ambiguous.
 - commit_download(primary, fallbacks): start the download and end. primary/fallbacks: {magnet, title, author, narrator, format}. Put narrator and format on `primary` whenever you know them — the user sees them and that is how they catch a wrong pick. Include 1–2 fallbacks whenever you have viable alternates; the polling layer uses them if the primary stalls.
 
@@ -107,17 +108,17 @@ a similar name. "Some Sort of Justice" is not "Ancillary Justice", and a book
 by another author is a miss even when the title matches. When you are not sure
 a result is their book, ask.
 
-CHECK THE SHELF BEFORE EVERY DOWNLOAD.
-Before commit_download, run search_library for the book (and for the series,
-when they asked for a trilogy or a set). If they already own it — including
-every book of a set they asked for as one — do not download it. Reply that
-they have it, and with whom as narrator.
+THE SHELF. commit_download refuses a book they already own, including a set
+whose books are all on the shelf, and tells you what they have: tell them, with
+the narrator. Pass `force: true` only when they asked for another copy on
+purpose (a different narrator or edition).
 
 WHEN NOTHING MATCHES.
-- reply: Couldn't find <what they asked for> on the site. Name any other books
+- Say you couldn't find <what they asked for> on the site. Name any other books
   by the author that are there, and offer to watch for it: "Want me to watch for
-  it? I'll grab it when it turns up."
-- If they say yes, call watch_for, then reply in one line.
+  it? I'll grab it when it turns up." Ask this in your own words, not with
+  ask_user_to_pick: a tap on a card would search again rather than watch.
+- If they say yes, call watch_for, then confirm in one line.
 - Then end without committing.
 
 DOWNLOADS. Each past download appears in the conversation as a "[download]"
@@ -133,8 +134,8 @@ Pending options:
 ANSWERING RATHER THAN FETCHING.
 Not every message is a request for a book. "What's Piranesi about?", "who
 narrates it?", "which of those is shortest?", "do I already have Mistborn?",
-"why that one?" — these want an answer, not a download. Use `reply` for them:
-say the thing, in a sentence or two, and end. Never run a search to answer a
+"why that one?" — these want an answer, not a download. Answer in a sentence
+or two as your final message, and end. Never run a search to answer a
 question you already know the answer to, and never fall back to "couldn't find
 that one" when they didn't ask you to find anything.
 
@@ -237,15 +238,32 @@ LIBRARY_MATCH_LIMIT = 25
 def _library_row(item: dict) -> dict:
     media = item.get("media") or {}
     meta = media.get("metadata") or {}
+    title, author = item_title_author(item)
     return {
         "id": item.get("id", ""),
-        "title": meta.get("title") or "",
-        "author": meta.get("authorName") or "",
+        "title": title,
+        "author": author,
         "narrator": meta.get("narratorName") or "",
         "series": meta.get("seriesName") or "",
         "hours": round((media.get("duration") or 0) / 3600, 1),
         "year": meta.get("publishedYear") or "",
     }
+
+
+# The agent checks the shelf before every download and every suggestion list,
+# and each call fetched the whole library (up to 500 items).
+LIBRARY_CACHE_S = 60.0
+_library_cache: tuple[float, list[dict]] | None = None
+
+
+async def _library_items(settings: Settings) -> list[dict]:
+    global _library_cache
+    from .audiobookshelf import ABSClient
+
+    now = time.monotonic()
+    if _library_cache is None or now - _library_cache[0] > LIBRARY_CACHE_S:
+        _library_cache = (now, await ABSClient(settings).list_items(settings.abs_library_id))
+    return _library_cache[1]
 
 
 async def _search_library(settings: Settings, query: str) -> list[dict]:
@@ -259,9 +277,7 @@ async def _search_library(settings: Settings, query: str) -> list[dict]:
     This one answers questions, where a near-miss in the list is useful and a
     miss is not.
     """
-    from .audiobookshelf import ABSClient
-
-    items = await ABSClient(settings).list_items(settings.abs_library_id)
+    items = await _library_items(settings)
     needle = query.casefold().strip()
     out: list[dict] = []
     for item in items:
@@ -272,6 +288,40 @@ async def _search_library(settings: Settings, query: str) -> list[dict]:
             if len(out) >= LIBRARY_MATCH_LIMIT:
                 break
     return out
+
+
+# Words that make a title name a set rather than one book.
+_SET_WORDS = re.compile(
+    r"\b(the\s+)?(complete\s+)?(trilogy|series|saga|omnibus|collection|box\s*set|books?\s*\d+\s*-\s*\d+)\b",
+    re.I,
+)
+
+
+async def _owned(settings: Settings, title: str, author: str) -> list[dict]:
+    """The shelf's copies of a book, or of every book in a set, or [].
+
+    A guard rather than a prompt rule: the agent was told to check the shelf
+    first and still started "The Tawny Man Trilogy" with all three books
+    already there. One book counts when the title matches; a set counts when at
+    least two owned books carry its name.
+    """
+    try:
+        items = await _library_items(settings)
+    except Exception:  # noqa: BLE001
+        logger.warning("shelf check failed; allowing the download", exc_info=True)
+        return []
+    match = find_existing(items, title, author)
+    if match is not None:
+        return [_library_row(match)]
+    core = normalise_title(_SET_WORDS.sub(" ", title))
+    if not _SET_WORDS.search(title) or len(core) < 4:
+        return []
+    rows = [_library_row(i) for i in items]
+    in_set = [
+        r for r in rows
+        if core in normalise_title(r["title"]) or core in normalise_title(r["series"])
+    ]
+    return in_set if len(in_set) >= 2 else []
 
 
 async def _inspect_book(settings: Settings, item_id: str) -> dict:
@@ -396,7 +446,7 @@ def _search_pipeline_sync(
     # The agent has already worked out which book it wants, and it is usually
     # right where the catalogue lookup guesses: "Dune Frank Herbert" resolved to
     # Dune Messiah, and a whole search round went on the wrong book.
-    if title and _norm(book.title) != _norm(title):
+    if title and normalise_title(book.title) != normalise_title(title):
         book = BookMetadata(title=title, author=author or "")
     elif title and author and not book.author:
         book = replace(book, author=author)
@@ -440,10 +490,6 @@ def _search_pipeline_sync(
         "book": _book_to_dict(book),
         "results": [_scored_to_payload(s, i) for i, s in enumerate(scored)],
     }
-
-
-def _norm(text: str) -> str:
-    return " ".join("".join(c for c in text.casefold() if c.isalnum() or c.isspace()).split())
 
 
 def _book_to_dict(book: BookMetadata) -> dict:
@@ -490,6 +536,11 @@ def _narrate(sink: object, stage: str, text: str) -> None:
 SESSION_MAX_TURNS = 8
 
 
+def _out(value) -> dict:
+    """A tool result: text as given, anything else as JSON."""
+    return {"content": [{"type": "text", "text": value if isinstance(value, str) else json.dumps(value)}]}
+
+
 def _build_tools(t: "AgentSession") -> list:
     """The agent's tools, bound once per session. Per-turn state lives on `t`
     and is reset by `AgentSession.turn`, so the same tools serve every turn."""
@@ -528,16 +579,9 @@ def _build_tools(t: "AgentSession") -> list:
         one anyway, and the user was shown a question that had already been
         answered for them by a download they never chose.
         """
-        if t.state["outcome"] is None:
+        if t.outcome is None:
             return None
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": "this turn has already ended; stop calling tools",
-                }
-            ]
-        }
+        return _out("this turn has already ended; stop calling tools")
 
     @tool(
         name="search_audiobookbay",
@@ -566,14 +610,14 @@ def _build_tools(t: "AgentSession") -> list:
         # for the same answer. Observed live: the same query three times.
         key = (query_text.casefold().strip(), limit, title.casefold(), author.casefold())
         if key in t.search_cache:
-            return {"content": [{"type": "text", "text": t.search_cache[key]}]}
+            return _out(t.search_cache[key])
         t.search_attempts += 1
         try:
             data = await asyncio.to_thread(
                 _search_pipeline_sync,
                 query_text,
                 limit,
-                lambda msg: _narrate(t.sms, STAGE_SEARCHING, msg),
+                lambda msg: _narrate(t.sink, STAGE_SEARCHING, msg),
                 t.search_attempts,
                 title,
                 author,
@@ -581,10 +625,10 @@ def _build_tools(t: "AgentSession") -> list:
             text = json.dumps(data)
             t.search_cache[key] = text
             _prefetch_peers(data)
-            return {"content": [{"type": "text", "text": text}]}
+            return _out(text)
         except Exception as e:
             logger.exception("search tool failed")
-            return {"content": [{"type": "text", "text": json.dumps({"error": f"{type(e).__name__}: {e}"})}]}
+            return _out({"error": f"{type(e).__name__}: {e}"})
 
     @tool(
         name="analyze_cover",
@@ -592,12 +636,12 @@ def _build_tools(t: "AgentSession") -> list:
         input_schema={"cover_url": str},
     )
     async def analyze_cover(args: dict) -> dict:
-        _narrate(t.sms, STAGE_SEARCHING, "Checking the cover for the narrator…")
+        _narrate(t.sink, STAGE_SEARCHING, "Checking the cover for the narrator…")
         try:
             data = await _analyze_cover(args.get("cover_url", ""))
-            return {"content": [{"type": "text", "text": json.dumps(data)}]}
+            return _out(data)
         except Exception as e:
-            return {"content": [{"type": "text", "text": json.dumps({"error": str(e)})}]}
+            return _out({"error": str(e)})
 
     @tool(
         name="probe_peers",
@@ -617,7 +661,7 @@ def _build_tools(t: "AgentSession") -> list:
         if args.get("magnet"):
             magnets.append(args["magnet"])
         magnets = list(dict.fromkeys(magnets))[:PROBE_MAX]
-        _narrate(t.sms, STAGE_SEARCHING, "Checking who's sharing it…")
+        _narrate(t.sink, STAGE_SEARCHING, "Checking who's sharing it…")
         try:
             # settle_s: the probe stops when the first magnet shows a peer, so
             # the others would read 0 when compared. It waits a few seconds
@@ -628,9 +672,9 @@ def _build_tools(t: "AgentSession") -> list:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
             counts = await _probe(magnets, PROBE_SETTLE_S if len(magnets) > 1 else None)
-            return {"content": [{"type": "text", "text": json.dumps({"peers": counts})}]}
+            return _out({"peers": counts})
         except Exception as e:
-            return {"content": [{"type": "text", "text": json.dumps({"error": str(e), "peers": {}})}]}
+            return _out({"error": str(e), "peers": {}})
 
     @tool(
         name="say",
@@ -640,13 +684,12 @@ def _build_tools(t: "AgentSession") -> list:
     async def say(args: dict) -> dict:
         text = (args.get("text") or "").strip()
         if not text:
-            return {"content": [{"type": "text", "text": "ignored: empty"}]}
+            return _out("ignored: empty")
         try:
-            await asyncio.to_thread(t.sms.send, t.phone, text)
-            t.state["spoke"] = True
-            return {"content": [{"type": "text", "text": "sent"}]}
+            t.sink.send(text)
+            return _out("sent")
         except Exception as e:
-            return {"content": [{"type": "text", "text": f"error: {e}"}]}
+            return _out(f"error: {e}")
 
     @tool(
         name="ask_user_to_pick",
@@ -669,7 +712,7 @@ def _build_tools(t: "AgentSession") -> list:
             return ended
         options = args.get("options") or []
         if not options:
-            return {"content": [{"type": "text", "text": "error: no options"}]}
+            return _out("error: no options")
         # Carried on the tool call rather than left to a preceding send_sms.
         # Observed live: the agent asked with no preamble at all, so the user
         # got a bare list of near-identical rows and no reason for the question.
@@ -682,31 +725,8 @@ def _build_tools(t: "AgentSession") -> list:
 
         # Shown as tappable cards; the magnets stay on the server.
         await t.on_ask(question, kind, options)
-        t.state["outcome"] = AgentOutcome(kind="asked", options=options)
-        return {"content": [{"type": "text", "text": "asked user; conversation ended"}]}
-
-    @tool(
-        name="reply",
-        description=(
-            "Answer the user and end the turn. Use whenever they asked something "
-            "rather than asked for something — what a book is about, who narrates "
-            "it, what you'd recommend and why, or a follow-up to your own last "
-            "message. Do NOT search first; answer from what you know."
-        ),
-        input_schema={"text": str},
-    )
-    async def reply(args: dict) -> dict:
-        if (ended := _already_ended()) is not None:
-            return ended
-        text = (args.get("text") or "").strip()
-        if not text:
-            return {"content": [{"type": "text", "text": "error: empty reply"}]}
-        try:
-            await asyncio.to_thread(t.sms.send, t.phone, text)
-        except Exception as e:  # noqa: BLE001
-            return {"content": [{"type": "text", "text": f"error: {e}"}]}
-        t.state["outcome"] = AgentOutcome(kind="replied", message=text)
-        return {"content": [{"type": "text", "text": "replied; conversation ended"}]}
+        t.outcome = AgentOutcome(kind="asked", options=options)
+        return _out("asked user; conversation ended")
 
     @tool(
         name="search_library",
@@ -721,7 +741,7 @@ def _build_tools(t: "AgentSession") -> list:
     async def search_library(args: dict) -> dict:
         query = (args.get("query") or "").strip()
         if not query:
-            return {"content": [{"type": "text", "text": json.dumps({"matches": []})}]}
+            return _out({"matches": []})
         try:
             matches = await _search_library(t.settings, query)
         except Exception as e:  # noqa: BLE001
@@ -729,12 +749,8 @@ def _build_tools(t: "AgentSession") -> list:
             # answer degrades to "I can't see your shelf right now", which is
             # far better than the whole request erroring.
             logger.warning("library search failed: %r", e)
-            return {
-                "content": [
-                    {"type": "text", "text": json.dumps({"error": "library unavailable"})}
-                ]
-            }
-        return {"content": [{"type": "text", "text": json.dumps({"matches": matches})}]}
+            return _out({"error": "library unavailable"})
+        return _out({"matches": matches})
 
     @tool(
         name="inspect_book",
@@ -749,14 +765,14 @@ def _build_tools(t: "AgentSession") -> list:
     async def inspect_book(args: dict) -> dict:
         item_id = (args.get("item_id") or "").strip()
         if not item_id:
-            return {"content": [{"type": "text", "text": "error: item_id required"}]}
-        _narrate(t.sms, STAGE_SEARCHING, "Looking at your copy…")
+            return _out("error: item_id required")
+        _narrate(t.sink, STAGE_SEARCHING, "Looking at your copy…")
         try:
             book = await _inspect_book(t.settings, item_id)
         except Exception as e:  # noqa: BLE001
             logger.warning("inspect_book failed: %r", e)
-            return {"content": [{"type": "text", "text": json.dumps({"error": "book unavailable"})}]}
-        return {"content": [{"type": "text", "text": json.dumps(book)}]}
+            return _out({"error": "book unavailable"})
+        return _out(book)
 
     @tool(
         name="check_downloads",
@@ -770,13 +786,13 @@ def _build_tools(t: "AgentSession") -> list:
     )
     async def check_downloads(args: dict) -> dict:
         if t.downloads is None:
-            return {"content": [{"type": "text", "text": json.dumps({"error": "not available"})}]}
+            return _out({"error": "not available"})
         try:
             data = await t.downloads()
         except Exception as e:  # noqa: BLE001
             logger.warning("check_downloads failed: %r", e)
-            return {"content": [{"type": "text", "text": json.dumps({"error": "downloads unavailable"})}]}
-        return {"content": [{"type": "text", "text": json.dumps(data)}]}
+            return _out({"error": "downloads unavailable"})
+        return _out(data)
 
     @tool(
         name="watch_for",
@@ -798,24 +814,43 @@ def _build_tools(t: "AgentSession") -> list:
     async def watch_for(args: dict) -> dict:
         title = (args.get("title") or "").strip()
         if not title or t.on_watch is None:
-            return {"content": [{"type": "text", "text": json.dumps({"error": "cannot watch"})}]}
+            return _out({"error": "cannot watch"})
         try:
             wish = await t.on_watch(title, (args.get("author") or "").strip(), (args.get("note") or "").strip())
         except Exception as e:  # noqa: BLE001
             logger.warning("watch_for failed: %r", e)
-            return {"content": [{"type": "text", "text": json.dumps({"error": "could not save"})}]}
-        return {"content": [{"type": "text", "text": json.dumps({"watching": wish})}]}
+            return _out({"error": "could not save"})
+        return _out({"watching": wish})
 
     @tool(
         name="commit_download",
         description="Start the BG download. `primary` and each `fallbacks` entry: {magnet, title, author, narrator, format}. Include narrator and format on `primary` whenever the search result or analyze_cover gave them — they're shown to the user so they can see which edition was chosen. ALWAYS include 1-2 fallbacks when you have viable alternates — the polling layer uses them if the primary stalls.",
-        input_schema={"primary": dict, "fallbacks": list},
+        input_schema={
+            "type": "object",
+            "properties": {
+                "primary": {"type": "object"},
+                "fallbacks": {"type": "array"},
+                "force": {
+                    "type": "boolean",
+                    "description": "Only when they asked for another copy of a book they own.",
+                },
+            },
+            "required": ["primary"],
+        },
     )
     async def commit_download(args: dict) -> dict:
         if (ended := _already_ended()) is not None:
             return ended
         primary = args.get("primary") or {}
         fallbacks = args.get("fallbacks") or []
+        if not args.get("force"):
+            owned = await _owned(t.settings, primary.get("title") or "", primary.get("author") or "")
+            if owned:
+                return _out({
+                    "refused": "already on the shelf; nothing downloaded",
+                    "owned": owned,
+                    "next": "Tell them they have it, with the narrator. Pass force only if they want another copy.",
+                })
 
         magnet = primary.get("magnet")
         title = primary.get("title") or "Unknown"
@@ -823,15 +858,15 @@ def _build_tools(t: "AgentSession") -> list:
         narrator = primary.get("narrator") or ""
         file_format = primary.get("format") or ""
         if not magnet:
-            return {"content": [{"type": "text", "text": "error: primary.magnet required"}]}
+            return _out("error: primary.magnet required")
 
         bg_title = f"{title} - {author}" if author else title
-        _narrate(t.sms, STAGE_FOUND, f"Starting “{title}”…")
+        _narrate(t.sink, STAGE_FOUND, f"Starting “{title}”…")
         try:
             download = await asyncio.to_thread(_execute_download_bg, bg_title, magnet, None)
         except Exception as e:
             logger.exception("commit_download failed to start BG process")
-            return {"content": [{"type": "text", "text": f"error: {e}"}]}
+            return _out(f"error: {e}")
 
         clean_fallbacks = [
             {
@@ -844,7 +879,7 @@ def _build_tools(t: "AgentSession") -> list:
         ]
 
         display = f"“{title}”" + (f" by {author}" if author else "")
-        t.state["outcome"] = AgentOutcome(
+        t.outcome = AgentOutcome(
             kind="committed",
             download=download,
             fallbacks=clean_fallbacks,
@@ -854,7 +889,7 @@ def _build_tools(t: "AgentSession") -> list:
             narrator=narrator,
             file_format=file_format,
         )
-        return {"content": [{"type": "text", "text": json.dumps({"id": download.get("id"), "started": True})}]}
+        return _out({"id": download.get("id"), "started": True})
 
     return [
         search_audiobookbay,
@@ -862,7 +897,6 @@ def _build_tools(t: "AgentSession") -> list:
         probe_peers,
         say,
         ask_user_to_pick,
-        reply,
         search_library,
         inspect_book,
         check_downloads,
@@ -871,12 +905,12 @@ def _build_tools(t: "AgentSession") -> list:
     ]
 
 
-def _options() -> ClaudeAgentOptions:
+def _options(tools: list) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(
         model=AGENT_MODEL,
         max_turns=AGENT_MAX_TURNS,
         system_prompt=SYSTEM_PROMPT + APP_ASK_CLAUSE,
-        allowed_tools=[f"mcp__atb__{name}" for name in TOOL_NAMES],
+        allowed_tools=[f"mcp__atb__{tool.name}" for tool in tools],
         # No built-in Claude Code tools (Bash, Read, …): the agent only uses its
         # own, and their definitions were in every request.
         tools=[],
@@ -887,21 +921,6 @@ def _options() -> ClaudeAgentOptions:
         # for details"), and an auth failure looks like any other.
         stderr=lambda line: logger.warning("claude cli: %s", line.rstrip()),
     )
-
-
-TOOL_NAMES = (
-    "search_audiobookbay",
-    "analyze_cover",
-    "probe_peers",
-    "say",
-    "ask_user_to_pick",
-    "reply",
-    "search_library",
-    "inspect_book",
-    "check_downloads",
-    "watch_for",
-    "commit_download",
-)
 
 
 class AgentSession:
@@ -924,54 +943,62 @@ class AgentSession:
         # One probe at a time: each opens a libtorrent session on one port.
         self.probe_lock = asyncio.Lock()
         self.probing: dict[str, asyncio.Task] = {}
-        self._new_turn("", "", None, None, None)
+        self._new_turn("", None, None, None)
+        # What the worker last told this session about the conversation: the
+        # message ids it has seen and each download's last reported state. The
+        # next turn is told only what changed since.
+        self.seen_ids: set[str] = set()
+        self.job_states: dict[str, str] = {}
         self._client: ClaudeSDKClient | None = None
         # One turn at a time. Two turns raced on one session in a live test:
         # the second found the CLI still connecting and crashed.
         self._lock = asyncio.Lock()
-        self._server = create_sdk_mcp_server(name="atb", tools=_build_tools(self))
+        self._tools = _build_tools(self)
+        self._server = create_sdk_mcp_server(name="atb", tools=self._tools)
 
     def _new_turn(
-        self, raw_query, phone, settings, sms, on_ask, downloads=None, on_watch=None
+        self, raw_query, settings, sink, on_ask, downloads=None, on_watch=None
     ) -> None:
         self.downloads = downloads
         self.on_watch = on_watch
         self.raw_query = raw_query
-        self.phone = phone
         self.settings = settings
-        self.sms = sms
+        self.sink = sink
         self.on_ask = on_ask
-        self.state: dict = {"outcome": None, "spoke": False}
+        self.outcome: AgentOutcome | None = None
         # The round number lets repeated searches say "Searching again".
         self.search_attempts = 0
 
     async def turn(
         self,
         raw_query: str,
-        phone: str,
         settings: Settings,
-        sms,
+        sink,
         *,
         on_ask: Callable[[str, str, list[dict]], Awaitable[None]],
         pending_options: list[dict] | None = None,
         history: list[tuple[str, str]] | None = None,
         downloads: Callable[[], Awaitable[dict]] | None = None,
         on_watch: Callable[[str, str, str], Awaitable[dict]] | None = None,
+        event: str | None = None,
     ) -> AgentOutcome:
-        """Run one request. `history` is used only on the session's first turn:
-        after that the session remembers the conversation itself."""
+        """Run one request, or react to `event` (something that happened, not
+        something the user said). `history` is the conversation so far on a
+        fresh session, and what changed since the last turn on an open one."""
         self.last_used = time.monotonic()
         async with self._lock:
-            self._new_turn(raw_query, phone, settings, sms, on_ask, downloads, on_watch)
-            prompt = _prompt(raw_query, pending_options, history if self.turns == 0 else None)
+            self._new_turn(raw_query, settings, sink, on_ask, downloads, on_watch)
+            prompt = _prompt(raw_query, pending_options, history, event, fresh=self.turns == 0)
             self.turns += 1
             try:
                 return await self._run(prompt)
             finally:
                 self.last_used = time.monotonic()
+                # Drop this turn's sink and callbacks: they hold the worker's
+                # context, and the session idles for up to 15 minutes.
+                self._new_turn("", None, None, None)
 
     async def _run(self, prompt: str) -> AgentOutcome:
-        state = self.state
         # The SDK reports running out of turns as a result message, then raises
         # the same bare "exit code 1" as a dead CLI. Remembered so the two get
         # different sentences.
@@ -980,7 +1007,7 @@ class AgentSession:
         final_text = ""
         try:
             if self._client is None:
-                options = _options()
+                options = _options(self._tools)
                 options.mcp_servers = {"atb": self._server}
                 client = ClaudeSDKClient(options=options)
                 await client.connect()
@@ -997,11 +1024,11 @@ class AgentSession:
                             final_text = block.text.strip()
         except Exception:
             self.broken = True
-            if state["outcome"] is not None:
+            if self.outcome is not None:
                 # A tool had already settled the turn; the CLI dying afterwards
                 # changes nothing the user needs to hear about.
                 logger.warning("agent loop ended with an error after the outcome was set")
-                return state["outcome"]
+                return self.outcome
             if ran_out:
                 return _out_of_turns()
             # Typically the claude CLI dying — an expired subscription token
@@ -1013,23 +1040,20 @@ class AgentSession:
                 message="Couldn't reach the book finder just now. Try again shortly.",
             )
 
-        if state["outcome"] is not None:
-            return state["outcome"]
+        if self.outcome is not None:
+            return self.outcome
         if ran_out:
             # The session survives this, but its context is the long search
             # that ran out, which is no help to the next turn.
             self.broken = True
             return _out_of_turns()
 
-        # The agent sometimes answers a question in plain text instead of
-        # calling `reply`. Observed live on "What is Piranesi about?": a good
-        # answer, which the user never saw — they got "Couldn't find that one".
-        if final_text and not state["spoke"]:
-            try:
-                await asyncio.to_thread(self.sms.send, self.phone, final_text)
-                return AgentOutcome(kind="replied", message=final_text)
-            except Exception:  # noqa: BLE001
-                logger.exception("sending the agent's final text failed")
+        # The agent's last words are its reply. A separate `reply` tool made
+        # this a fallback, and the agent often skipped the tool: a good answer
+        # to "What is Piranesi about?" never reached the user.
+        if final_text:
+            self.sink.send(final_text)
+            return AgentOutcome(kind="replied", message=final_text)
 
         # Reached when the agent stops without committing — overwhelmingly "no
         # match found". The message is user-visible, so it reads as an
@@ -1065,14 +1089,21 @@ def _prompt(
     raw_query: str,
     pending_options: list[dict] | None,
     history: list[tuple[str, str]] | None,
+    event: str | None = None,
+    *,
+    fresh: bool = True,
 ) -> str:
     parts: list[str] = []
     if history:
         # Oldest first, so the last line before the new request is the most
         # recent thing that happened — which is what a follow-up refers to.
         rendered = "\n".join(f"{role}: {text}" for role, text in history)
-        parts.append(f"Earlier in this conversation:\n{rendered}\n")
-    parts.append(f"User said: {raw_query!r}")
+        heading = "Earlier in this conversation:" if fresh else "Since your last message:"
+        parts.append(f"{heading}\n{rendered}\n")
+    if event:
+        parts.append(f"Something happened (this is not the user speaking): {event}")
+    else:
+        parts.append(f"User said: {raw_query!r}")
     if pending_options:
         formatted = "\n".join(
             f"{i+1}. {o.get('title','?')} (narrator: {o.get('narrator','?')}, author: {o.get('author','?')})"
@@ -1080,45 +1111,9 @@ def _prompt(
         )
         parts.append(f"\nPending options from earlier conversation (still valid):\n{formatted}")
     parts.append(
-        "\nResolve this. Use tools as needed. End via commit_download, ask_user_to_pick or reply."
+        "\nResolve this. Use tools as needed. End with commit_download, ask_user_to_pick, or your answer."
     )
     return "\n".join(parts)
 
 
-async def run_agent(
-    raw_query: str,
-    phone: str,
-    settings: Settings,
-    sms,
-    pending_options: list[dict] | None = None,
-    on_ask: Callable[[str, str, list[dict]], Awaitable[None]] | None = None,
-    history: list[tuple[str, str]] | None = None,
-    session: AgentSession | None = None,
-    downloads: Callable[[], Awaitable[dict]] | None = None,
-    on_watch: Callable[[str, str, str], Awaitable[dict]] | None = None,
-) -> AgentOutcome:
-    """Run one request, in `session` if given, else in a session of its own."""
-    own = session is None
-    session = session or AgentSession()
-    try:
-        return await session.turn(
-            raw_query,
-            phone,
-            settings,
-            sms,
-            on_ask=on_ask or _cannot_ask,
-            pending_options=pending_options,
-            history=history,
-            downloads=downloads,
-            on_watch=on_watch,
-        )
-    finally:
-        if own:
-            await session.close()
-
-
-async def _cannot_ask(*_a) -> None:
-    raise RuntimeError("this caller cannot ask the user anything")
-
-
-__all__ = ["run_agent", "AgentOutcome", "AgentSession"]
+__all__ = ["AgentOutcome", "AgentSession"]

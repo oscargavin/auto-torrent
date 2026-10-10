@@ -85,8 +85,8 @@ class TestCheckNewPosts:
 
     @pytest.fixture
     def enqueue(self, enqueued):
-        async def enqueue_turn(thread_id, text, pending):
-            enqueued.append((thread_id, text, pending))
+        async def enqueue_turn(thread_id, text, pending, event=None):
+            enqueued.append((thread_id, text, pending, event))
         return enqueue_turn
 
     async def test_a_match_starts_a_turn_on_the_latest_thread(self, redis, threads, enqueue, enqueued):
@@ -96,10 +96,12 @@ class TestCheckNewPosts:
 
         assert await wishlist.check_new_posts(redis, threads, enqueue, [OTHER, SONGBIRD]) == 1
 
-        [(thread_id, text, pending)] = enqueued
+        [(thread_id, text, pending, event)] = enqueued
         assert thread_id == latest.id and pending is None
-        assert text.startswith("(watchlist) Songbird by Peter Grainger just appeared")
-        assert SONGBIRD.title in text
+        # Something that happened, not words put in the user's mouth.
+        assert text == ""
+        assert event.startswith('The book they asked you to watch for, "Songbird" by Peter Grainger,')
+        assert SONGBIRD.title in event
         assert (await threads.get(latest.id)).status is ThreadStatus.working
         [note] = await threads.messages(latest.id)
         assert note.kind is MessageKind.assistant and SONGBIRD.title in note.text
@@ -138,7 +140,7 @@ class TestCheckNewPosts:
         await threads.create("p1")
         await wishlist.add(redis, "p1", "Songbird")
 
-        async def broken(thread_id, text, pending):
+        async def broken(thread_id, text, pending, event=None):
             raise ConnectionError("redis went away")
 
         assert await wishlist.check_new_posts(redis, threads, broken, [SONGBIRD]) == 0
@@ -150,4 +152,4 @@ class TestCheckNewPosts:
         await wishlist.add(redis, "a", "Songbird")
         await wishlist.add(redis, "b", "Ancillary Justice", "Ann Leckie")
         assert await wishlist.check_new_posts(redis, threads, enqueue, [SONGBIRD, OTHER]) == 2
-        assert {t for t, _, _ in enqueued} == {a.id, b.id}
+        assert {t for t, *_ in enqueued} == {a.id, b.id}

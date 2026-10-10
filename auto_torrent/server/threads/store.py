@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Final
+from typing import Awaitable, Callable, Final
 
 from redis.asyncio import Redis
+from redis.exceptions import WatchError
 
 from ..jobs.events import EventLog
 from .types import (
@@ -132,6 +133,64 @@ class ThreadStore:
             await self._r.delete(_live_key(thread_id))
         await self._log.publish(thread_id, EVENT_STATUS, {"status": status.value})
         return current.model_copy(update={"status": status, "updated_at": updated_at})
+
+    async def start_turn(
+        self,
+        thread_id: str,
+        message: Message,
+        enqueue: Callable[..., Awaitable[None]],
+        text: str,
+        pending: list[dict] | None = None,
+        event: str | None = None,
+    ) -> bool:
+        """Claim the thread for one turn, write the message that starts it, and
+        queue the turn. False when a turn is already running.
+
+        The one way a turn starts: the message route, a tapped choice and the
+        watch list all came through here as copies, and the check-then-set had
+        awaits between the two, so two quick messages could both pass it. The
+        claim is one atomic step.
+        """
+        previous = await self._claim(thread_id)
+        if previous in (None, ThreadStatus.working.value):
+            return False
+        await self._log.publish(thread_id, EVENT_STATUS, {"status": ThreadStatus.working.value})
+        if previous == ThreadStatus.awaiting_choice.value:
+            # A new turn supersedes an unanswered question: typing instead of
+            # tapping is itself an answer ("none of those").
+            await self.clear_pending(thread_id)
+        await self.append(thread_id, message)
+        try:
+            # `event` is something that happened rather than something the user
+            # said, such as a watched-for book turning up.
+            if event is None:
+                await enqueue(thread_id, text, pending)
+            else:
+                await enqueue(thread_id, text, pending, event)
+        except Exception:
+            await self.set_status(thread_id, ThreadStatus.idle)
+            raise
+        return True
+
+    async def _claim(self, thread_id: str) -> str | None:
+        """Set the status to working unless it already is, atomically (WATCH
+        aborts the write if another claim landed in between). Returns the old
+        status, or None for a missing thread."""
+        key = _thread_key(thread_id)
+        working = ThreadStatus.working.value
+        async with self._r.pipeline(transaction=True) as pipe:
+            while True:
+                try:
+                    await pipe.watch(key)
+                    old = await pipe.hget(key, "status")
+                    if old is None or old == working:
+                        return old
+                    pipe.multi()
+                    pipe.hset(key, mapping={"status": working, "updated_at": str(time.time())})
+                    await pipe.execute()
+                    return old
+                except WatchError:
+                    continue
 
     async def list_for_profile(self, profile_id: str, *, limit: int = 20) -> list[Thread]:
         ids = await self._r.zrevrange(_profile_key(profile_id), 0, limit - 1)

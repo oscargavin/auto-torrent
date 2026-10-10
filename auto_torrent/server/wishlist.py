@@ -15,16 +15,17 @@ import json
 import logging
 import re
 import time
-import unicodedata
 import uuid
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from redis.asyncio import Redis
 
 from ..types import SearchResult
+from .library_match import fold
 
 if TYPE_CHECKING:
+    from .runtime import EnqueueTurn
     from .threads.store import ThreadStore
 
 logger = logging.getLogger("atb.wishlist")
@@ -72,12 +73,9 @@ async def remove(redis: Redis, profile_id: str, wish_id: str) -> bool:
 
 
 def _words(text: str) -> list[str]:
-    """Lower-case words with accents, apostrophes, and punctuation removed, so
-    "Fool’s Errand" and "fools errand" give the same words."""
-    text = unicodedata.normalize("NFKD", text.casefold())
-    text = "".join(c for c in text if not unicodedata.combining(c))
-    text = re.sub(r"['‘’`´]", "", text)
-    return re.findall(r"[^\W_]+", text)
+    # Not `normalise`: that drops "abridged" and a leading article, and the
+    # matcher's own stop words already decide which words count.
+    return re.findall(r"[^\W_]+", fold(text))
 
 
 def _significant(words: Iterable[str]) -> set[str]:
@@ -135,14 +133,11 @@ def matches(wish: dict, post_title: str) -> bool:
 
 # ---- the nightly check ----
 
-EnqueueTurn = Callable[[str, str, "list[dict] | None"], Awaitable[None]]
-
-
-def _turn_text(wish: dict, post: SearchResult) -> str:
+def _event_text(wish: dict, post: SearchResult) -> str:
     by = f" by {wish['author']}" if wish.get("author") else ""
     return (
-        f"(watchlist) {wish['title']}{by} just appeared on the site as \"{post.title}\". "
-        "Fetch it as if they had asked for it."
+        f"The book they asked you to watch for, \"{wish['title']}\"{by}, has just "
+        f"appeared on the site as \"{post.title}\". Fetch it for them."
     )
 
 
@@ -158,7 +153,7 @@ async def check_new_posts(
     whose thread is busy, stays for the next refresh. One failing wish never
     stops the others.
     """
-    from .threads.types import Message, MessageKind, ThreadStatus
+    from .threads.types import Message, MessageKind
 
     if not posts:
         return 0
@@ -181,25 +176,16 @@ async def check_new_posts(
                     logger.info("wish %s matched %r but profile %s has no thread", wish["id"], post.title, profile_id)
                     continue
                 thread = recent[0]
-                if thread.status is ThreadStatus.working:
+                note = Message.new(
+                    thread.id,
+                    MessageKind.assistant,
+                    text=f"The book you asked me to watch for is on the site now: {post.title}. Getting it.",
+                )
+                if not await threads.start_turn(
+                    thread.id, note, enqueue_turn, "", event=_event_text(wish, post)
+                ):
                     logger.info("wish %s matched %r but thread %s is busy", wish["id"], post.title, thread.id)
                     continue
-
-                # The same steps as post_message: a new turn supersedes an
-                # unanswered question, and the thread is working from now so
-                # the user cannot start a second turn over this one.
-                if thread.status is ThreadStatus.awaiting_choice:
-                    await threads.clear_pending(thread.id)
-                await threads.append(
-                    thread.id,
-                    Message.new(
-                        thread.id,
-                        MessageKind.assistant,
-                        text=f"The book you asked me to watch for is on the site now: {post.title}. Getting it.",
-                    ),
-                )
-                await threads.set_status(thread.id, ThreadStatus.working)
-                await enqueue_turn(thread.id, _turn_text(wish, post), None)
                 await remove(redis, profile_id, wish["id"])
                 started += 1
                 logger.info("wish %s matched %r: started a turn on thread %s", wish["id"], post.title, thread.id)
@@ -211,24 +197,14 @@ async def check_new_posts(
 async def check_after_refresh(posts: list[SearchResult]) -> int:
     """check_new_posts with the server's own Redis and arq queue, for the
     nightly refresh, which runs outside the web app."""
-    from arq import create_pool
-    from arq.connections import RedisSettings
-
-    from .jobs.events import EventLog
+    from .runtime import build_stores, turn_queue
     from .settings import Settings
-    from .threads.store import ThreadStore
 
     settings = Settings()
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
-    pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+    pool, enqueue_turn = await turn_queue(settings)
     try:
-        threads = ThreadStore(
-            redis, EventLog(redis, prefix="thread"), state_ttl_s=settings.job_state_ttl_s
-        )
-
-        async def enqueue_turn(thread_id: str, text: str, pending: list[dict] | None) -> None:
-            await pool.enqueue_job("run_thread_turn", thread_id, text, pending)
-
+        threads = build_stores(redis, settings).threads
         return await check_new_posts(redis, threads, enqueue_turn, posts)
     finally:
         await pool.close()

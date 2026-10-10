@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from ..event_types import EVENT_PROGRESS, STAGE_DOWNLOADING, STAGE_FOUND
 from ..settings import Settings
@@ -19,6 +19,9 @@ from ..worker import (
     _refresh_state,
     poll_and_finalise,
 )
+
+if TYPE_CHECKING:
+    from ..agent import AgentOutcome
 
 logger = logging.getLogger("atb.jobs.progress")
 settings = Settings()
@@ -135,18 +138,11 @@ async def _chat_progress_pump(
 
 async def _emit_download_and_poll(
     bus: Any,
+    outcome: AgentOutcome,
     *,
-    download: dict,
-    fallbacks: list[dict],
-    display: str,
-    title: str,
-    author: str,
-    session: str,
     on_download_change: Callable[[str], Awaitable[None]] | None = None,
     query: str | None = None,
     deadline: float | None = None,
-    narrator: str = "",
-    file_format: str = "",
 ) -> DownloadResult:
     """Emit `committed`, then run the poll with a progress pump.
 
@@ -165,14 +161,16 @@ async def _emit_download_and_poll(
     `on_download_change` forwards the per-fallback download_id update from
     poll_and_finalise to the caller — the jobs worker uses it to keep
     store.set_download_id current so cancel kills the right subprocess."""
+    download = outcome.download or {}
     download_id = download.get("id", "")
     # The edition rides on `committed` so the card shows which copy this is the
     # moment it is chosen, not on the next 30s snapshot poll.
     bus.emit(
         "committed",
         {
-            "id": download_id, "title": title, "author": author, "display": display,
-            "narrator": narrator, "format": file_format,
+            "id": download_id, "title": outcome.title, "author": outcome.author,
+            "display": outcome.display, "narrator": outcome.narrator or "",
+            "format": outcome.file_format or "",
         },
     )
     # `committed` carries the book; this carries the lifecycle position, so the
@@ -193,11 +191,10 @@ async def _emit_download_and_poll(
     try:
         await poll_and_finalise(
             download=download,
-            fallbacks=fallbacks,
-            display=display,
-            author=author,
-            title=title,
-            session=session,
+            fallbacks=outcome.fallbacks,
+            display=outcome.display,
+            author=outcome.author,
+            title=outcome.title,
             settings=settings,
             sink=bus,
             on_download_change=_on_download_change,
@@ -209,7 +206,7 @@ async def _emit_download_and_poll(
         # An abandoned or half-finished download. poll_and_finalise has already
         # messaged the user and emitted the relevant stage; we only translate
         # the reason for the caller. Never `completed`.
-        logger.info("download did not finish for %s: %s", display, type(e).__name__)
+        logger.info("download did not finish for %s: %s", outcome.display, type(e).__name__)
         return DownloadResult.from_error(e)
     except Exception as e:  # noqa: BLE001
         logger.exception("poll_and_finalise crashed")

@@ -30,3 +30,31 @@ def fake_client(script):
             self.connected = False
 
     return FakeClient
+
+
+async def _no_ask(*_a):
+    pass
+
+
+async def one_turn(text, thread_id, settings, sink, session=None, **kw):
+    """One turn on a session of its own (closed after), or on `session`."""
+    from auto_torrent.server.agent import AgentSession
+
+    own = session is None
+    session = session or AgentSession()
+    kw.setdefault("on_ask", _no_ask)
+    try:
+        return await session.turn(text, settings, sink, **kw)
+    finally:
+        if own:
+            await session.close()
+
+
+def bound_tools(sink, *, on_ask=None, settings=None, raw_query="dune", **turn):
+    """A session's tool handlers, bound to one turn's sink and callbacks, for
+    calling the tools directly."""
+    from auto_torrent.server.agent import AgentSession
+
+    session = AgentSession()
+    session._new_turn(raw_query, settings, sink, on_ask or _no_ask, **turn)
+    return session, {t.name: t.handler for t in session._tools}

@@ -56,10 +56,9 @@ class ThreadSink(StreamEventBus):
         self._thread_log = thread_log
         self._threads = threads
         self._steps: list[Step] = []
-        # Whether the agent said anything to the user in its own words.
-        # `messaged` cannot answer that here: every narration line sets it, so a
-        # turn that searched and then failed looked as if it had already
-        # explained itself, and ended with no reply at all.
+        # Whether the agent said anything to the user in its own words, not
+        # just narration. A turn that searched and then failed used to count
+        # its narration as an answer, and ended with no reply at all.
         self.spoke = False
         # Writes are scheduled fire-and-forget from tool callbacks, and each one
         # appends twice (its step group, then its message). Without a lock two
@@ -92,7 +91,6 @@ class ThreadSink(StreamEventBus):
             )
             await self._save_live()
         await self._thread_log.publish(self._thread_id, EVENT_ACTIVITY, payload)
-        self.messaged = True
 
     async def _save_live(self) -> None:
         """Mirror the unpersisted steps into the thread snapshot, for a client
@@ -130,10 +128,7 @@ class ThreadSink(StreamEventBus):
         except Exception:  # noqa: BLE001
             logger.exception("thread %s: steps flush failed", self._thread_id)
 
-    async def system_progress_async(self, text: str) -> None:
-        await self.emit_async("progress", {"text": text})
-
-    def send(self, _phone: str, text: str) -> None:
+    def send(self, text: str) -> None:
         """Say something, taking the current step group with it.
 
         The base class schedules the write and returns, which is what makes
@@ -146,7 +141,6 @@ class ThreadSink(StreamEventBus):
         if not (text or "").strip():
             return
         steps = self.take_steps()
-        self.messaged = True
         self.spoke = True
         self._loop.call_soon_threadsafe(
             lambda: self._track(_schedule(self._write_reply(text.strip(), steps)))
@@ -166,11 +160,10 @@ class ThreadSink(StreamEventBus):
         while self._writes:
             await asyncio.gather(*tuple(self._writes), return_exceptions=True)
 
-    async def send_async(self, _phone: str, text: str) -> None:
+    async def send_async(self, text: str) -> None:
         text = (text or "").strip()
         if not text:
             return
-        self.messaged = True
         self.spoke = True
         await self._write_reply(text, self.take_steps())
 

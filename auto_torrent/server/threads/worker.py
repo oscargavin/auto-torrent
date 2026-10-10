@@ -17,7 +17,7 @@ import time
 from typing import Any
 from urllib.parse import quote_plus
 
-from ..agent import SESSION_MAX_TURNS, AgentSession, run_agent
+from ..agent import SESSION_MAX_TURNS, AgentSession
 from ..covers import find_card, find_cover_url
 from ..event_types import EVENT_PROGRESS, STAGE_FOUND
 from ..jobs.finish import finish_agent_outcome
@@ -60,7 +60,6 @@ async def close_idle_sessions() -> None:
 
 
 async def _session_for(thread_id: str) -> AgentSession:
-    await close_idle_sessions()
     session = _sessions.get(thread_id)
     if session is not None and (session.broken or session.turns >= SESSION_MAX_TURNS):
         await _drop(thread_id)
@@ -163,6 +162,7 @@ async def run_thread_turn(
     thread_id: str,
     text: str,
     pending_options: list[dict] | None = None,
+    event: str | None = None,
 ) -> None:
     threads: ThreadStore = ctx["threads"]
     jobs: JobStore = ctx["store"]
@@ -216,15 +216,9 @@ async def run_thread_turn(
         str(pending_options[0].get("cover_url") or "").strip() if pending_options else ""
     )
 
+    session = await _session_for(thread_id)
     try:
-        past = await threads.history_for_agent(thread_id)
-        job_ids = [m.job_id for m in past if m.kind is MessageKind.job and m.job_id]
-        history = render_history(
-            past,
-            # The message just posted is the request itself, not history.
-            exclude_last_text=text,
-            jobs={j.id: j for j in await asyncio.gather(*(jobs.get(i) for i in job_ids)) if j},
-        )
+        history = await _history_for(session, threads, jobs, thread_id, text)
 
         async def downloads() -> dict:
             recent = await jobs.list_for_profile(thread.profile_id, limit=10)
@@ -248,17 +242,16 @@ async def run_thread_turn(
 
             return await wishlist.add(ctx["redis"], thread.profile_id, title, author, note)
 
-        outcome = await run_agent(
+        outcome = await session.turn(
             text,
-            thread_id,
             settings,
             sink,
-            pending_options=pending_options or None,
             on_ask=on_ask,
+            pending_options=pending_options or None,
             history=history or None,
-            session=await _session_for(thread_id),
             downloads=downloads,
             on_watch=on_watch,
+            event=event,
         )
         _close_when_idle()
 
@@ -345,3 +338,51 @@ async def run_thread_turn(
             ),
         )
         await threads.set_status(thread_id, ThreadStatus.idle)
+    finally:
+        await _remember(session, threads, jobs, thread_id)
+
+
+async def _history_for(
+    session: AgentSession, threads: ThreadStore, jobs: JobStore, thread_id: str, text: str
+) -> list[tuple[str, str]]:
+    """What the agent needs to hear about the conversation.
+
+    A fresh session gets the whole recent transcript. An open one remembers it,
+    so it gets only what happened since its last turn: a download that finished
+    or failed, a watched-for book turning up. Without this it answered "is it
+    done?" from the state it saw when it started the download.
+    """
+    past = await threads.history_for_agent(thread_id)
+    job_ids = [m.job_id for m in past if m.kind is MessageKind.job and m.job_id]
+    known = {j.id: j for j in await asyncio.gather(*(jobs.get(i) for i in job_ids)) if j}
+    if session.turns == 0:
+        # The message just posted is the request itself, not history.
+        return render_history(past, exclude_last_text=text, jobs=known)
+    new = [
+        m for m in past
+        if m.kind is not MessageKind.job and m.id not in session.seen_ids
+    ]
+    # The message being answered is the prompt itself, not news.
+    if new and new[-1].kind is MessageKind.user and new[-1].text == text:
+        new.pop()
+    changed = [
+        m for m in past
+        if m.kind is MessageKind.job
+        and m.job_id in known
+        and session.job_states.get(m.job_id) != describe_job(known[m.job_id])
+    ]
+    return render_history(new + changed, jobs=known)
+
+
+async def _remember(session: AgentSession, threads: ThreadStore, jobs: JobStore, thread_id: str) -> None:
+    """Note what the session now knows, so the next turn hears only news."""
+    try:
+        past = await threads.history_for_agent(thread_id)
+        session.seen_ids = {m.id for m in past}
+        for m in past:
+            if m.kind is MessageKind.job and m.job_id:
+                job = await jobs.get(m.job_id)
+                if job is not None:
+                    session.job_states[m.job_id] = describe_job(job)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not record what the session has seen", exc_info=True)
