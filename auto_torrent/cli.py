@@ -1270,6 +1270,11 @@ def _build_parser(prog: str = "auto-torrent", default_source: str = "abb") -> ar
 
 
 def cmd_index(args: argparse.Namespace) -> None:
+    # ABB blocks the home IP, so every crawl has to go through the proxy.
+    proxy = _resolve_proxy(args)
+    if proxy:
+        abb.configure(proxy=proxy)
+
     if args.action == "backfill":
         started = time.time()
         total = abb_index.backfill(
@@ -1279,12 +1284,34 @@ def cmd_index(args: argparse.Namespace) -> None:
         )
         print(f"backfill: +{total} new posts, {abb_index.count()} indexed, {time.time() - started:.0f}s")
     elif args.action == "refresh":
-        print(f"refresh: +{abb_index.refresh()} new posts, {abb_index.count()} indexed")
+        try:
+            fresh = abb_index.refresh()
+        except ABBError as e:
+            print(f"refresh failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"refresh: +{len(fresh)} new posts, {abb_index.count()} indexed")
+        _check_wishlist(fresh)
     elif args.action == "count":
         print(abb_index.count())
     else:
         for r in abb_index.search(" ".join(args.query)):
             print(f"{r.title}\n  {r.link}  [{r.format} {r.file_size} {r.posted}]")
+
+
+def _check_wishlist(fresh: list[SearchResult]) -> None:
+    """Start a chat turn for every watched-for book in the new posts. The
+    refresh already succeeded, so a failure here is logged and never fails it."""
+    if not fresh:
+        return
+    try:
+        import asyncio
+
+        from .server import wishlist
+
+        started = asyncio.run(wishlist.check_after_refresh(fresh))
+        print(f"wishlist: {started} watched-for book(s) found")
+    except Exception as e:
+        print(f"wishlist check failed: {e!r}", file=sys.stderr)
 
 
 def main() -> None:

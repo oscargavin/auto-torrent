@@ -132,3 +132,27 @@ class TestCrawlArchive:
 
 def _page_number(path: str) -> int:
     return int(path.rstrip("/").split("/")[-1])
+
+
+class TestRefresh:
+    def test_returns_the_new_posts(self, conn, monkeypatch):
+        page = [result("Songbird - Peter Grainger", "/abss/songbird/")]
+        monkeypatch.setattr(abb_index, "fetch_html", lambda path: '<a href="/page/2/">2</a>')
+        monkeypatch.setattr(abb_index, "parse_listing", lambda html: page)
+
+        assert [r.title for r in abb_index.refresh(conn)] == ["Songbird - Peter Grainger"]
+        assert abb_index.refresh(conn) == []
+
+    def test_an_unreachable_site_raises(self, conn, monkeypatch):
+        """A blocked home IP once looked like a quiet day: "+0 new posts"."""
+        def unreachable(path):
+            raise abb_index.ABBError("AudiobookBay is unreachable (connection failed)")
+
+        monkeypatch.setattr(abb_index, "fetch_html", unreachable)
+        with pytest.raises(abb_index.ABBError, match="unreachable"):
+            abb_index.refresh(conn)
+
+    def test_a_listing_with_no_posts_raises(self, conn, monkeypatch):
+        monkeypatch.setattr(abb_index, "fetch_html", lambda path: "<html>blocked</html>")
+        with pytest.raises(abb_index.ABBError, match="no posts"):
+            abb_index.refresh(conn)

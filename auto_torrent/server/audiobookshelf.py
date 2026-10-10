@@ -119,6 +119,17 @@ class ABSClient:
             resp.raise_for_status()
             return resp.json()
 
+    async def get_cover(self, item_id: str) -> tuple[bytes, str]:
+        """The item's cover image and its media type."""
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{self._base}/api/items/{item_id}/cover",
+                headers=self._headers,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.content, resp.headers.get("content-type", "image/jpeg").split(";")[0]
+
     async def update_chapters(self, item_id: str, chapters: list[dict]) -> None:
         """Replace an item's chapter list.
 

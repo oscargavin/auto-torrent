@@ -24,7 +24,7 @@ from ..jobs.finish import finish_agent_outcome
 from ..jobs.store import JobStore
 from ..settings import Settings
 from .bus import ThreadSink
-from .history import render_history
+from .history import describe_job, render_history
 from .store import ThreadStore, option_from_payload
 from .types import (
     EVENT_ERROR,
@@ -75,6 +75,15 @@ async def _session_for(thread_id: str) -> AgentSession:
 def _close_when_idle() -> None:
     loop = asyncio.get_running_loop()
     loop.call_later(SESSION_IDLE_S + 5, lambda: loop.create_task(close_idle_sessions()))
+
+def _ago(ts: float) -> str:
+    minutes = int((time.time() - ts) / 60)
+    if minutes < 60:
+        return f"{minutes} min ago"
+    if minutes < 48 * 60:
+        return f"{minutes // 60} h ago"
+    return f"{minutes // 1440} days ago"
+
 
 def goodreads_search_url(title: str, author: str) -> str:
     """Where to send someone who wants the reviews.
@@ -208,11 +217,36 @@ async def run_thread_turn(
     )
 
     try:
+        past = await threads.history_for_agent(thread_id)
+        job_ids = [m.job_id for m in past if m.kind is MessageKind.job and m.job_id]
         history = render_history(
-            await threads.history_for_agent(thread_id),
+            past,
             # The message just posted is the request itself, not history.
             exclude_last_text=text,
+            jobs={j.id: j for j in await asyncio.gather(*(jobs.get(i) for i in job_ids)) if j},
         )
+
+        async def downloads() -> dict:
+            recent = await jobs.list_for_profile(thread.profile_id, limit=10)
+            out: dict = {
+                "downloads": [
+                    {"started": _ago(j.created_at), "status": describe_job(j)} for j in recent
+                ]
+            }
+            # The downloads are the answer; the watch list is extra, so its
+            # failure must not cost the user the rest.
+            try:
+                from .. import wishlist
+
+                out["watching"] = await wishlist.list_for(ctx["redis"], thread.profile_id)
+            except Exception:  # noqa: BLE001
+                logger.warning("watch list unavailable", exc_info=True)
+            return out
+
+        async def on_watch(title: str, author: str, note: str) -> dict:
+            from .. import wishlist
+
+            return await wishlist.add(ctx["redis"], thread.profile_id, title, author, note)
 
         outcome = await run_agent(
             text,
@@ -223,6 +257,8 @@ async def run_thread_turn(
             on_ask=on_ask,
             history=history or None,
             session=await _session_for(thread_id),
+            downloads=downloads,
+            on_watch=on_watch,
         )
         _close_when_idle()
 

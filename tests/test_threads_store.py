@@ -57,13 +57,15 @@ async def test_title_is_set_once_from_first_user_message(store):
     assert (await store.get(t.id)).title == "dune"
 
 
-async def test_history_drops_job_messages(store):
+async def test_history_keeps_download_cards(store):
+    """render_history turns each one into a line on how the download went."""
     t = await store.create("p1")
     await store.append(t.id, Message.new(t.id, MessageKind.user, text="dune"))
     await store.append(t.id, Message.new(t.id, MessageKind.job, job_id="j1"))
     await store.append(t.id, Message.new(t.id, MessageKind.assistant, text="found it"))
     assert [m.kind for m in await store.history_for_agent(t.id)] == [
         MessageKind.user,
+        MessageKind.job,
         MessageKind.assistant,
     ]
 

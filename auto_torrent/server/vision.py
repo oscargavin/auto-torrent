@@ -79,6 +79,16 @@ async def analyze_cover(cover_url: str) -> dict:
     except Exception as e:
         logger.warning("Cover fetch failed for %s: %s", cover_url, e)
         return {}
+    return await _read(b64, media_type, cover_url)
+
+
+async def read_cover_image(data: bytes, media_type: str) -> dict:
+    """The same reading, for an image already in hand (a library cover, which
+    needs the library's token to fetch)."""
+    return await _read(base64.b64encode(data).decode(), media_type, "library cover")
+
+
+async def _read(b64: str, media_type: str, cover_url: str) -> dict:
 
     try:
         text = await asyncio.wait_for(_query_vision(b64, media_type), timeout=VISION_TIMEOUT_S)

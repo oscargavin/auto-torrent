@@ -95,9 +95,16 @@ def _index(conn: sqlite3.Connection | None) -> Iterator[sqlite3.Connection]:
 
 def upsert(conn: sqlite3.Connection, results: Iterable[SearchResult], commit: bool = True) -> int:
     """Store results, returning how many were new to the index."""
+    return len(_upsert_new(conn, results, commit))
+
+
+def _upsert_new(
+    conn: sqlite3.Connection, results: Iterable[SearchResult], commit: bool = True
+) -> list[SearchResult]:
+    """Store results, returning the ones that were new to the index."""
     rows = list(results)
     if not rows:
-        return 0
+        return []
 
     now = time.time()
     conn.executemany(
@@ -112,12 +119,12 @@ def upsert(conn: sqlite3.Connection, results: Iterable[SearchResult], commit: bo
         row[0] for row in
         conn.execute(f"SELECT link FROM posts_fts WHERE link IN ({placeholders})", links)
     }
-    fresh = [(r.title, r.link) for r in rows if r.link not in known]
-    conn.executemany("INSERT INTO posts_fts (title, link) VALUES (?, ?)", fresh)
+    fresh = [r for r in rows if r.link not in known]
+    conn.executemany("INSERT INTO posts_fts (title, link) VALUES (?, ?)", [(r.title, r.link) for r in fresh])
 
     if commit:
         conn.commit()
-    return len(fresh)
+    return fresh
 
 
 def last_page(html: str) -> int:
@@ -141,21 +148,40 @@ def crawl_archive(
     Returns (pages crawled, new posts). With stop_when_known it stops at the
     first page holding nothing new, which is what makes the nightly refresh cheap.
     """
+    pages, fresh = _crawl(conn, path, max_pages, stop_when_known, workers, strict=False)
+    return pages, len(fresh)
+
+
+def _crawl(
+    conn: sqlite3.Connection,
+    path: str,
+    max_pages: int,
+    stop_when_known: bool,
+    workers: int,
+    strict: bool,
+) -> tuple[int, list[SearchResult]]:
+    """crawl_archive, returning the new posts themselves. With strict, a first
+    page that cannot be fetched or holds no posts raises ABBError: the refresh
+    must not report "+0" when it never reached the site."""
     try:
         html = fetch_html(f"{path}/page/2/")
     except ABBError:
-        return 0, 0
+        if strict:
+            raise
+        return 0, []
 
     results = parse_listing(html)
     if not results:
-        return 0, 0
+        if strict:
+            raise ABBError(f"AudiobookBay returned a listing page with no posts ({path or '/'}/page/2/)")
+        return 0, []
 
     pages = 1
-    new_total = upsert(conn, results, commit=False)
+    fresh = _upsert_new(conn, results, commit=False)
     end = min(last_page(html), max_pages)
     empties = 0
 
-    if not (stop_when_known and new_total == 0):
+    if not (stop_when_known and not fresh):
         with ThreadPoolExecutor(workers) as pool:
             for start in range(3, end + 1, workers):
                 batch = range(start, min(start + workers, end + 1))
@@ -171,10 +197,10 @@ def crawl_archive(
                         continue
                     empties = 0
 
-                    new = upsert(conn, page_results, commit=False)
+                    new = _upsert_new(conn, page_results, commit=False)
                     pages += 1
-                    new_total += new
-                    if stop_when_known and new == 0:
+                    fresh.extend(new)
+                    if stop_when_known and not new:
                         done = True
                         break
 
@@ -183,7 +209,7 @@ def crawl_archive(
                     break
 
     conn.commit()
-    return pages, new_total
+    return pages, fresh
 
 
 def _safe_fetch(path: str) -> list[SearchResult]:
@@ -225,11 +251,21 @@ def backfill(
         return total
 
 
-def refresh(conn: sqlite3.Connection | None = None) -> int:
-    """Pick up posts added since the last run. Seconds, not hours."""
+def refresh(conn: sqlite3.Connection | None = None) -> list[SearchResult]:
+    """Pick up posts added since the last run, returning them. Seconds, not hours.
+
+    Raises ABBError when the site could not be reached, so a blocked or down
+    site fails the run instead of looking like a quiet day.
+    """
     with _index(conn) as db:
-        _, new = crawl_archive(db, "", max_pages=40, stop_when_known=True)
-        return new
+        _, fresh = _crawl(db, "", max_pages=40, stop_when_known=True, workers=WORKERS, strict=True)
+        # The crawl starts at page 2, so the newest posts only arrived once
+        # they slid off page 1, a day late for anyone watching for one.
+        try:
+            newest = _upsert_new(db, parse_listing(fetch_html("/")), commit=True)
+        except ABBError:
+            newest = []
+        return newest + fresh
 
 
 def count(conn: sqlite3.Connection | None = None) -> int:

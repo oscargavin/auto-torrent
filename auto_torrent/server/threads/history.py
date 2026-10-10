@@ -10,11 +10,16 @@ to resolve against.
 
 from __future__ import annotations
 
+from typing import Any
+
 from .types import Message, MessageKind
 
 
 def render_history(
-    messages: list[Message], *, exclude_last_text: str | None = None
+    messages: list[Message],
+    *,
+    exclude_last_text: str | None = None,
+    jobs: dict[str, Any] | None = None,
 ) -> list[tuple[str, str]]:
     """(role, text) pairs, oldest first.
 
@@ -35,8 +40,12 @@ def render_history(
     out: list[tuple[str, str]] = []
     for m in items:
         if m.kind is MessageKind.job:
-            # A download's status is not something the agent should reason
-            # about, and the turn after one is nearly always a fresh request.
+            # The download card. Dropped entirely before, so "I don't see it
+            # in my library" got an agent that did not know it had started a
+            # download, let alone that it had failed.
+            job = (jobs or {}).get(m.job_id or "")
+            if job is not None:
+                out.append(("assistant", f"[download] {describe_job(job)}"))
             continue
         if m.kind is MessageKind.choice:
             out.append(("assistant", _render_choice(m)))
@@ -45,6 +54,22 @@ def render_history(
             continue
         out.append(("user" if m.kind is MessageKind.user else "assistant", m.text))
     return out
+
+
+def describe_job(job: Any) -> str:
+    """One line on where a download stands, as the user's card shows it."""
+    title = job.picked_title or job.query
+    status = getattr(job.status, "value", job.status)
+    if status == "succeeded":
+        state = "already in the library, nothing downloaded" if job.already_had else "done, in the library"
+    elif status == "failed":
+        state = f"failed: {job.error or 'unknown error'}"
+    elif status == "cancelled":
+        state = "cancelled by the user"
+    else:
+        state = "still downloading or importing"
+    edition = ", ".join(p for p in (job.picked_narrator, job.picked_format) if p)
+    return f"“{title}”" + (f" ({edition})" if edition else "") + f" — {state}"
 
 
 def _render_choice(message: Message) -> str:

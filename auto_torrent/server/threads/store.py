@@ -192,11 +192,10 @@ class ThreadStore:
         return out
 
     async def history_for_agent(self, thread_id: str) -> list[Message]:
-        """The tail of the transcript, for prompting. Job messages are dropped —
-        a job's status is not something the agent should reason about, and the
-        turn that follows a download is nearly always a fresh request."""
+        """The tail of the transcript, for prompting, download cards included:
+        render_history turns each one into a line on how it went."""
         msgs = await self.messages(thread_id, limit=HISTORY_LIMIT * 2)
-        return [m for m in msgs if m.kind is not MessageKind.job][-HISTORY_LIMIT:]
+        return msgs[-HISTORY_LIMIT:]
 
     async def resolve_choice(
         self, thread_id: str, message_id: str, option_index: int

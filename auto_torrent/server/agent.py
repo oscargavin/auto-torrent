@@ -101,9 +101,30 @@ COMMITTING.
 - If you had to take a collection: say "Only found it in <collection name>, grabbing that."
 - Never invent a narrator, runtime, or ETA. You do not know how long it will take.
 
+A DIFFERENT BOOK IS NEVER A MATCH.
+If the search does not find the book they asked for, do not download one with
+a similar name. "Some Sort of Justice" is not "Ancillary Justice", and a book
+by another author is a miss even when the title matches. When you are not sure
+a result is their book, ask.
+
+CHECK THE SHELF BEFORE EVERY DOWNLOAD.
+Before commit_download, run search_library for the book (and for the series,
+when they asked for a trilogy or a set). If they already own it — including
+every book of a set they asked for as one — do not download it. Reply that
+they have it, and with whom as narrator.
+
 WHEN NOTHING MATCHES.
-- reply: Couldn't find <what they asked for>. Try the full title and author?
+- reply: Couldn't find <what they asked for> on the site. Name any other books
+  by the author that are there, and offer to watch for it: "Want me to watch for
+  it? I'll grab it when it turns up."
+- If they say yes, call watch_for, then reply in one line.
 - Then end without committing.
+
+DOWNLOADS. Each past download appears in the conversation as a "[download]"
+line saying how it went. For "is it done?" or "I don't see it in my library",
+use check_downloads for the latest state, and say what happened and what to
+do: a failed copy can be fetched again, and a finished one can take a few
+minutes to show up in the app.
 
 Pending options:
 - If "Pending options" are present in the user prompt, treat the user's message as a pick from those options. Resolve to the magnet they meant and commit_download. Don't re-search.
@@ -118,7 +139,17 @@ question you already know the answer to, and never fall back to "couldn't find
 that one" when they didn't ask you to find anything.
 
 Use `search_library` when the question is about what they own, and before
-offering suggestions so you don't recommend a book already on the shelf.
+offering suggestions so you don't recommend a book already on the shelf. It
+returns each book's id, narrator, series, length and year, and matches on any
+of them.
+
+WHEN THEY REFER TO BOOKS THEY OWN — "the same narrator as my Farseer books",
+"the next one in the series I'm on", "is this longer than the last one" — look
+them up first instead of guessing. search_library gives the narrator for most
+books; `inspect_book` gives one book's full record and reads its cover when no
+narrator is recorded. Then search for a copy that matches (put the narrator in
+the query), and say plainly when they already own what they asked for or when
+no copy has the narrator they want.
 
 End as soon as you have committed, asked, or replied. Don't keep tool-calling
 after."""
@@ -199,12 +230,29 @@ to decide."""
 
 
 # How many library matches a search returns. Enough to answer "what have I got
-# by Sanderson?" honestly, few enough not to flood the context.
-LIBRARY_MATCH_LIMIT = 12
+# by Robin Hobb?" honestly (22 books), few enough not to flood the context.
+LIBRARY_MATCH_LIMIT = 25
+
+
+def _library_row(item: dict) -> dict:
+    media = item.get("media") or {}
+    meta = media.get("metadata") or {}
+    return {
+        "id": item.get("id", ""),
+        "title": meta.get("title") or "",
+        "author": meta.get("authorName") or "",
+        "narrator": meta.get("narratorName") or "",
+        "series": meta.get("seriesName") or "",
+        "hours": round((media.get("duration") or 0) / 3600, 1),
+        "year": meta.get("publishedYear") or "",
+    }
 
 
 async def _search_library(settings: Settings, query: str) -> list[dict]:
-    """Substring match over the family's shelf, on title and author.
+    """Substring match over the family's shelf, on title, author, narrator and
+    series. The narrator is what "the same narrator as my Farseer books" needs:
+    with only title and author, the agent told the user the library did not
+    record one.
 
     Deliberately looser than `library_match.find_existing`, which exists to
     decide whether to skip a download and so must not produce false positives.
@@ -217,14 +265,47 @@ async def _search_library(settings: Settings, query: str) -> list[dict]:
     needle = query.casefold().strip()
     out: list[dict] = []
     for item in items:
-        meta = ((item.get("media") or {}).get("metadata")) or {}
-        title = meta.get("title") or ""
-        author = meta.get("authorName") or ""
-        if needle in title.casefold() or needle in author.casefold():
-            out.append({"title": title, "author": author})
+        row = _library_row(item)
+        haystack = " ".join((row["title"], row["author"], row["narrator"], row["series"]))
+        if needle in haystack.casefold():
+            out.append(row)
             if len(out) >= LIBRARY_MATCH_LIMIT:
                 break
     return out
+
+
+async def _inspect_book(settings: Settings, item_id: str) -> dict:
+    """Everything the library knows about one book. When it records no
+    narrator, the cover is read instead, since covers usually print one."""
+    from .audiobookshelf import ABSClient
+    from .vision import read_cover_image
+
+    abs_client = ABSClient(settings)
+    item = await abs_client.get_item(item_id)
+    media = item.get("media") or {}
+    meta = media.get("metadata") or {}
+    book = {
+        **_library_row(item),
+        "subtitle": meta.get("subtitle") or "",
+        "narrators": meta.get("narrators") or [],
+        "series_detail": [
+            {"name": s.get("name"), "sequence": s.get("sequence")} for s in meta.get("series") or []
+        ],
+        "publisher": meta.get("publisher") or "",
+        "abridged": bool(meta.get("abridged")),
+        "genres": meta.get("genres") or [],
+        "chapters": len(media.get("chapters") or []),
+        "files": len(media.get("audioFiles") or []),
+        "description": _truncate(meta.get("descriptionPlain") or meta.get("description") or "", 600),
+    }
+    if not book["narrator"]:
+        try:
+            data, media_type = await abs_client.get_cover(item_id)
+            book["cover_says"] = await read_cover_image(data, media_type)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("library cover read failed for %s: %r", item_id, e)
+            book["cover_says"] = {}
+    return book
 
 
 @dataclass
@@ -656,6 +737,76 @@ def _build_tools(t: "AgentSession") -> list:
         return {"content": [{"type": "text", "text": json.dumps({"matches": matches})}]}
 
     @tool(
+        name="inspect_book",
+        description=(
+            "Everything the library knows about one book it owns, by the `id` "
+            "from search_library: narrators, series and position, publisher, "
+            "year, length, chapters, description. If no narrator is recorded, "
+            "`cover_says` holds what the cover prints."
+        ),
+        input_schema={"item_id": str},
+    )
+    async def inspect_book(args: dict) -> dict:
+        item_id = (args.get("item_id") or "").strip()
+        if not item_id:
+            return {"content": [{"type": "text", "text": "error: item_id required"}]}
+        _narrate(t.sms, STAGE_SEARCHING, "Looking at your copy…")
+        try:
+            book = await _inspect_book(t.settings, item_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("inspect_book failed: %r", e)
+            return {"content": [{"type": "text", "text": json.dumps({"error": "book unavailable"})}]}
+        return {"content": [{"type": "text", "text": json.dumps(book)}]}
+
+    @tool(
+        name="check_downloads",
+        description=(
+            "The family's recent downloads, newest first, each with how it went "
+            "(done, already owned, failed and why, still going), plus the books "
+            "you are watching for. Use for 'is it done?', 'I don't see it in my "
+            "library', 'what happened to X?'."
+        ),
+        input_schema={"type": "object", "properties": {}},
+    )
+    async def check_downloads(args: dict) -> dict:
+        if t.downloads is None:
+            return {"content": [{"type": "text", "text": json.dumps({"error": "not available"})}]}
+        try:
+            data = await t.downloads()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("check_downloads failed: %r", e)
+            return {"content": [{"type": "text", "text": json.dumps({"error": "downloads unavailable"})}]}
+        return {"content": [{"type": "text", "text": json.dumps(data)}]}
+
+    @tool(
+        name="watch_for",
+        description=(
+            "Remember a book that is not on the site yet. Every night new uploads "
+            "are checked against the list, and when it appears it is fetched and "
+            "the user hears about it here. Only after they say yes to watching."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "author": {"type": "string"},
+                "note": {"type": "string", "description": "Narrator or edition they want, if any."},
+            },
+            "required": ["title"],
+        },
+    )
+    async def watch_for(args: dict) -> dict:
+        title = (args.get("title") or "").strip()
+        if not title or t.on_watch is None:
+            return {"content": [{"type": "text", "text": json.dumps({"error": "cannot watch"})}]}
+        try:
+            wish = await t.on_watch(title, (args.get("author") or "").strip(), (args.get("note") or "").strip())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("watch_for failed: %r", e)
+            return {"content": [{"type": "text", "text": json.dumps({"error": "could not save"})}]}
+        return {"content": [{"type": "text", "text": json.dumps({"watching": wish})}]}
+
+    @tool(
         name="commit_download",
         description="Start the BG download. `primary` and each `fallbacks` entry: {magnet, title, author, narrator, format}. Include narrator and format on `primary` whenever the search result or analyze_cover gave them — they're shown to the user so they can see which edition was chosen. ALWAYS include 1-2 fallbacks when you have viable alternates — the polling layer uses them if the primary stalls.",
         input_schema={"primary": dict, "fallbacks": list},
@@ -713,6 +864,9 @@ def _build_tools(t: "AgentSession") -> list:
         ask_user_to_pick,
         reply,
         search_library,
+        inspect_book,
+        check_downloads,
+        watch_for,
         commit_download,
     ]
 
@@ -743,6 +897,9 @@ TOOL_NAMES = (
     "ask_user_to_pick",
     "reply",
     "search_library",
+    "inspect_book",
+    "check_downloads",
+    "watch_for",
     "commit_download",
 )
 
@@ -774,7 +931,11 @@ class AgentSession:
         self._lock = asyncio.Lock()
         self._server = create_sdk_mcp_server(name="atb", tools=_build_tools(self))
 
-    def _new_turn(self, raw_query, phone, settings, sms, on_ask) -> None:
+    def _new_turn(
+        self, raw_query, phone, settings, sms, on_ask, downloads=None, on_watch=None
+    ) -> None:
+        self.downloads = downloads
+        self.on_watch = on_watch
         self.raw_query = raw_query
         self.phone = phone
         self.settings = settings
@@ -794,12 +955,14 @@ class AgentSession:
         on_ask: Callable[[str, str, list[dict]], Awaitable[None]],
         pending_options: list[dict] | None = None,
         history: list[tuple[str, str]] | None = None,
+        downloads: Callable[[], Awaitable[dict]] | None = None,
+        on_watch: Callable[[str, str, str], Awaitable[dict]] | None = None,
     ) -> AgentOutcome:
         """Run one request. `history` is used only on the session's first turn:
         after that the session remembers the conversation itself."""
         self.last_used = time.monotonic()
         async with self._lock:
-            self._new_turn(raw_query, phone, settings, sms, on_ask)
+            self._new_turn(raw_query, phone, settings, sms, on_ask, downloads, on_watch)
             prompt = _prompt(raw_query, pending_options, history if self.turns == 0 else None)
             self.turns += 1
             try:
@@ -931,6 +1094,8 @@ async def run_agent(
     on_ask: Callable[[str, str, list[dict]], Awaitable[None]] | None = None,
     history: list[tuple[str, str]] | None = None,
     session: AgentSession | None = None,
+    downloads: Callable[[], Awaitable[dict]] | None = None,
+    on_watch: Callable[[str, str, str], Awaitable[dict]] | None = None,
 ) -> AgentOutcome:
     """Run one request, in `session` if given, else in a session of its own."""
     own = session is None
@@ -944,6 +1109,8 @@ async def run_agent(
             on_ask=on_ask or _cannot_ask,
             pending_options=pending_options,
             history=history,
+            downloads=downloads,
+            on_watch=on_watch,
         )
     finally:
         if own:
