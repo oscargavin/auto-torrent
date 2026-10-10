@@ -150,3 +150,14 @@ Errors return `{"error": "message"}`. Used by [Basil](https://github.com/oscarga
 ## License
 
 MIT
+
+## Deploying
+
+A push to `main` deploys to the server. GitHub calls `/webhook/github`, which
+starts `deploy/deploy.sh` as its own systemd unit, `atb-deploy`. The script
+fast-forwards the checkout, syncs dependencies, restarts `atb-arq-worker` and
+`atb-server`, and waits for `/health`. To see the last deploy:
+
+```bash
+ssh basil-server journalctl --user -u atb-deploy -n 20
+```
