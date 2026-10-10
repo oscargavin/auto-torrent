@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -92,19 +93,31 @@ async def github_webhook(request: Request) -> Response:
         if not hmac.compare_digest(signature, expected):
             return Response(status_code=403)
 
-    async def _deploy() -> None:
-        proc = await asyncio.create_subprocess_exec(
-            "/home/oscar/auto-torrent/deploy.sh",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode == 0:
-            logger.info("Deploy OK: %s", stdout.decode().strip())
-        else:
-            logger.error("Deploy failed: %s", stderr.decode().strip())
+    # Only a push to main deploys. GitHub also sends ping and other events.
+    if request.headers.get("X-GitHub-Event") != "push":
+        return Response(status_code=204)
+    try:
+        ref = json.loads(body or b"{}").get("ref")
+    except ValueError:
+        return Response(status_code=400)
+    if ref != "refs/heads/main":
+        return Response(status_code=204)
 
-    asyncio.create_task(_deploy())
+    # Its own systemd unit, not a child process: the deploy restarts this
+    # server, and a child would die with it before restarting the worker.
+    # A deploy already running makes this fail, which is fine: it re-checks
+    # origin/main before it finishes.
+    proc = await asyncio.create_subprocess_exec(
+        "systemd-run", "--user", "--unit=atb-deploy", "--collect", "--quiet",
+        "/home/oscar/auto-torrent/deploy/deploy.sh",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode == 0:
+        logger.info("deploy started (journalctl --user -u atb-deploy)")
+    else:
+        logger.info("deploy not started: %s", stderr.decode().strip())
     return Response(status_code=200)
 
 
